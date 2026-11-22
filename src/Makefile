@@ -100,19 +100,6 @@ ifeq ($(HAS_MBELIB),1)
    MBELIB_CPPFLAGS = -DHAVE_MBELIB=1
    MBELIB_LIBS = -lmbe
 endif
-# libfec (github.com/ka9q/libfec; Debian libfec-dev), optional: its Reed-Solomon decoder for
-# rs63.c, which otherwise uses its own. USE_LIBFEC=0 takes our own even when libfec is
-# installed, USE_LIBFEC=1 takes libfec without looking. Remove rs63.o after changing it
-USE_LIBFEC ?= auto
-ifeq ($(USE_LIBFEC),auto)
-   HAS_LIBFEC := $(shell printf '\043include <fec.h>\n' | $(CC) $(CPPFLAGS) $(INCLUDES) -E - >/dev/null 2>&1 && echo 1)
-else
-   HAS_LIBFEC := $(USE_LIBFEC)
-endif
-ifeq ($(HAS_LIBFEC),1)
-   LIBFEC_CPPFLAGS = -DHAVE_LIBFEC=1
-   LIBFEC_LIBS = -lfec
-endif
 
 ifeq ($(BUILD),debug)
      DOPTS += -g
@@ -305,10 +292,9 @@ opussend: opussend.o libradio.a
 	$(CC) $(LDFLAGS) -o $@ $^ -lopus -lportaudio $(LDLIBS)
 
 p25d: p25d.o p25audio.o chanctl.o avahi.o libdigital.a libdsp.a libstatus.a libradio.a
-	$(CC) $(LDFLAGS) -o $@ $^ $(MBELIB_LIBS) $(LIBFEC_LIBS) $(LDLIBS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(MBELIB_LIBS) $(LDLIBS)
 
 p25audio.o: CPPFLAGS += $(MBELIB_CPPFLAGS)
-rs63.o: CPPFLAGS += $(LIBFEC_CPPFLAGS)
 
 packetd: packetd.o ax25.o avahi.o libdsp.a libstatus.a libradio.a
 	$(CC) $(LDFLAGS) -o $@ $^ -lfftw3f_threads -lfftw3f $(LDLIBS)

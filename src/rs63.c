@@ -1,19 +1,11 @@
 // Reed-Solomon codes over GF(64) with errors and erasures, the P25 codes among them,
 // and the BCH(63,16,23) code of the P25 NID decoded as a binary subcode of one.
-// Two decoders behind the one interface, chosen when building: with HAVE_LIBFEC, Phil Karn's
-// general Reed-Solomon decoder from libfec (<fec.h>, -lfec), this file mapping our symbol order
-// and shortening onto it and keeping our rules for accepting a correction; without it, our own.
-// The two give the same results
 // Copyright 2026, Matthew Kaufman, KA6SQG
 #include <assert.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
-#ifdef HAVE_LIBFEC
-#include <stdlib.h>
-#include <fec.h> // libfec's 8-bit-or-less Reed-Solomon codec: init_rs_char(), decode_rs_char()
-#endif
 
 #include "rs63.h"
 
@@ -32,15 +24,6 @@ static int Alpha_pow[ALPHA_POW_SPAN * GF_N];
 
 static pthread_once_t Once = PTHREAD_ONCE_INIT;
 
-#ifdef HAVE_LIBFEC
-// libfec codecs, made once and then only read (decode_rs_char() does not write to them):
-// one unshortened code per parity count, used for the shortened codes too, the zero symbols
-// included. libfec's revisions differ for a shortened codec (one with padding): Phil Karn's
-// numbers erasures and corrections in the unshortened block, Debian's (github.com/fblomqvi/libfec)
-// in the shortened one; on a whole block they agree
-static void *Rs_full[RS_MAXPAR+1];
-#endif
-
 static void init_tables(void){
   int x = 1;
   for(int i = 0; i < GF_N; i++){
@@ -54,14 +37,6 @@ static void init_tables(void){
   Index_of[0] = -1;
   for(int e = 0; e < ALPHA_POW_SPAN * GF_N; e++)
     Alpha_pow[e] = Alpha_to[e % GF_N];
-#ifdef HAVE_LIBFEC
-  // symbol size 6, field polynomial x^6 + x + 1, roots alpha^1 .. alpha^parity
-  for(int p = 1; p <= RS_MAXPAR; p++){
-    Rs_full[p] = init_rs_char(GF_M,GF_POLY,1,1,p,0);
-    if(Rs_full[p] == NULL)
-      abort();
-  }
-#endif
 }
 static inline void init(void){
   pthread_once(&Once,init_tables);
@@ -70,7 +45,6 @@ static inline void init(void){
 // ---------------------------------------------------------------------------
 // Reed-Solomon over GF(64)
 
-#ifndef HAVE_LIBFEC
 static inline int gf_mul(int a,int b){
   if(a == 0 || b == 0)
     return 0;
@@ -97,7 +71,6 @@ static int gf_poly_mul(int *r,int const *a,int alen,int const *b,int blen){
       r[i+j] ^= gf_mul(a[i],b[j]);
   return rlen;
 }
-#endif
 
 // True if all syndromes S1..S_parity of the word are zero
 static bool is_codeword(int const *sym,int parity){
@@ -133,59 +106,6 @@ static void commit(int *out,int const *poly,bool binary){
   for(int i = 0; i < GF_N; i++)
     out[i] = binary ? (poly[i] != 0) : (poly[i] & GF_N);
 }
-
-#ifdef HAVE_LIBFEC
-// Errors-and-erasures decode by libfec. sym[] is updated only on success. libfec takes the
-// highest power first, so data[j] is x^(62-j) and coefficient i (x^i) is its position 62 - i.
-// It accepts any errata locator whose roots it all finds, and its return value differs between
-// revisions (Phil Karn's: the locator's roots; Debian's: the symbols changed), so our rules are
-// on the corrected word: at most (parity - erasures) / 2 symbols changed outside the erasures,
-// no correction (and no erasure) in the shortened code's zero padding, and the result must be a
-// codeword (of the binary subcode in binary mode). libfec returns 0, no correction, only for a
-// codeword or (Phil Karn's) for a locator of degree 0, so a codeword is recognised here first
-// and 0 from libfec is a failure
-static bool rs_erasures(int *sym,int parity,int length,bool binary,int const *erasures,int t){
-  if(t > parity)
-    return false;
-  if(is_codeword(sym,parity))
-    return true; // already a codeword
-  bool erased[GF_N] = {false};
-  for(int i = 0; i < t; i++){
-    if(erasures[i] >= length)
-      return false; // an erasure in the zero padding: not a codeword of the real code
-    erased[erasures[i]] = true;
-  }
-  unsigned char data[GF_N];
-  for(int j = 0; j < GF_N; j++)
-    data[j] = (unsigned char)sym[GF_N-1-j];
-  int pos[RS_MAXPAR];
-  for(int i = 0; i < t; i++)
-    pos[i] = GF_N - 1 - erasures[i];
-  int const count = decode_rs_char(Rs_full[parity],data,pos,t);
-  if(count <= 0)
-    return false; // the locator does not split, or (0) has degree 0 though the word is no codeword
-  int poly[GF_N];
-  int errors = 0;
-  for(int i = 0; i < GF_N; i++){
-    poly[i] = data[GF_N-1-i];
-    if(poly[i] == sym[i])
-      continue;
-    if(i >= length)
-      return false; // a "correction" in the zero padding: not a codeword of the real code
-    if(!erased[i])
-      errors++;
-  }
-  if(2 * errors + t > parity)
-    return false; // more errors than the code corrects
-  int out[GF_N];
-  commit(out,poly,binary);
-  if(!is_codeword(out,parity))
-    return false;
-  memcpy(sym,out,sizeof out);
-  return true;
-}
-
-#else // our own decoder
 
 // Errors-only decode: Berlekamp iteration for the error locator, Chien search for its roots,
 // Forney for the error values. sym[] is updated only on success
@@ -528,7 +448,6 @@ static bool rs_erasures(int *sym,int parity,int length,bool binary,int const *er
   memcpy(sym,out,sizeof out);
   return true;
 }
-#endif // HAVE_LIBFEC
 
 int rs63_decode(uint8_t sym[GF_N],int parity,int length,int const *erasures,int nerasures){
   assert(sym != NULL);
