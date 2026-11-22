@@ -2,7 +2,7 @@
 // Reads complex baseband (I/Q) RTP streams from radiod, runs one P25 Phase 1 receiver per SSRC
 // and logs what it decodes, one timestamped line per event, on standard output.
 // Follows trunked calls: on a voice channel grant it asks radiod for that channel, and it sends
-// the clear voice it decodes as RTP audio streams
+// the clear voice it decodes as RTP audio streams, and the vocoder frames themselves as RTP streams
 // Copyright 2026, Matthew Kaufman, KA6SQG
 
 #include <assert.h>
@@ -63,6 +63,25 @@ struct block {
   float complex samples[]; // I in the real part, Q in the imaginary, as radiod sends them
 };
 
+// A transmission on a conventional channel (one that is neither a control channel nor a voice
+// channel p25d asked for), for its start and end lines
+struct conv {
+  bool active;
+  bool logged;             // its start line is out
+  uint64_t start;          // sample counts: first and last data unit
+  uint64_t last;
+  bool known;              // talkgroup (or unit) known, from the header or link control
+  bool unit_call;
+  uint32_t target;
+  uint32_t source;
+  char alias[P25_ALIAS_MAX];
+  bool encrypted;
+  bool emergency;
+  int units;               // voice units, words that failed, bits corrected in the voice frames
+  int words_bad;
+  int bits_fixed;
+};
+
 // Decode thread view of a channel. Only that thread touches it, so the decoder's frame and
 // message callbacks (when they exist) can be handed a pointer to it and log without locking
 struct decoder {
@@ -101,6 +120,8 @@ struct decoder {
   struct p25_alias alias;  // talker aliases from link control
   struct work *work;       // to act on after a site's lock is let go
   uint16_t site_nac;       // control: NAC of the last trunking message
+  struct conv conv;        // conventional: the transmission in progress
+  uint16_t conv_nac;
 };
 
 // One for each channel (SSRC) being decoded
@@ -220,6 +241,8 @@ static uint32_t Ssrc;                 // Decode only this SSRC, when specified
 static int64_t Timeout = 20;          // Seconds without data before a channel is closed
 static int Update = 10;               // Seconds of stream between -v status lines
 static char const *Output;            // Voice output group (--pcm-out), NULL for none
+static char const *Frames_output;     // Vocoder frame output group (--frames-out), NULL for none
+static bool Frames_encrypted;         // Also send the frames of encrypted voice units (--frames-encrypted)
 static char const *Name = "p25d";     // Service name it is advertised under
 static int Mcast_ttl = DEFAULT_TTL;   // of the voice output
 static int IP_tos = DEFAULT_IP_TOS;
@@ -246,6 +269,7 @@ static pthread_mutex_t Output_mutex = PTHREAD_MUTEX_INITIALIZER; // One line at 
 static volatile sig_atomic_t Terminate;
 static volatile sig_atomic_t Signal;
 static struct p25_audio_group *Audio_group;
+static struct p25_audio_group *Frames_group;
 static pthread_mutex_t Sites_mutex = PTHREAD_MUTEX_INITIALIZER; // the Sites list
 static struct site *Sites;            // Never freed before exit, so a decode thread can keep a pointer
 static pthread_mutex_t Ctl_mutex = PTHREAD_MUTEX_INITIALIZER;   // Radios[], every chanctl call, site ctl/format
@@ -289,12 +313,17 @@ static void control_block(struct decoder *dp);
 static void control_lost(struct decoder *dp);
 static void voice_unit(struct decoder *dp,uint64_t sample,struct p25_frame const *frame);
 static void link_voice(struct decoder *dp);
+static void conv_unit(struct decoder *dp,uint64_t sample,struct p25_frame const *frame);
+static void conv_end(struct decoder *dp,uint64_t sample,char const *how);
+static void block_done(struct decoder *dp,int count);
 static int parse_talkgroups(uint16_t *list,int n,char const *arg);
 
 static struct option Options[] = {
   {"iface", required_argument, NULL, 'A'},
   {"input", required_argument, NULL, 'I'},
   {"encrypted", no_argument, NULL, 'e'},
+  {"frames-encrypted", no_argument, NULL, 'E'},
+  {"frames-out", required_argument, NULL, 'F'},
   {"talkgroups", required_argument, NULL, 'g'},
   {"locale", required_argument, NULL, 'l'},
   {"max-calls", required_argument, NULL, 'm'},
@@ -312,10 +341,10 @@ static struct option Options[] = {
   {"version", no_argument, NULL, 'V'},
   {NULL, 0, NULL, 0},
 };
-static char const Optstring[] = "A:eg:I:l:m:nN:o:p:R:S:t:T:u:vVx:";
+static char const Optstring[] = "A:eEF:g:I:l:m:nN:o:p:R:S:t:T:u:vVx:";
 
 static void usage(void){
-  fprintf(stderr,"Usage: %s [-v|--verbose] [-V|--version] [-l|--locale locale] [-A|--iface interface] [-o|--source <source-name-or-address>] [-S|--ssrc ssrc] [-t|--timeout seconds] [-u|--update seconds] [-R|--pcm-out audio_mcast_address] [-N|--name service_name] [-T|--ttl ttl] [-p|--tos tos] [-n|--no-follow] [-g|--talkgroups list] [-x|--exclude list] [-m|--max-calls n] [-e|--encrypted] [-I|--input] iq_mcast_address [iq_mcast_address ...]\n",App_path);
+  fprintf(stderr,"Usage: %s [-v|--verbose] [-V|--version] [-l|--locale locale] [-A|--iface interface] [-o|--source <source-name-or-address>] [-S|--ssrc ssrc] [-t|--timeout seconds] [-u|--update seconds] [-R|--pcm-out audio_mcast_address] [-F|--frames-out frames_mcast_address] [-E|--frames-encrypted] [-N|--name service_name] [-T|--ttl ttl] [-p|--tos tos] [-n|--no-follow] [-g|--talkgroups list] [-x|--exclude list] [-m|--max-calls n] [-e|--encrypted] [-I|--input] iq_mcast_address [iq_mcast_address ...]\n",App_path);
 }
 
 int main(int argc,char *argv[]){
@@ -339,6 +368,12 @@ int main(int argc,char *argv[]){
       break;
     case 'e':
       Follow_encrypted = true;
+      break;
+    case 'E':
+      Frames_encrypted = true;
+      break;
+    case 'F':
+      Frames_output = optarg;
       break;
     case 'g':
       Nallow = parse_talkgroups(Allow,Nallow,optarg);
@@ -423,7 +458,10 @@ int main(int argc,char *argv[]){
     Follow = false;
   }
   if(p25_vocoder_name(P25_CODEC_IMBE) == NULL)
-    fprintf(stderr,"%s: built without a vocoder (mbelib): no voice output\n",App_path);
+    fprintf(stderr,"%s: built without a vocoder (mbelib): no voice output%s\n",App_path,
+	    Frames_output != NULL ? " (vocoder frames are sent)" : "");
+  if(Frames_encrypted && Frames_output == NULL)
+    fprintf(stderr,"%s: --frames-encrypted has no effect without --frames-out\n",App_path);
   if(Source != NULL){
     Source_socket = calloc(1,sizeof(struct sockaddr_storage));
     assert(Source_socket != NULL);
@@ -454,6 +492,15 @@ int main(int argc,char *argv[]){
     if(Verbose)
       fprintf(stderr,"%s: voice to %s (%s)\n",App_path,Output,p25_vocoder_name(P25_CODEC_IMBE));
   }
+  if(Frames_output != NULL){
+    // A service name of its own, so the two streams are told apart when browsing
+    char name[256];
+    snprintf(name,sizeof name,"%s frames",Name);
+    if((Frames_group = p25_frames_open(Frames_output,Default_mcast_iface,Mcast_ttl,IP_tos,name,Frames_encrypted)) == NULL)
+      exit(EX_TEMPFAIL); // Let systemd restart us
+    if(Verbose)
+      fprintf(stderr,"%s: vocoder frames to %s%s\n",App_path,Frames_output,Frames_encrypted ? ", encrypted ones too" : "");
+  }
   // Graceful signal catch
   signal(SIGINT,closedown);
   signal(SIGQUIT,closedown);
@@ -465,6 +512,7 @@ int main(int argc,char *argv[]){
   input_loop(); // Returns on a signal
   cleanup();
   p25_audio_close(Audio_group);
+  p25_audio_close(Frames_group);
   if(Verbose)
     fprintf(stderr,"%s: caught signal %d: %s\n",App_path,(int)Signal,strsignal(Signal));
   exit((Signal == SIGTERM || Signal == SIGINT) ? EX_OK : EX_SOFTWARE);
@@ -911,7 +959,7 @@ static void *decode_task(void *arg){
     fprintf(stderr,"ssrc %u: out of memory\n",sp->ssrc);
     return NULL;
   }
-  dec.audio = p25_audio_create(Audio_group,sp->ssrc); // NULL without --pcm-out
+  dec.audio = p25_audio_create(Audio_group,Frames_group,sp->ssrc); // NULL without --pcm-out or --frames-out
   p25_alias_init(&dec.alias);
   while(true){
     pthread_mutex_lock(&sp->qmutex);
@@ -961,7 +1009,7 @@ static void *decode_task(void *arg){
     if(dec.p25 != NULL){
       p25p1_samples(dec.p25,bp->samples,bp->count); // decoder_frame() runs in here
     }
-    p25_audio_poll(dec.audio,dec.frequency,decoder_time(&dec,dec.block_start + bp->count));
+    block_done(&dec,bp->count);
     if(dec.control)
       control_block(&dec);
     dec.samples += bp->count;
@@ -973,11 +1021,21 @@ static void *decode_task(void *arg){
   }
   if(dec.control)
     control_lost(&dec);
+  if(dec.conv.active)
+    conv_end(&dec,dec.conv.last,Terminate ? "p25d shutting down" : "channel closed");
   p25_audio_destroy(dec.audio);
   FREE(dec.work);
   if(dec.p25 != NULL)
     delete_p25p1(dec.p25);
   return NULL;
+}
+
+// After each block: the voice output's clock, and the end of a conventional transmission that
+// stopped without a terminator (the next voice unit overdue by half a second, as p25audio decides)
+static void block_done(struct decoder *dp,int count){
+  p25_audio_poll(dp->audio,dp->frequency,decoder_time(dp,dp->block_start + count));
+  if(dp->conv.active && dp->samples + count - dp->conv.last > (uint64_t)((0.18 + 0.5) * dp->samprate))
+    conv_end(dp,dp->conv.last,"timeout");
 }
 
 // Log one decoded message for a channel, with the band plan's frequencies where it names channels
@@ -1029,6 +1087,8 @@ static void decoder_frame(void *arg,struct p25_frame const *frame){
     voice_unit(dp,sample,frame); // the trunking logic, then the voice output under its labels
   else
     p25_audio_frame(dp->audio,frame,decoder_time(dp,sample)); // voice output on this module's own rule
+  if(!dp->voice && !dp->control)
+    conv_unit(dp,sample,frame);
   struct p25_msg msg;
   switch(frame->duid){
   case P25_DUID_TSDU:
@@ -1779,9 +1839,12 @@ static void voice_unit(struct decoder *dp,uint64_t sample,struct p25_frame const
 
   if(new_alias)
     decoder_event(dp,sample,"NAC %03x talker alias src %u \"%s\"",frame->nac,label.source,alias.text);
-  if(ldu && label.call_id != dp->call_id){
-    // Another call (or none) on this channel: what was held for the last one is never decoded
-    p25_audio_call_end(dp->audio);
+  if((ldu || (duid == P25_DUID_HDU && label.call_id != 0)) && label.call_id != dp->call_id){
+    // Another call (or none) on this channel: what was held for the last one is never decoded.
+    // Not when the first call is learned (none before): the transmission is the same, and what its
+    // header or encryption sync said (clear, and the encryption parameters) stays with it
+    if(dp->call_id != 0)
+      p25_audio_call_end(dp->audio);
     dp->call_id = label.call_id;
   }
   if(release != 0)
@@ -1810,6 +1873,132 @@ static void voice_unit(struct decoder *dp,uint64_t sample,struct p25_frame const
     p25_audio_set_stream(dp->audio,ssrc,desc);
   }
   p25_audio_unit(dp->audio,frame,when,ldu ? audio_label(&label) : P25_AUDIO_UNLABELLED);
+}
+
+// ---------------------------------------------------------------------------
+// Conventional channels: one line when a transmission starts, once its talkgroup (or unit) and
+// source are known or after four voice units without them, and one when it ends, as the trunked
+// call lines do
+
+static void conv_start_line(struct decoder *dp){
+  struct conv * const c = &dp->conv;
+  char id[256];
+  int n;
+  if(c->known)
+    n = snprintf(id,sizeof id,"%s %u src %u",c->unit_call ? "unit tgt" : "group tg",c->target,c->source);
+  else
+    n = snprintf(id,sizeof id,"talkgroup unknown src %u",c->source);
+  if(strlen(c->alias) > 0 && n > 0 && (size_t)n < sizeof id)
+    snprintf(id + n,sizeof id - n," alias \"%s\"",c->alias);
+  decoder_event(dp,c->start,"NAC %03x transmission start %s%s%s",dp->conv_nac,id,
+		c->emergency ? " emergency" : "",c->encrypted ? " encrypted" : "");
+  c->logged = true;
+}
+
+// 'how': terminator, timeout (no voice for 0.5 s past the next unit's time), new transmission
+// (a header, or link control naming another talkgroup or source), channel closed, shutdown
+static void conv_end(struct decoder *dp,uint64_t sample,char const *how){
+  struct conv * const c = &dp->conv;
+  if(!c->active)
+    return;
+  if(c->units > 0 || Verbose){
+    if(!c->logged)
+      conv_start_line(dp);
+    char id[256];
+    int n;
+    if(c->known)
+      n = snprintf(id,sizeof id,"%s %u src %u",c->unit_call ? "unit tgt" : "group tg",c->target,c->source);
+    else
+      n = snprintf(id,sizeof id,"talkgroup unknown src %u",c->source);
+    if(strlen(c->alias) > 0 && n > 0 && (size_t)n < sizeof id)
+      snprintf(id + n,sizeof id - n," alias \"%s\"",c->alias);
+    double const secs = dp->samprate > 0 ? (double)(c->last - c->start) / dp->samprate + (c->units > 0 ? 0.18 : 0) : 0;
+    decoder_event(dp,sample,"NAC %03x transmission end %s%s%s after %.1f s, %d voice units, %d words bad, %d bits corrected, %s",
+		  dp->conv_nac,id,c->emergency ? " emergency" : "",c->encrypted ? " encrypted" : "",secs,c->units,c->words_bad,c->bits_fixed,how);
+  }
+  memset(c,0,sizeof *c);
+}
+
+static void conv_begin(struct decoder *dp,uint64_t sample,uint16_t nac){
+  memset(&dp->conv,0,sizeof dp->conv);
+  dp->conv.active = true;
+  dp->conv.start = dp->conv.last = sample;
+  dp->conv_nac = nac;
+}
+
+static void conv_unit(struct decoder *dp,uint64_t sample,struct p25_frame const *frame){
+  struct conv * const c = &dp->conv;
+  struct p25_msg msg;
+  uint8_t octets[15];
+  switch(frame->duid){
+  case P25_DUID_HDU:
+    if(c->active)
+      conv_end(dp,c->last,"new transmission");
+    conv_begin(dp,sample,frame->nac);
+    if(frame->word != NULL && frame->word->ok){
+      p25_pack_bits(octets,frame->word->bits,120);
+      if(p25_decode_hdu(&msg,octets) == 0){
+	c->known = true;
+	c->unit_call = false;
+	c->target = msg.group;
+	c->encrypted |= msg.algid != 0x80;
+      }
+    }
+    break;
+  case P25_DUID_LDU1:
+  case P25_DUID_LDU2:
+    {
+      struct p25_ldu const * const ldu = frame->ldu;
+      if(ldu == NULL)
+	break;
+      if(frame->duid == P25_DUID_LDU1 && ldu->word.ok){
+	p25_pack_bits(octets,ldu->word.bits,72);
+	if(p25_decode_lc(&msg,octets,false) == 0 && !msg.protect
+	   && (msg.kind == P25_LC_GRP_V_CH_USR || msg.kind == P25_LC_MOT_GRG_V_CH_USR || msg.kind == P25_LC_UU_V_CH_USR)){
+	  bool const unit_call = msg.kind == P25_LC_UU_V_CH_USR;
+	  uint32_t const target = unit_call ? msg.tgt : msg.group;
+	  // Another talkgroup or talker with no terminator and header between: another transmission
+	  if(c->active && c->known && (c->unit_call != unit_call || c->target != target
+				       || (c->source != 0 && msg.src != 0 && c->source != msg.src)))
+	    conv_end(dp,c->last,"new transmission");
+	  if(!c->active)
+	    conv_begin(dp,sample,frame->nac);
+	  c->known = true;
+	  c->unit_call = unit_call;
+	  c->target = target;
+	  if(msg.src != 0)
+	    c->source = msg.src;
+	  c->encrypted |= (msg.svc & P25_SVC_ENCRYPTED) != 0;
+	  c->emergency |= (msg.svc & 0x80) != 0;
+	}
+	struct p25_alias_result alias;
+	if(p25_decode_lc(&msg,octets,false) == 0 && p25_alias_lc(&dp->alias,&msg,&alias) && alias.len > 0)
+	  strlcpy(c->alias,alias.text,sizeof c->alias);
+      } else if(frame->duid == P25_DUID_LDU2 && ldu->word.ok){
+	p25_pack_bits(octets,ldu->word.bits,96);
+	if(p25_decode_es(&msg,octets) == 0)
+	  c->encrypted |= msg.algid != 0x80;
+      }
+      if(!c->active)
+	conv_begin(dp,sample,frame->nac); // late entry
+      c->last = sample;
+      c->units++;
+      if(!ldu->word.ok)
+	c->words_bad++;
+      for(int i=0; i < P25_IMBE_FRAMES; i++)
+	c->bits_fixed += ldu->voice[i].total;
+      if(!c->logged && ((c->known && c->source != 0) || c->units >= 4))
+	conv_start_line(dp);
+    }
+    break;
+  case P25_DUID_TDU:
+  case P25_DUID_TDULC:
+    if(c->active)
+      conv_end(dp,sample,"terminator");
+    break;
+  default:
+    break;
+  }
 }
 
 // Talkgroup list: numbers and ranges, comma separated ("100,200-299"), added to list[n]

@@ -3,6 +3,7 @@
 # Every channel (SSRC) on the group is decoded; events from all instances are appended to /var/log/p25d.log
 # Trunked calls are followed (p25d asks radiod for their voice channels and releases them on stop).
 # For voice output add -R, e.g. with systemctl edit: ExecStart= then ExecStart=@sbindir@/p25d -R p25-pcm.local %i
+# For the vocoder frames themselves (for your own vocoder) add -F, e.g. -F p25-frames.local
 
 [Unit]
 Description=P25 decoder %i
