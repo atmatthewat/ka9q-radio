@@ -1,7 +1,7 @@
 // P25 decoder daemon for ka9q-radio
 // Reads complex baseband (I/Q) RTP streams from radiod, runs one P25 receiver per SSRC (Phase 1,
-// or Phase 2 on a TDMA voice channel it asked for) and logs what it decodes, one timestamped line
-// per event, on standard output.
+// or Phase 2 on a TDMA voice channel it asked for or a TDMA control channel) and logs what it
+// decodes, one timestamped line per event, on standard output.
 // Follows trunked calls: on a voice channel grant it asks radiod for that channel, and it sends
 // the clear voice it decodes as RTP audio streams, and the vocoder frames themselves as RTP streams
 // Copyright 2026, Matthew Kaufman, KA6SQG
@@ -85,11 +85,13 @@ struct conv {
   int bits_fixed;
 };
 
-// Which receiver a channel needs: Phase 1 (FDMA), unless it is a voice channel p25d asked for to
-// follow a Phase 2 (TDMA) call
+// Which receiver a channel needs. A voice channel p25d asked for: the one its grant says. Any
+// other channel: not known (RX_NONE) until a receiver has decoded something there; at a rate the
+// Phase 2 receiver can take, both run on the same samples until then (a TDMA control channel)
 enum receiver { RX_NONE, RX_PHASE1, RX_PHASE2 };
 
-// One timeslot of a Phase 2 voice channel: its own call, label state and output streams
+// One timeslot of a Phase 2 voice channel (or the traffic timeslot of a TDMA control channel):
+// its own call, label state and output streams
 struct p2slot {
   struct p25_audio *audio;   // NULL without --pcm-out or --frames-out
   uint32_t call_id;          // call of the last voice burst
@@ -112,8 +114,10 @@ struct decoder {
   struct session *sp;
   enum receiver rx;
   struct p25p1 *p25;
-  struct p25p2 *p2;        // Phase 2 voice channel: its receiver, its two timeslots
+  struct p25p2 *p2;        // Phase 2: its receiver, its two timeslots
   struct p2slot slot[2];
+  bool choosing;           // rx not known yet: both receivers run, the first to decode stays
+  bool lcch[2];            // Phase 2 control channel: timeslots its LCCH has been heard on
   bool scrambling;         // Phase 2: scrambling parameters set
   bool scrambling_said;    // and said once that they are not known yet
   double samprate;
@@ -210,6 +214,8 @@ struct fcall {
   int slot;
   uint32_t flags;            // P25_TRUNK_F_* as last reported
   bool requested;            // its channel was asked for and not released
+  bool local;                // followed on the other timeslot of the site's own TDMA control
+			     // carrier: decoded from the control channel's samples, nothing asked for
   bool refused;              // radiod refused its channel
   uint32_t ssrc;             // of its voice channel, when requested
   bool seed;                 // the control channel's carrier offset, for the voice channel's receiver
@@ -233,6 +239,9 @@ struct site {
   struct p25_trunk *trunk;   // NULL while the control channel is not being received
   double freq;               // control channel, Hz, and the NAC it last decoded with
   uint16_t nac;
+  bool phase2;               // the control channel is TDMA (LCCH). Also written under Ctl_mutex
+  uint64_t carrier_hz;       // the control channel's carrier as the band plan names it
+  bool carrier_granted;      // carrier_hz is the frequency of a grant of the carrier's other slot
   int64_t now;               // last time given to the trunking logic: it must not go back
   struct fcall calls[P25_TRUNK_MAX_CALLS];
   uint64_t refused[MAX_REFUSED];
@@ -299,6 +308,14 @@ static int const Ctl_ttl = 1;         // Commands to radiod, as tune and control
 // Everything else (encoding, gain, AGC, data group) is the control channel's
 static int const P2_samprate = 4 * P25P2_SYMRATE;
 static float const P2_edge = 5000;
+// A Phase 1 voice channel granted on a TDMA control channel (which runs at 24 kHz) is asked for
+// in the form docs/p25d.md gives a Phase 1 channel: 19.2 kHz, four samples per 4800 baud symbol,
+// filter +/-5 kHz. Granted on a Phase 1 control channel it gets that channel's form, as configured
+static int const P1_samprate = 4 * P25_SYMRATE;
+static float const P1_edge = 5000;
+// A grant names the control channel's own carrier when its frequency is this close to the
+// channel's (P25 channels lie at least 6.25 kHz apart; radiod may report the frequency rounded)
+static int64_t const Carrier_match = 1000;
 
 // Global variables
 static int Data_fd[MAX_MCAST];
@@ -351,13 +368,14 @@ static void control_message(struct decoder *dp,uint64_t sample,struct p25_msg co
 static void control_block(struct decoder *dp);
 static void control_lost(struct decoder *dp);
 static void voice_unit(struct decoder *dp,uint64_t sample,struct p25_frame const *frame);
-static void link_voice(struct decoder *dp);
+static bool link_voice(struct decoder *dp);
 static void conv_unit(struct decoder *dp,uint64_t sample,struct p25_frame const *frame);
 static void conv_end(struct decoder *dp,uint64_t sample,char const *how);
 static void block_done(struct decoder *dp,int count);
 static int parse_talkgroups(uint16_t *list,int n,char const *arg);
 static void p2_burst(void *arg,struct p25p2_burst const *burst);
 static void p2_block(struct decoder *dp);
+static void choose(struct decoder *dp,enum receiver rx);
 static void p2_status_line(struct decoder const *dp);
 
 static struct option Options[] = {
@@ -1022,8 +1040,9 @@ static void *decode_task(void *arg){
       break; // Told to terminate, and nothing left
 
     dec.frequency = bp->frequency;
-    if(Follow && !dec.voice && !dec.control)
-      link_voice(&dec); // before the receiver is created, so it can be seeded
+    if(Follow && !dec.voice && !dec.control && link_voice(&dec) && dec.samprate != 0
+       && (dec.choosing || (dec.rx == RX_PHASE2) != (dec.p2 != NULL)))
+      dec.samprate = 0; // a channel already running, now granted: start the receiver its grant says
     if(bp->samprate != dec.samprate){
       // First block, or the sample rate changed
       p25_audio_call_end(dec.audio);
@@ -1038,7 +1057,13 @@ static void *decode_task(void *arg){
       dec.samprate = bp->samprate;
       dec.samples = 0;
       dec.next_report = (uint64_t)(Update * dec.samprate);
-      if(dec.rx == RX_PHASE2){
+      if(!dec.voice)
+	dec.rx = RX_NONE; // chosen again from what decodes at the new rate
+      // A channel p25d did not ask for may be a TDMA control channel: at a rate the Phase 2
+      // receiver can take, it runs beside the Phase 1 receiver until one of them decodes a
+      // message that passes its check (choose())
+      dec.choosing = !dec.voice && dec.samprate >= P2_samprate;
+      if(dec.rx == RX_PHASE2 || dec.choosing){
 	dec.p2 = create_p25p2(dec.samprate);
 	if(dec.p2 == NULL)
 	  fprintf(stderr,"ssrc %u: can't create P25 Phase 2 receiver at %'.0lf Hz (needs at least %d Hz)\n",
@@ -1050,7 +1075,8 @@ static void *decode_task(void *arg){
 	    p25p2_seed_frequency(dec.p2,dec.seed_hz,true);
 	  dec.scrambling = false; // set again from the site (p2_block)
 	}
-      } else {
+      }
+      if(dec.rx != RX_PHASE2){
 	dec.p25 = create_p25p1(dec.samprate);
 	if(dec.p25 == NULL)
 	  fprintf(stderr,"ssrc %u: can't create P25 receiver at %'.0lf Hz (needs at least %d Hz)\n",
@@ -1068,9 +1094,10 @@ static void *decode_task(void *arg){
     dec.frequency = bp->frequency;
     dec.block_time = bp->time;
     dec.block_start = dec.samples;
-    if(dec.p25 != NULL){
+    // While both run, a receiver's callback can choose() the other's deletion; never its own
+    if(dec.p25 != NULL)
       p25p1_samples(dec.p25,bp->samples,bp->count); // decoder_frame() runs in here
-    } else if(dec.p2 != NULL){
+    if(dec.p2 != NULL){
       p2_block(&dec); // the scrambling parameters, once the site knows them
       p25p2_samples(dec.p2,bp->samples,bp->count); // p2_burst() runs in here
     }
@@ -1080,10 +1107,10 @@ static void *decode_task(void *arg){
     dec.samples += bp->count;
     FREE(bp);
     if(Verbose && Update > 0 && dec.samples >= dec.next_report){
+      if(dec.p25 != NULL)
+	status_line(&dec);
       if(dec.p2 != NULL)
 	p2_status_line(&dec);
-      else
-	status_line(&dec);
       dec.next_report += (uint64_t)(Update * dec.samprate);
     }
   }
@@ -1157,6 +1184,31 @@ static bool lc_seen(struct decoder *dp,uint64_t sample,uint8_t const lc[9]){
 static void decoder_frame(void *arg,struct p25_frame const *frame){
   struct decoder * const dp = (struct decoder *)arg;
   uint64_t const sample = dp->block_start; // to the block; a block is one RTP packet
+  if(dp->choosing){
+    // The first data unit whose contents pass their check settles it: Phase 1. A terminator
+    // without link control has no check of its own beyond the NID, so it does not count
+    bool good = false;
+    switch(frame->duid){
+    case P25_DUID_TSDU:
+      good = frame->crc >= 0;
+      break;
+    case P25_DUID_HDU:
+    case P25_DUID_TDULC:
+      good = frame->word != NULL && frame->word->ok;
+      break;
+    case P25_DUID_LDU1:
+    case P25_DUID_LDU2:
+      good = frame->ldu != NULL && frame->ldu->word.ok;
+      break;
+    case P25_DUID_PDU:
+      good = frame->pdu != NULL;
+      break;
+    default:
+      break;
+    }
+    if(good)
+      choose(dp,RX_PHASE1);
+  }
   if(dp->voice)
     voice_unit(dp,sample,frame); // the trunking logic, then the voice output under its labels
   else
@@ -1410,7 +1462,7 @@ static bool was_refused(struct site const *site,uint64_t freq_hz){
 static int requested_count(struct site const *site){
   int n = 0;
   for(int i=0; i < P25_TRUNK_MAX_CALLS; i++)
-    n += site->calls[i].used && site->calls[i].requested;
+    n += site->calls[i].used && (site->calls[i].requested || site->calls[i].local);
   return n;
 }
 
@@ -1442,14 +1494,17 @@ static enum receiver choose_receiver(uint32_t flags,char const **why){
 }
 
 // The form a call's channel is asked for in: the control channel's, and for Phase 2 its own
-// sample rate and filter (P2_samprate, P2_edge). Under Ctl_mutex
+// sample rate and filter (P2_samprate, P2_edge), and a Phase 1 channel granted on a TDMA control
+// channel the Phase 1 form (P1_samprate, P1_edge). Under Ctl_mutex
 static void call_format(struct chanctl_format *f,struct site const *site,bool tdma){
   *f = site->format;
-  if(tdma){
-    f->samprate = P2_samprate;
-    f->low = -P2_edge;
-    f->high = +P2_edge;
-    int const pt = pt_from_info(P2_samprate,f->channels,f->encoding); // as radiod chooses it
+  if(tdma || site->phase2){
+    int const rate = tdma ? P2_samprate : P1_samprate;
+    float const edge = tdma ? P2_edge : P1_edge;
+    f->samprate = rate;
+    f->low = -edge;
+    f->high = +edge;
+    int const pt = pt_from_info(rate,f->channels,f->encoding); // as radiod chooses it
     f->pt = pt > 0 ? pt : 0; // 0: unknown, taken from the new channel's status
   }
 }
@@ -1488,6 +1543,21 @@ static bool want_channel(struct site *site,struct fcall *fc,char const **why){
   }
   if(choose_receiver(fc->flags,why) == RX_NONE)
     return false;
+  if(site->phase2 && fc->slot >= 0 && site->carrier_hz != 0
+     && llabs((int64_t)(fc->freq_hz - site->carrier_hz)) < Carrier_match){
+    // The other timeslot of the control channel's own carrier: its samples are here already, so
+    // the control channel's thread decodes it and nothing is asked of radiod (nor let go)
+    if(Max_calls > 0 && requested_count(site) >= Max_calls){
+      *why = "already following the most calls allowed (--max-calls)";
+      return false;
+    }
+    site->carrier_hz = fc->freq_hz; // the call's key, for the voice heard there
+    site->carrier_granted = true;
+    fc->local = true;
+    fc->ssrc = site->ssrc;
+    *why = NULL;
+    return true;
+  }
   if(was_refused(site,fc->freq_hz)){
     *why = "radiod refused this frequency";
     fc->refused = true;
@@ -1518,6 +1588,8 @@ static bool want_channel(struct site *site,struct fcall *fc,char const **why){
 
 // Ask radiod for the call's channel (again: chanctl sends only when needed)
 static void ask_channel(struct decoder *dp,int *nwork,struct fcall const *fc){
+  if(fc->local)
+    return; // the control channel's own carrier
   struct work * const w = add_work(dp,nwork,WORK_REQUEST);
   if(w != NULL){
     w->ssrc = fc->ssrc;
@@ -1530,6 +1602,7 @@ static void ask_channel(struct decoder *dp,int *nwork,struct fcall const *fc){
 // The call no longer needs its channel. The channel is let go only when no other call needs it
 // (the other slot of a Phase 2 channel)
 static void let_go(struct decoder *dp,int *nwork,struct fcall *fc){
+  fc->local = false; // the control channel's own carrier: nothing to release
   if(!fc->requested)
     return;
   fc->requested = false;
@@ -1623,10 +1696,12 @@ static int take_events(struct decoder *dp,struct site *site,int nwork){
 	break;
       }
       fc->flags = e->flags;
-      if(fc->requested && !(e->flags & P25_TRUNK_F_FOLLOW)){
+      if((fc->requested || fc->local) && !(e->flags & P25_TRUNK_F_FOLLOW)){
 	let_go(dp,&nwork,fc);
 	call_text(id,sizeof id,fc);
 	add_log(dp,&nwork,e->time,"NAC %03x call %s no longer followed: %s",site->nac,id,p25_trunk_why_name(e->why_not));
+      } else if(fc->local){
+	// On the control channel's carrier: nothing to ask for
       } else if(fc->requested){
 	// Still on: ask again. chanctl sends only when needed, and this keeps the channel's lifetime fresh
 	ask_channel(dp,&nwork,fc);
@@ -1653,7 +1728,7 @@ static int take_events(struct decoder *dp,struct site *site,int nwork){
       if((fc = find_call(site,e->call_id)) == NULL)
 	break;
       fc->flags = e->flags;
-      if(fc->requested || fc->ssrc != 0 || Verbose)
+      if(fc->requested || fc->local || fc->ssrc != 0 || Verbose)
 	log_end(dp,&nwork,site,fc,e->time,p25_trunk_end_name(e->end_reason));
       let_go(dp,&nwork,fc);
       fc->used = false;
@@ -1744,15 +1819,30 @@ static void site_unlock(struct site *site,struct decoder *dp,int nwork){
   }
 }
 
+// This channel carries its own site's trunking. False if the site can't be made
+static bool become_control(struct decoder *dp){
+  if(dp->site != NULL)
+    return true;
+  if((dp->site = get_site(dp->sp)) == NULL)
+    return false;
+  dp->control = true;
+  struct site * const site = dp->site;
+  bool const phase2 = dp->p2 != NULL && dp->p25 == NULL;
+  pthread_mutex_lock(&site->lock);
+  pthread_mutex_lock(&Ctl_mutex);
+  site->phase2 = phase2; // a channel's modulation does not change
+  pthread_mutex_unlock(&Ctl_mutex);
+  site->carrier_granted = false;
+  pthread_mutex_unlock(&site->lock);
+  atomic_store(&dp->sp->site,dp->site); // the input thread fills in the command handle and format
+  return true;
+}
+
 // A trunking message decoded on a channel that is not a voice channel p25d asked for: it is a
 // control channel, of its own site
 static void control_message(struct decoder *dp,uint64_t sample,struct p25_msg const *msg){
-  if(dp->site == NULL){
-    if((dp->site = get_site(dp->sp)) == NULL)
-      return;
-    dp->control = true;
-    atomic_store(&dp->sp->site,dp->site); // the input thread fills in the command handle and format
-  }
+  if(!become_control(dp))
+    return;
   struct site * const site = dp->site;
   pthread_mutex_lock(&site->lock);
   site->freq = dp->frequency;
@@ -1769,8 +1859,16 @@ static void control_block(struct decoder *dp){
   pthread_mutex_lock(&site->lock);
   if(site->trunk != NULL){
     site->freq = dp->frequency;
+    // The carrier as the band plan has it (the RFSS status names the control channel), so a grant
+    // of its other timeslot and voice heard there key the same call
+    uint64_t const f = (uint64_t)llrint(dp->frequency);
+    uint64_t const cc = p25_trunk_site(site->trunk)->control_hz;
+    if(!site->carrier_granted)
+      site->carrier_hz = (cc != 0 && llabs((int64_t)(cc - f)) < Carrier_match) ? cc : f;
     if(dp->p25 != NULL)
-      p25_trunk_set_control(site->trunk,(uint64_t)llrint(dp->frequency),p25p1_frequency_offset(dp->p25));
+      p25_trunk_set_control(site->trunk,site->carrier_hz,p25p1_frequency_offset(dp->p25));
+    else if(dp->p2 != NULL)
+      p25_trunk_set_control(site->trunk,site->carrier_hz,p25p2_frequency_offset(dp->p2));
     p25_trunk_tick(site->trunk,site_time(site,decoder_time(dp,dp->block_start)));
   }
   site_unlock(site,dp,0);
@@ -1796,8 +1894,9 @@ static void control_lost(struct decoder *dp){
   site_unlock(site,dp,nwork);
 }
 
-// A voice channel p25d asked for? If some site's call has this SSRC, it is that site's
-static void link_voice(struct decoder *dp){
+// A voice channel p25d asked for? If some site's call has this SSRC, it is that site's. True
+// when this call found it
+static bool link_voice(struct decoder *dp){
   struct session const * const sp = dp->sp;
   pthread_mutex_lock(&Sites_mutex);
   for(struct site *site = Sites; site != NULL && !dp->voice; site = site->next){
@@ -1827,7 +1926,8 @@ static void link_voice(struct decoder *dp){
     // stream. Channel SSRCs are radiod's kHz numbers, and P25 channels lie at least 6.25 kHz
     // apart, so the one above a channel's is no other channel's
     for(int t=0; t < 2; t++){
-      dp->slot[t].audio = p25_audio_create(Audio_group,Frames_group,dp->sp->ssrc + (uint32_t)t);
+      if(dp->slot[t].audio == NULL)
+	dp->slot[t].audio = p25_audio_create(Audio_group,Frames_group,dp->sp->ssrc + (uint32_t)t);
       p25_alias_init(&dp->slot[t].alias);
     }
     p25_audio_destroy(dp->audio); // the Phase 1 streams are not used here
@@ -1839,6 +1939,7 @@ static void link_voice(struct decoder *dp){
 		  dp->seed ? "seeded with the control channel's carrier offset" : "not seeded");
   if(dp->voice && dp->seed && Verbose > 1)
     decoder_event(dp,dp->samples,"seed %.9g Hz",dp->seed_hz); // exactly, for comparing with an offline decode
+  return dp->voice;
 }
 
 // What the trunking logic's label says for the voice output. A held unit whose own label says
@@ -2027,10 +2128,102 @@ static void p2_block(struct decoder *dp){
     dp->scrambling = true;
     if(Verbose || dp->scrambling_said)
       decoder_event(dp,dp->samples,"Phase 2 scrambling: WACN %05x, system %03x, NAC %03x",wacn,sysid,nac);
-  } else if(!dp->scrambling_said){
+  } else if(!dp->scrambling_said && (dp->voice || Verbose)){
     dp->scrambling_said = true;
     decoder_event(dp,dp->samples,"Phase 2 scrambling parameters not known yet (no network status on the control channel): voice not decoded until they are");
   }
+}
+
+static bool voice_user_kind(int kind){
+  return kind == P25_LC_GRP_V_CH_USR || kind == P25_LC_MOT_GRG_V_CH_USR || kind == P25_LC_UU_V_CH_USR
+    || kind == P25_LC_TEL_INT_V_CH_USR;
+}
+
+// The first receiver to decode a message that passes its check stays; the other is deleted. Called
+// from inside the winner's callback, never the loser's (decode_task feeds them one after the other)
+static void choose(struct decoder *dp,enum receiver rx){
+  dp->choosing = false;
+  dp->rx = rx;
+  if(rx == RX_PHASE2){
+    if(dp->p25 != NULL)
+      delete_p25p1(dp->p25);
+    dp->p25 = NULL;
+    // Phase 2 streams, as for a voice channel: the traffic timeslot of a TDMA control channel
+    p25_audio_destroy(dp->audio);
+    dp->audio = NULL;
+    for(int t=0; t < 2; t++){
+      if(dp->slot[t].audio == NULL)
+	dp->slot[t].audio = p25_audio_create(Audio_group,Frames_group,dp->sp->ssrc + (uint32_t)t);
+      p25_alias_init(&dp->slot[t].alias);
+    }
+  } else {
+    if(dp->p2 != NULL)
+      delete_p25p2(dp->p2);
+    dp->p2 = NULL;
+    if(dp->audio == NULL) // chosen again after a change of sample rate
+      dp->audio = p25_audio_create(Audio_group,Frames_group,dp->sp->ssrc);
+  }
+  if(Verbose)
+    decoder_event(dp,dp->block_start,"receiver %s: the first to decode, after %.2f s",
+		  rx == RX_PHASE2 ? "Phase 2 (TDMA)" : "Phase 1",dp->samprate > 0 ? dp->block_start / dp->samprate : 0);
+}
+
+// One MAC structure to the trunking logic in the form it takes (p25_mac_trunk_msgs()): a multiple
+// grant update as single updates, one at a time; from an LCCH as control channel activity
+static void mac_to_trunk(struct p25_trunk *t,struct p25_mac_struct const *ms,uint16_t nac,int64_t now,bool lcch){
+  struct p25_msg m[3];
+  int const n = p25_mac_trunk_msgs(ms,m);
+  for(int i=0; i < n; i++){
+    if(lcch)
+      p25_trunk_lcch(t,&m[i],nac,now);
+    else
+      p25_trunk_control(t,&m[i],nac,now);
+  }
+}
+
+// An LCCH PDU that passed its check: this channel is a Phase 2 control channel. Each structure is
+// logged, as a Phase 1 control channel's TSBKs are, and goes to the site's trunking logic. The
+// NAC is the PDU's color code (bits 152-163 of a MAC_SIGNAL, as OP25 and sdrtrunk read it); the
+// WACN and system ID come from its network status broadcast, as on a Phase 1 control channel
+static void p2_control(struct decoder *dp,int ts,uint64_t sample,struct p25_mac_pdu const *pdu){
+  if(pdu->type == P25_MAC_SIGNAL && pdu->lcch_nac != 0)
+    dp->site_nac = pdu->lcch_nac;
+  bool const new_slot = !dp->lcch[ts];
+  dp->lcch[ts] = true;
+  char text[512];
+  for(int i=0; i < pdu->nstruct; i++){
+    struct p25_mac_struct const * const ms = &pdu->s[i];
+    if(ms->mac_kind == P25_MAC_NULL || ms->mac_kind == P25_MAC_NULL_AZB)
+      continue;
+    if(ms->mac_kind == P25_MAC_MSG)
+      p25_bandplan_update(&dp->plan,&ms->msg);
+    p25_mac_format(text,sizeof text,pdu,i,&dp->plan);
+    decoder_event(dp,sample,"NAC %03x slot %d %s",dp->site_nac,ts,text);
+  }
+  if(pdu->nstruct == 0 && Verbose){
+    p25_mac_format(text,sizeof text,pdu,-1,&dp->plan);
+    decoder_event(dp,sample,"NAC %03x slot %d %s",dp->site_nac,ts,text);
+  }
+  if(new_slot && Verbose)
+    decoder_event(dp,sample,"Phase 2 control channel: LCCH on timeslot %s",dp->lcch[0] && dp->lcch[1] ? "0 and 1" : ts ? "1" : "0");
+  if(!Follow || !become_control(dp))
+    return;
+  struct site * const site = dp->site;
+  pthread_mutex_lock(&site->lock);
+  site->freq = dp->frequency;
+  site->nac = dp->site_nac;
+  struct p25_trunk * const t = site_trunk(site);
+  if(t != NULL){
+    int64_t const now = site_time(site,decoder_time(dp,sample));
+    p25_trunk_set_control_slot(t,dp->lcch[0] && dp->lcch[1] ? -1 : dp->lcch[0] ? 0 : 1);
+    for(int i=0; i < pdu->nstruct; i++){
+      struct p25_mac_struct const * const ms = &pdu->s[i];
+      if(ms->mac_kind == P25_MAC_MSG && voice_user_kind(ms->msg.kind))
+	continue; // names a traffic timeslot's talker; nothing for the control channel
+      mac_to_trunk(t,ms,dp->site_nac,now,true);
+    }
+  }
+  site_unlock(site,dp,0);
 }
 
 // Has this text been logged for the timeslot in the last couple of seconds? If not, note it
@@ -2115,17 +2308,18 @@ static void p2_log(struct decoder *dp,struct p2slot *s,int ts,uint64_t sample,st
 		  b->duid == P25P2_DUID_2V ? (b->ess != NULL && b->ess->ok ? " ESS ok" : " ESS not decoded") : "",errors);
 }
 
-static bool voice_user_kind(int kind){
-  return kind == P25_LC_GRP_V_CH_USR || kind == P25_LC_MOT_GRG_V_CH_USR || kind == P25_LC_UU_V_CH_USR
-    || kind == P25_LC_TEL_INT_V_CH_USR;
-}
-
 // One burst from the Phase 2 receiver, in the decode thread
 static void p2_burst(void *arg,struct p25p2_burst const *b){
   struct decoder * const dp = arg;
   int const ts = b->timeslot;
-  if(ts < 0 || ts > 1 || !dp->voice)
+  if(ts < 0 || ts > 1)
     return;
+  if(dp->choosing){
+    // A MAC PDU that passed its CRC settles it: Phase 2. Until then nothing here is used
+    if(b->mac == NULL || !b->mac->crc_ok)
+      return;
+    choose(dp,RX_PHASE2);
+  }
   struct p2slot * const s = &dp->slot[ts];
   uint64_t const sample = dp->block_start; // to the block, as for Phase 1
   int64_t const when = decoder_time(dp,sample);
@@ -2133,7 +2327,21 @@ static void p2_burst(void *arg,struct p25p2_burst const *b){
   struct p25_mac_pdu pdu;
   bool const have_pdu = b->mac != NULL && b->mac->crc_ok
     && p25_mac_decode(&pdu,(enum p25_mac_chan)b->mac->chan,b->mac->octets,b->mac->nbits) >= 0;
+  if(b->duid == P25P2_DUID_LCCH && !dp->voice){
+    // The control channel itself
+    if(have_pdu)
+      p2_control(dp,ts,sample,&pdu);
+    else
+      p2_log(dp,s,ts,sample,b,NULL);
+    return;
+  }
   p2_log(dp,s,ts,sample,b,have_pdu ? &pdu : NULL);
+  // A voice channel p25d asked for, or the traffic timeslot of a TDMA control channel (the one
+  // its LCCH is not on): the slot's call, as the trunking logic knows it. Anything else (a TDMA
+  // carrier configured by hand, never granted) is only logged
+  bool const traffic = dp->voice || (dp->control && !dp->lcch[ts]);
+  if(!traffic || dp->site == NULL)
+    return;
   struct p25_alias_result alias;
   bool new_alias = false;
   for(int i=0; have_pdu && i < pdu.nstruct; i++)
@@ -2147,9 +2355,10 @@ static void p2_burst(void *arg,struct p25p2_burst const *b){
   int nwork = 0;
   struct site * const site = dp->site;
   pthread_mutex_lock(&site->lock);
-  struct p25_trunk * const t = site->trunk;
+  // The control channel's own carrier is known to the trunking logic by its band plan frequency
+  uint64_t const freq = dp->voice ? dp->trunk_freq : site->carrier_hz;
+  struct p25_trunk * const t = freq != 0 ? site->trunk : NULL;
   uint16_t const nac = site->nac;
-  uint64_t const freq = dp->trunk_freq;
   if(t != NULL){
     int64_t const now = site_time(site,when);
     struct p25_msg m;
@@ -2175,22 +2384,7 @@ static void p2_burst(void *arg,struct p25p2_burst const *b){
       default:
 	for(int i=0; i < pdu.nstruct; i++){
 	  struct p25_mac_struct const * const ms = &pdu.s[i];
-	  if(ms->mac_kind == P25_MAC_GRP_V_CH_GRANT_UPDT_MULT || ms->mac_kind == P25_MAC_GRP_V_CH_GRANT_UPDT_MULT_EXP){
-	    // Several updates in one structure: one at a time, as single updates
-	    for(int g=0; g < ms->ngrants; g++){
-	      memset(&m,0,sizeof m);
-	      m.family = P25_FAMILY_MAC;
-	      m.kind = ms->mac_kind == P25_MAC_GRP_V_CH_GRANT_UPDT_MULT ? P25_GRP_V_CH_GRANT_UPDT : P25_GRP_V_CH_GRANT_UPDT_EXP;
-	      m.svc = ms->grant[g].svc;
-	      m.ch = ms->grant[g].ch;
-	      m.ch_b = ms->grant[g].ch_ul;
-	      m.has_b = m.kind == P25_GRP_V_CH_GRANT_UPDT_EXP;
-	      m.group = ms->grant[g].group;
-	      p25_trunk_control(t,&m,nac,now);
-	    }
-	  } else if(ms->mac_kind != P25_MAC_MSG)
-	    continue;
-	  else if(voice_user_kind(ms->msg.kind)){
+	  if(ms->mac_kind == P25_MAC_MSG && voice_user_kind(ms->msg.kind)){
 	    // Who holds the timeslot, for the next voice burst. Only while voice is under way:
 	    // an idle or hang time PDU names the call, not a transmission
 	    if(pdu.type == P25_MAC_ACTIVE || pdu.type == P25_MAC_SIGNAL){
@@ -2199,7 +2393,7 @@ static void p2_burst(void *arg,struct p25p2_burst const *b){
 	      s->have_user = true;
 	    }
 	  } else
-	    p25_trunk_control(t,&ms->msg,nac,now); // grants, updates and the like
+	    mac_to_trunk(t,ms,nac,now,false); // grants, updates and the like: not a control channel's
 	}
 	if(pdu.type == P25_MAC_IDLE || pdu.type == P25_MAC_HANGTIME)
 	  s->have_user = false;
@@ -2225,6 +2419,8 @@ static void p2_burst(void *arg,struct p25p2_burst const *b){
   }
   nwork = take_events(dp,site,nwork); // a call this burst started is in the table now
   struct fcall * const fc = label.call_id != 0 ? find_call(site,label.call_id) : find_call_freq(site,freq,ts);
+  if(!dp->voice && (fc == NULL || !fc->local))
+    label.decision = P25_TRUNK_VOICE_NONE; // the control carrier's traffic slot: only a call followed there is heard
   if(fc != NULL){
     if(new_alias)
       strlcpy(fc->alias,alias.text,sizeof fc->alias);
@@ -2284,7 +2480,9 @@ static void p2_status_line(struct decoder const *dp){
   struct p25p2_stats st;
   memset(&st,0,sizeof st);
   p25p2_get_stats(dp->p2,&st);
-  decoder_event(dp,dp->samples,"status: Phase 2 %s, offset %+.1f Hz, scrambling %s, fragments %'llu missed %'llu, slot 0 voice frames %'llu MAC %'llu bad %'llu, slot 1 voice frames %'llu MAC %'llu bad %'llu, %'.0lf Hz, packets %'llu drops %'llu dupes %'llu filled %'llu resyncs %'llu overruns %'llu",
+  decoder_event(dp,dp->samples,"status: Phase 2%s %s, offset %+.1f Hz, scrambling %s, fragments %'llu missed %'llu, slot 0 voice frames %'llu MAC %'llu bad %'llu, slot 1 voice frames %'llu MAC %'llu bad %'llu, %'.0lf Hz, packets %'llu drops %'llu dupes %'llu filled %'llu resyncs %'llu overruns %'llu",
+		dp->choosing ? " (receiver not chosen yet)" : dp->lcch[0] && dp->lcch[1] ? " control, LCCH slots 0 and 1"
+		: dp->lcch[0] ? " control, LCCH slot 0" : dp->lcch[1] ? " control, LCCH slot 1" : "",
 		st.locked ? "locked" : "searching",st.frequency_offset,dp->scrambling ? "set" : "not known",
 		(unsigned long long)st.fragments,(unsigned long long)st.missed_fragments,
 		(unsigned long long)st.voice_frames[0],(unsigned long long)st.mac_ok[0],(unsigned long long)st.mac_bad[0],

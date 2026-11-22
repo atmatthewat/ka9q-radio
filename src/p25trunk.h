@@ -249,6 +249,9 @@ void delete_p25_trunk(struct p25_trunk *t);
 // Trunking messages that turn up on a voice channel go here too, and so do a Phase 2 voice
 // channel's MAC structures (P25_FAMILY_MAC: grants and updates as the TSBKs they abbreviate).
 void p25_trunk_control(struct p25_trunk *t,struct p25_msg const *msg,uint16_t nac,int64_t now);
+// A MAC structure from a Phase 2 control channel's LCCH (P25_FAMILY_MAC): as p25_trunk_control(),
+// and it counts as control channel activity as a control channel's TSBK does
+void p25_trunk_lcch(struct p25_trunk *t,struct p25_msg const *msg,uint16_t nac,int64_t now);
 
 // From a voice channel the caller is receiving, identified by its frequency and slot (-1 FDMA),
 // as given in CALL_START. For each data unit, first the word it carried if that decoded (LDU1
@@ -270,6 +273,9 @@ void p25_trunk_tick(struct p25_trunk *t,int64_t now);
 // The control channel's frequency as the caller receives it (voice there means the control
 // channel has moved) and its carrier offset, seeded into newly granted voice channels
 void p25_trunk_set_control(struct p25_trunk *t,uint64_t freq_hz,float offset_hz);
+// A Phase 2 control channel whose LCCH is on one timeslot (0 or 1) of its carrier: voice on the
+// other slot is traffic, not a sign that control has moved. -1 (the default): FDMA, or LCCH on both
+void p25_trunk_set_control_slot(struct p25_trunk *t,int slot);
 
 // The band plan this site has broadcast (for the caller's log lines)
 struct p25_bandplan const *p25_trunk_bandplan(struct p25_trunk const *t);

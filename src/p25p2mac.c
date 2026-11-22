@@ -716,6 +716,33 @@ int p25_mac_decode(struct p25_mac_pdu *pdu, enum p25_mac_chan chan, uint8_t cons
   return pdu->nstruct;
 }
 
+int p25_mac_trunk_msgs(struct p25_mac_struct const *s, struct p25_msg out[3]){
+  if(s == NULL || out == NULL)
+    return 0;
+  if(s->mac_kind == P25_MAC_MSG){
+    out[0] = s->msg;
+    return 1;
+  }
+  if(s->mac_kind != P25_MAC_GRP_V_CH_GRANT_UPDT_MULT && s->mac_kind != P25_MAC_GRP_V_CH_GRANT_UPDT_MULT_EXP)
+    return 0;
+  bool const exp = s->mac_kind == P25_MAC_GRP_V_CH_GRANT_UPDT_MULT_EXP;
+  int n = 0;
+  for(int g = 0; g < s->ngrants && n < 3; g++, n++){
+    struct p25_msg *m = &out[n];
+    memset(m, 0, sizeof *m);
+    m->family = P25_FAMILY_MAC;
+    m->opcode = s->opcode;
+    m->mfid = s->vendor;
+    m->kind = exp ? P25_GRP_V_CH_GRANT_UPDT_EXP : P25_GRP_V_CH_GRANT_UPDT;
+    m->svc = s->grant[g].svc;   // the multiple forms carry service options; the single implicit one does not
+    m->ch = s->grant[g].ch;
+    m->ch_b = s->grant[g].ch_ul;
+    m->has_b = exp;
+    m->group = s->grant[g].group;
+  }
+  return n;
+}
+
 // Names
 
 static char const *const Mac_kind_names[P25_MAC_KIND_COUNT] = {

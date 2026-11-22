@@ -1738,9 +1738,9 @@ journalctl -u radiod@hf -f</pre>
     link control word, encryption sync and packet data unit. When a control
     channel grants a voice channel, p25d asks radiod for that channel, decodes
     it, and lets it go when the call ends. Phase 1 (FDMA) control, voice and
-    conventional channels are decoded, and the Phase 2 (TDMA) voice channels of
-    trunked systems, both timeslots of a carrier from one radiod channel. Phase
-    2 control channels are not decoded.</p>
+    conventional channels are decoded, and the Phase 2 (TDMA) control and voice
+    channels of trunked systems, both timeslots of a carrier from one radiod
+    channel.</p>
 <p class="Pp">The speech of clear (unencrypted) calls can be sent as an 8 kHz
     RTP audio stream that monitor plays and pcmrecord records (when p25d is
     built with mbelib), and the vocoder frames themselves can be sent as an RTP
@@ -1837,9 +1837,19 @@ encoding = f32le
 agc = no
 gain = 60
 freq = &quot;857m98125&quot;</pre>
-<p class="Pp">Voice channels are asked for in the control channel's form (a
-    Phase 2 voice channel at 24 kHz) and need no configuration, except that
-    radiod builds them from its [global] section: see NOTES.</p>
+<p class="Pp">A Phase 2 (TDMA) control channel is configured the same way but at
+    24 kHz (&quot;samprate = 24000&quot;, four samples per 6000 baud symbol). No
+    option says which kind a channel is: on a channel at 24 kHz or more that it
+    did not ask for, p25d runs its Phase 1 and Phase 2 receivers side by side
+    until one of them decodes something that passes its check, and keeps that
+    one. A call on the other timeslot of a TDMA control channel's own carrier is
+    decoded from the control channel itself; nothing more is asked of
+  radiod.</p>
+<p class="Pp">Voice channels are asked for in the control channel's form, except
+    that a Phase 2 voice channel is always asked for at 24 kHz, and a Phase 1
+    voice channel granted on a Phase 2 control channel at 19.2 kHz. They need no
+    configuration, except that radiod builds them from its [global] section: see
+    NOTES.</p>
 </section>
 <section class="Sh">
 <h1 class="Sh" id="INPUT_AND_OUTPUT"><a class="permalink" href="#INPUT_AND_OUTPUT">INPUT

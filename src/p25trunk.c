@@ -104,6 +104,7 @@ struct p25_trunk {
   struct p25_trunk_site site;
   uint64_t control_freq;
   float control_offset;
+  int control_slot;          // the control channel's timeslot on a TDMA carrier (LCCH), -1 FDMA or both
   // The word of the voice unit about to be passed
   bool pending;
   uint64_t pend_freq;
@@ -1156,9 +1157,12 @@ static void control_loss(struct p25_trunk *t){
   control_event(t, P25_TRUNK_F_LOST, t->control_freq, "lost");
 }
 
-// Voice on the control channel's frequency: control has moved elsewhere
-static void voice_on_control(struct p25_trunk *t, uint64_t freq){
+// Voice on the control channel's frequency: control has moved elsewhere. Not on the other
+// timeslot of a TDMA control carrier whose LCCH is on one slot only: that slot carries traffic
+static void voice_on_control(struct p25_trunk *t, uint64_t freq, int slot){
   if(!t->site.control_up || t->control_freq == 0 || freq != t->control_freq)
+    return;
+  if(t->control_slot >= 0 && slot >= 0 && slot != t->control_slot)
     return;
   t->site.control_up = false;
   control_event(t, P25_TRUNK_F_LOST, freq, "lost: voice on the control channel");
@@ -1201,6 +1205,7 @@ struct p25_trunk *create_p25_trunk(struct p25_trunk_config const *config, p25_tr
   t->config.ndeny = deny ? t->config.ndeny : 0;
   t->handler = handler;
   t->arg = arg;
+  t->control_slot = -1;
   p25_bandplan_init(&t->plan);
   return t;
 }
@@ -1219,13 +1224,15 @@ static void begin(struct p25_trunk *t, int64_t now){
   expire(t);
 }
 
-void p25_trunk_control(struct p25_trunk *t, struct p25_msg const *m, uint16_t nac, int64_t now){
+static void control_msg(struct p25_trunk *t, struct p25_msg const *m, uint16_t nac, int64_t now, bool lcch){
   if(t == NULL || m == NULL)
     return;
   if(t->config.nac != 0 && nac != t->config.nac)
     return; // another system's
   begin(t, now);
-  if(m->family == P25_FAMILY_TSBK){
+  if(lcch)
+    control_activity(t); // an LCCH is only ever sent on a control channel
+  else if(m->family == P25_FAMILY_TSBK){
     // These opcodes are sent only by a control channel (any manufacturer's table)
     switch(m->opcode){
     case 0x00: case 0x02: case 0x38: case 0x3a: case 0x3b: case 0x3c: case 0x3d:
@@ -1236,8 +1243,8 @@ void p25_trunk_control(struct p25_trunk *t, struct p25_msg const *m, uint16_t na
     }
   }
   bool const mbt = m->family == P25_FAMILY_MBT;
-  // A Phase 2 voice channel's MAC structures: the same messages, read as the TSBKs they
-  // abbreviate (those that carry service options do so in both forms); not a control channel's
+  // MAC structures: the same messages, read as the TSBKs they abbreviate (those that carry service
+  // options do so in both forms). A voice channel's are not control channel activity; an LCCH's are
   if(m->family != P25_FAMILY_TSBK && !mbt && m->family != P25_FAMILY_MAC){
     finish(t);
     return;
@@ -1316,10 +1323,17 @@ void p25_trunk_control(struct p25_trunk *t, struct p25_msg const *m, uint16_t na
     note_rfss(t, m->sysid, m->rfss, m->site, m->ch, m->svc_class);
     break;
   case P25_NET_STS_BCST:
+  case P25_NET_STS_BCST_EXP:   // multi-block and MAC explicit forms: the same fields
     note_network(t, m->wacn, m->sysid);
     break;
   case P25_ADJ_STS_BCST:
     note_adjacent(t, m->sysid, m->rfss, m->site, m->ch, m->svc_class);
+    break;
+  case P25_RFSS_STS_BCST_EXP:  // a form without a system ID is this site's
+    note_rfss(t, m->sysid ? m->sysid : t->site.sysid, m->rfss, m->site, m->ch, m->svc_class);
+    break;
+  case P25_ADJ_STS_BCST_EXP:
+    note_adjacent(t, m->sysid ? m->sysid : t->site.sysid, m->rfss, m->site, m->ch, m->svc_class);
     break;
   case P25_IDEN_UP:
   case P25_IDEN_UP_TDMA:
@@ -1330,6 +1344,14 @@ void p25_trunk_control(struct p25_trunk *t, struct p25_msg const *m, uint16_t na
     break;
   }
   finish(t);
+}
+
+void p25_trunk_control(struct p25_trunk *t, struct p25_msg const *m, uint16_t nac, int64_t now){
+  control_msg(t, m, nac, now, false);
+}
+
+void p25_trunk_lcch(struct p25_trunk *t, struct p25_msg const *m, uint16_t nac, int64_t now){
+  control_msg(t, m, nac, now, true);
 }
 
 // Link control (LDU1 or TDULC) about the site, patches and alarms, not this channel's call
@@ -1465,7 +1487,7 @@ static int voice_frames(struct p25_trunk *t, struct call *c, struct lcd const *l
 
 // An LDU1: its link control (NULL if it did not decode) names who holds the channel
 static int voice_ldu1(struct p25_trunk *t, struct key const *k, struct p25_msg const *m, int erasures){
-  voice_on_control(t, k->freq);
+  voice_on_control(t, k->freq, k->slot);
   if(m != NULL)
     site_lc(t, m);
   bool const user = channel_user(m);
@@ -1654,7 +1676,7 @@ int p25_trunk_voice_unit(struct p25_trunk *t, uint64_t freq_hz, int slot, int du
     voice_end(t, &k);
     break;
   case P25_DUID_TDULC:
-    voice_on_control(t, freq_hz);
+    voice_on_control(t, freq_hz, slot);
     if(m != NULL)
       site_lc(t, m);
     voice_end(t, &k);
@@ -1694,6 +1716,12 @@ void p25_trunk_set_control(struct p25_trunk *t, uint64_t freq_hz, float offset_h
     return;
   t->control_freq = freq_hz;
   t->control_offset = offset_hz;
+}
+
+void p25_trunk_set_control_slot(struct p25_trunk *t, int slot){
+  if(t == NULL)
+    return;
+  t->control_slot = slot == 0 || slot == 1 ? slot : -1;
 }
 
 struct p25_bandplan const *p25_trunk_bandplan(struct p25_trunk const *t){

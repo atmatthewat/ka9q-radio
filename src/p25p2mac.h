@@ -116,6 +116,13 @@ int p25_mac_decode(struct p25_mac_pdu *pdu, enum p25_mac_chan chan, uint8_t cons
 // p25_mac_decode walks them (the rest of the PDU for an unknown opcode); 0 ends the walk
 int p25_mac_struct_len(uint8_t const *octets, int nbits, enum p25_mac_chan chan, int offset);
 
+// The messages a structure stands for, in the form p25_trunk_control() takes (P25_FAMILY_MAC):
+// a structure p25msg has a kind for as it is; a multiple group grant update (0x05, 0x25) as its
+// single updates (implicit P25_GRP_V_CH_GRANT_UPDT with the group in 'group', explicit
+// P25_GRP_V_CH_GRANT_UPDT_EXP), each with its own service options; anything else none.
+// Returns how many (0-3) were written to out[]
+int p25_mac_trunk_msgs(struct p25_mac_struct const *s, struct p25_msg out[3]);
+
 // One log line, no newline. index -1 (or a PTT / END PTT PDU) is the PDU itself; 0..nstruct-1
 // a structure: "MAC <kind> chan=<sacch|facch|lcch> pdu=<type>" then key=value fields as
 // p25_format() writes them. Returns the length snprintf would have written.
