@@ -1485,3 +1485,227 @@ SEE ALSO
        Project documentation: https://github.com/ka9q/ka9q-radio
 
 ka9q-radio		       October 26, 2026			    PACKETD(8)
+
+------------------------------------------------------------------------------
+
+P25D(8)			       ka9q-radio Manual		       P25D(8)
+
+NAME
+       p25d - decode APCO Project 25 (P25) channels from radiod and follow
+       trunked calls
+
+SYNOPSIS
+       p25d [options] [-I input ...] [-R output] [-F frames] [input ...]
+
+DESCRIPTION
+       p25d listens to one or more multicast groups carrying complex baseband
+       (I/Q) channels from radiod and decodes every P25 channel on them, each
+       in its own thread. It decodes and logs every trunking message, header,
+       link control word, encryption sync and packet data unit. When a control
+       channel grants a voice channel, p25d asks radiod for that channel,
+       decodes it, and lets it go when the call ends. Phase 1 (FDMA) control,
+       voice and conventional channels are decoded, and the Phase 2 (TDMA)
+       voice channels of trunked systems, both timeslots of a carrier from one
+       radiod channel. Phase 2 control channels are not decoded.
+
+       The speech of clear (unencrypted) calls can be sent as an 8 kHz RTP
+       audio stream that monitor plays and pcmrecord records, and the vocoder
+       frames themselves can be sent as an RTP stream for a vocoder of your
+       own. The receive filter is chosen for each channel from its signal and
+       needs no setting.
+
+       This page is a summary. The package's docs/p25d.md describes the radiod
+       configuration, call following, the encryption rule, the frame packet
+       format and the log lines in full.
+
+OPTIONS
+       -I group, --input group
+	      Add an input group. May be repeated; positional groups are also
+	      accepted.
+
+       -R group, --pcm-out group
+	      Send decoded speech to this multicast group. Without it no audio
+	      is sent.	Needs a p25d built with mbelib.
+
+       -F group, --frames-out group
+	      Send the vocoder frames (IMBE, AMBE+2) to this multicast group.
+	      Works without mbelib.
+
+       -E, --frames-encrypted
+	      With -F, also send the frames of encrypted voice, flagged as
+	      encrypted, with their encryption parameters. p25d never decodes
+	      them.
+
+       -N name, --name name
+	      Name the voice output is advertised under. Default p25d; the
+	      frame output is advertised as "name frames".
+
+       -T ttl, --ttl ttl
+	      Multicast TTL of the voice and frame output. Default 0: this
+	      host only.
+
+       -p tos, --tos tos
+	      IP type of service of the voice and frame output. Default 184
+	      (expedited forwarding).
+
+       -n, --no-follow
+	      Do not follow calls; decode only the channels already there.
+
+       -g list, --talkgroups list
+	      Follow group calls on only these talkgroups, for example
+	      2501,2600-2699. May be repeated. This and -x choose which
+	      trunked calls to follow; they do not filter conventional
+	      channels.
+
+       -x list, --exclude list
+	      Never follow these talkgroups. May be repeated.
+
+       -m n, --max-calls n
+	      Follow at most n calls at once. Default: no limit.
+
+       -e, --encrypted
+	      Follow encrypted calls too. They are logged; their voice is
+	      never decoded.
+
+       -S ssrc, --ssrc ssrc
+	      Decode only this channel. Turns call following off.
+
+       -o source, --source source
+	      Accept only this sender, by name or address (source-specific
+	      multicast).
+
+       -A interface, --iface interface
+	      Set default multicast interface.
+
+       -t seconds, --timeout seconds
+	      Close a channel after this long without data. Default 20.
+
+       -u seconds, --update seconds
+	      Interval between the status lines that -v turns on. Default 10.
+
+       -l locale, --locale locale
+	      Locale for number formatting. Default $LANG.
+
+       -v, --verbose
+	      Increase diagnostics; repeat for more. At -v each channel also
+	      logs a status line.
+
+       -V, --version
+	      Print version and exit.
+
+RADIOD CONFIGURATION
+       p25d needs I/Q, not demodulated audio, at 19.2 kHz (four samples per
+       4800 baud symbol), with the AGC off and a fixed gain. For a trunked
+       system configure only the control channel; for a conventional channel
+       configure it the same way. An example is in
+       config/examples/fragments/p25.conf:
+
+       [P25]
+       data = p25-iq.local
+       mode = iq
+       samprate = 19200
+       low = -5k
+       high = +5k
+       encoding = f32le
+       agc = no
+       gain = 60
+       freq = "857m98125"
+
+       Voice channels are asked for in the control channel's form (a Phase 2
+       voice channel at 24 kHz) and need no configuration, except that radiod
+       builds them from its [global] section: see NOTES.
+
+INPUT AND OUTPUT
+       Decoded events go to standard output, one line each, starting with the
+       time of the signal, the SSRC and the channel frequency; errors and
+       startup messages go to standard error.
+
+       The voice stream (-R) is 8 kHz mono 16-bit audio, one RTP packet per 20
+       ms, with status packets as radiod sends them. A trunked group call's
+       stream has the talkgroup number as its SSRC; any other call, and a
+       conventional channel, uses the voice channel's SSRC. The frame stream
+       (-F) has the same SSRC, timestamps and marker bits, one packet per
+       vocoder frame.
+
+       No speech is ever sent from an encrypted voice unit, or from one not
+       yet known to be clear: a unit is decoded only after a header or
+       encryption sync of the same transmission has said it is unencrypted,
+       and on a trunked channel only when the call tracking agrees. Units that
+       arrive before that are held, then sent in order or dropped.
+
+NOTES
+       The vocoder is not a complete one.
+	      Speech decoding uses mbelib, which is optional when p25d is
+	      built. mbelib decodes the vocoder parameters, enhances the
+	      spectral amplitudes and synthesises voiced speech as the
+	      standards describe, but it takes shortcuts (checked for IMBE in
+	      mbelib 1.3.0): unvoiced bands are made from a few random-phase
+	      sinusoids and a little noise instead of shaped white noise,
+	      which is the audible difference; the standard's adaptive
+	      smoothing at high error rates is absent; silence frames are not
+	      treated as such; and it uses the C library's rand(), so its
+	      output is not repeatable bit for bit. p25d applies the
+	      standard's frame repeat and mute rules itself. The vocoder is
+	      called through a small interface, so a complete implementation
+	      can take its place, and -F gives the frames to a vocoder of your
+	      own. mbelib's README says it is for educational purposes only
+	      and that the algorithms may be covered by patents.
+
+       More than one system.
+	      A trunked group call's stream has the talkgroup number as its
+	      SSRC, and talkgroup numbers are unique only within one system.
+	      Run one p25d, with its own output group, per system.
+
+       The frame stream's numbers are p25d's own.
+	      RTP payload type 97 and encoding value 12 are not in ka9q-
+	      radio's rtp.h. No other ka9q-radio program reads the stream, and
+	      the numbers may change if the package assigns them.
+
+       TTL and [global].
+	      radiod makes a voice channel asked for on demand from its
+	      [global] section: "data =" must be set there, and "ttl =" there
+	      is the TTL of those channels, which a request cannot change.
+	      With "ttl = 0" a p25d on another host sees the control channel
+	      but none of the voice channels. p25d's own voice and frame
+	      output has TTL 0 unless -T says otherwise.
+
+CREDITS
+       sdrtrunk (Dennis Sheirer, GPL-3) and OP25 (Max H. Parke KA1RBI, Graham
+       J.  Norbury and others, GPL-3) were both used as references for P25
+       implementation details, along with the TIA-102 documents. Taken from
+       them, with a credit beside each in the source: the lengths of the Phase
+       2 MAC structures, the Motorola talker alias table and the rule for an
+       all-zero encryption sync.  Speech decoding uses mbelib
+       (https://github.com/szechyjs/mbelib) when it is installed.
+
+FILES
+       p25d@.service
+	      systemd template unit; the instance name is the input group. Its
+	      output is appended to /var/log/p25d.log.
+
+       config/examples/fragments/p25.conf
+	      Example radiod section.
+
+EXAMPLES
+       Decode a group, follow its calls and send the speech of clear calls:
+
+       p25d -R p25-pcm.local p25-iq.local
+
+       The same, with the vocoder frames as well, to listeners on the local
+       network:
+
+       p25d -T 1 -R p25-pcm.local -F p25-frames.local p25-iq.local
+
+       As a service:
+
+       systemctl enable --now p25d@p25-iq.local
+
+AUTHOR
+       Matthew Kaufman, KA6SQG.
+
+SEE ALSO
+       radiod(8), monitor(1), pcmrecord(1), tune(1), control(1)
+
+       Project documentation: https://github.com/ka9q/ka9q-radio
+
+ka9q-radio		       November 22, 2026		       P25D(8)
