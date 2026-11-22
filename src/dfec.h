@@ -60,6 +60,9 @@ int bch_63_16_decode_soft(uint8_t bits[63],float const confidence[32],bool const
 // Golay(24,12,8): bits 0-11 data, 12-22 Golay(23,12) parity, 23 overall even parity.
 // Corrects up to 3 errors, detects 4. Returns bits changed (0-3) or -1
 int golay24_decode(uint8_t bits[24]);
+// Golay(23,12): bits 0-11 data, 12-22 parity. Perfect: every word is within three bits of one codeword,
+// so this always corrects. Returns the bits changed (0-3); *data_fixed (may be NULL) those among bits 0-11
+int golay23_decode(uint8_t bits[23],int *data_fixed);
 // Golay(18,6,8): Golay(24,12,8) shortened by six leading zero data bits (HDU). bits 0-5 data
 int golay18_decode(uint8_t bits[18]);
 

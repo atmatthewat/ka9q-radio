@@ -66,6 +66,43 @@ int add_rxfilter_response(struct rxfilter *f,double samprate,double cutoff,int n
   f->nresponses++;
   return r;
 }
+int init_rrcfilter(struct rxfilter *f,double samprate,double symrate,double alpha,double span){
+  assert(f != NULL);
+  if(f == NULL || samprate <= 0 || symrate <= 0 || alpha <= 0 || alpha > 1 || span <= 0)
+    return -1;
+  double const sps = samprate / symrate; // samples per symbol
+  int const half = (int)lrint(span * sps);
+  int const ntaps = 2 * half + 1;
+  memset(f,0,sizeof *f);
+  f->responses[0] = calloc((size_t)ntaps,sizeof *f->taps);
+  f->history = calloc(2 * (size_t)ntaps,sizeof *f->history);
+  if(f->responses[0] == NULL || f->history == NULL){
+    free_rxfilter(f);
+    return -1;
+  }
+  f->ntaps = ntaps;
+  float * const taps = f->responses[0];
+  double sum = 0;
+  for(int i=0; i <= half; i++){
+    double const x = i / sps; // symbols from the centre
+    double const a4x = 4 * alpha * x;
+    double h;
+    if(x < 1e-9)
+      h = 1 - alpha + 4 * alpha / M_PI;
+    else if(fabs(1 - a4x * a4x) < 1e-7) // the limit at |4 alpha x| = 1
+      h = alpha / M_SQRT2 * ((1 + 2 / M_PI) * sin(M_PI / (4 * alpha)) + (1 - 2 / M_PI) * cos(M_PI / (4 * alpha)));
+    else
+      h = (sin(M_PI * x * (1 - alpha)) + a4x * cos(M_PI * x * (1 + alpha))) / (M_PI * x * (1 - a4x * a4x));
+    taps[half + i] = taps[half - i] = (float)h;
+    sum += i == 0 ? h : 2 * h;
+  }
+  for(int i=0; i < ntaps; i++)
+    taps[i] = (float)(taps[i] / sum);
+  f->counts[0] = ntaps;
+  f->nresponses = 1;
+  select_rxfilter(f,0);
+  return 0;
+}
 void select_rxfilter(struct rxfilter *f,int response){
   assert(f != NULL);
   if(response < 0 || response >= f->nresponses)
@@ -223,6 +260,13 @@ void correct_freqtrack(struct freqtrack *ft,float complex *buffer,int count){
     phase += increment;
   }
   ft->phase = phase;
+}
+void shift_freqtrack(struct freqtrack *ft,float complex *buffer,int count,float offset){
+  ft->applied = offset;
+  correct_freqtrack(ft,buffer,count);
+}
+void adjust_freqtrack(struct freqtrack *ft,float delta){
+  ft->estimate = fminf(fmaxf(ft->estimate + delta,-ft->max_offset),ft->max_offset);
 }
 void measure_freqtrack(struct freqtrack *ft,float complex const *buffer,int count){
   ft->unfiltered = lag_one(buffer,count);

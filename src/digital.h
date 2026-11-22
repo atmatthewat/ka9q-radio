@@ -31,6 +31,10 @@ int init_rxfilter(struct rxfilter *f,double samprate,double cutoff,int ntaps,dou
 // even). Returns its number, or -1
 int add_rxfilter_response(struct rxfilter *f,double samprate,double cutoff,int ntaps,double rolloff);
 void select_rxfilter(struct rxfilter *f,int response); // from the next sample
+// Root raised cosine matched filter for a linear modulation the transmitter shapes with the same
+// response (P25 Phase 2 H-DQPSK): rolloff alpha, 'span' symbols each side of the centre, unity DC gain
+// Runs with run_rxfilter()
+int init_rrcfilter(struct rxfilter *f,double samprate,double symrate,double alpha,double span);
 void free_rxfilter(struct rxfilter *f);
 void run_rxfilter(struct rxfilter *f,float complex *buffer,int count); // in place
 
@@ -90,6 +94,11 @@ bool freqtrack_residual(struct freqtrack const *ft,float complex const *buffer,i
 // Close the loop for this block of 'count' samples with a residual from freqtrack_residual()
 // or from the decoder's own decisions; valid false = no estimate, hold
 void update_freqtrack(struct freqtrack *ft,bool valid,float residual,int count);
+// For a decoder that corrects each block by an estimate updated from that same block (feed-forward):
+// rotate by -offset Hz rather than by the correction decided after the previous block
+void shift_freqtrack(struct freqtrack *ft,float complex *buffer,int count,float offset);
+// Move the estimate by delta Hz, e.g. a residual from the decoder's decisions
+void adjust_freqtrack(struct freqtrack *ft,float delta);
 
 // Symbol timing: polyphase interpolator to two samples per symbol, Gardner detector, PI loop
 // Wide loop until told the signal is locked (e.g. by frame sync), narrow after

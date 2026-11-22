@@ -630,6 +630,22 @@ int golay24_decode(uint8_t bits[24]){
   return __builtin_popcount((uint32_t)c ^ word);
 }
 
+int golay23_decode(uint8_t bits[23],int *data_fixed){
+  assert(bits != NULL);
+  init();
+  uint32_t w = 0;
+  for(int i = 0; i < 23; i++){
+    if(bits[i])
+      w |= 1u << (22 - i);
+  }
+  uint32_t const pattern = Golay_pattern[golay_syndrome(w)];
+  for(int i = 0; i < 23; i++)
+    bits[i] ^= (pattern >> (22 - i)) & 1;
+  if(data_fixed != NULL)
+    *data_fixed = __builtin_popcount(pattern >> 11);
+  return __builtin_popcount(pattern);
+}
+
 int golay18_decode(uint8_t bits[18]){
   assert(bits != NULL);
   init();
