@@ -134,8 +134,12 @@ void p25_audio_unit(struct p25_audio *a,struct p25_frame const *frame,int64_t wh
 void p25_audio_frame(struct p25_audio *a,struct p25_frame const *frame,int64_t when);
 // Phase 2: every burst of one timeslot (one struct p25_audio per timeslot), 'when' being the time
 // at its end, with the label of a voice burst as above. A MAC PTT starts a transmission, a MAC END
-// PTT ends it; MAC PTT, ESS and MAC voice channel user structures carry the call and encryption;
-// 4V and 2V bursts are the voice units, placed in time by burst->dibit and superframe_slot
+// PTT, IDLE or HANGTIME ends it; MAC PTT, ESS and MAC voice channel user structures carry the call
+// and encryption, and a voice channel user naming another talkgroup or talker starts a new
+// transmission; 4V and 2V bursts are the voice units, placed in time by burst->dibit and
+// superframe_slot. After two or more places of the timeslot (voice bursts, FACCH, SACCH) where
+// nothing decoded, the transmission is not clear again until a PTT or ESS says so, since a lost
+// END PTT and PTT may lie there; bursts held unconfirmed from before such a gap are never sent
 void p25_audio_burst(struct p25_audio *a,struct p25p2_burst const *burst,int64_t when,enum p25_audio_label label);
 // The trunking logic decided about the units it labelled P25_AUDIO_HOLD: clear (they are sent
 // once this module's own rule also allows) or not (treated as encrypted)

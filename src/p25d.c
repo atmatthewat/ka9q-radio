@@ -1,6 +1,7 @@
 // P25 decoder daemon for ka9q-radio
-// Reads complex baseband (I/Q) RTP streams from radiod, runs one P25 Phase 1 receiver per SSRC
-// and logs what it decodes, one timestamped line per event, on standard output.
+// Reads complex baseband (I/Q) RTP streams from radiod, runs one P25 receiver per SSRC (Phase 1,
+// or Phase 2 on a TDMA voice channel it asked for) and logs what it decodes, one timestamped line
+// per event, on standard output.
 // Follows trunked calls: on a voice channel grant it asks radiod for that channel, and it sends
 // the clear voice it decodes as RTP audio streams, and the vocoder frames themselves as RTP streams
 // Copyright 2026, Matthew Kaufman, KA6SQG
@@ -33,6 +34,8 @@
 #include "defaults.h"
 #include "chanctl.h"
 #include "p25p1.h"
+#include "p25p2.h"
+#include "p25p2mac.h"
 #include "p25msg.h"
 #include "p25p1msg.h"
 #include "p25trunk.h"
@@ -82,11 +85,37 @@ struct conv {
   int bits_fixed;
 };
 
+// Which receiver a channel needs: Phase 1 (FDMA), unless it is a voice channel p25d asked for to
+// follow a Phase 2 (TDMA) call
+enum receiver { RX_NONE, RX_PHASE1, RX_PHASE2 };
+
+// One timeslot of a Phase 2 voice channel: its own call, label state and output streams
+struct p2slot {
+  struct p25_audio *audio;   // NULL without --pcm-out or --frames-out
+  uint32_t call_id;          // call of the last voice burst
+  bool have_user;            // a MAC voice channel user structure, for the next voice burst
+  struct p25_msg user;
+  struct p25_alias alias;    // talker aliases from MAC structures
+  struct {
+    uint32_t hash;           // MAC text logged lately, each distinct one once a while
+    uint64_t sample;
+  } recent[8];
+  uint8_t es_key[3];         // ALGID and key of the last ESS logged
+  bool have_es;
+  int voice_units;           // voice bursts and bits corrected in their frames this transmission
+  int voice_errors;
+};
+
 // Decode thread view of a channel. Only that thread touches it, so the decoder's frame and
 // message callbacks (when they exist) can be handed a pointer to it and log without locking
 struct decoder {
   struct session *sp;
+  enum receiver rx;
   struct p25p1 *p25;
+  struct p25p2 *p2;        // Phase 2 voice channel: its receiver, its two timeslots
+  struct p2slot slot[2];
+  bool scrambling;         // Phase 2: scrambling parameters set
+  bool scrambling_said;    // and said once that they are not known yet
   double samprate;
   double frequency;        // of the block being decoded
   int64_t block_time;      // sender's time of the block's first sample, 0 if unknown
@@ -226,6 +255,7 @@ struct work {
   uint32_t ssrc;
   uint64_t freq_hz;
   uint32_t call_id;
+  bool tdma;                 // WORK_REQUEST: in the Phase 2 form
   char text[400];
 };
 
@@ -260,6 +290,15 @@ static double const Max_queue = 5.0;  // Seconds of samples queued to a decoder 
 // leave it behind for long
 static double const Lifetime = P25_TRUNK_CALL_TIMEOUT * 1e-9 + 2;
 static int const Ctl_ttl = 1;         // Commands to radiod, as tune and control send them
+// A Phase 2 (TDMA) voice channel is asked for at 24 kHz (four samples per 6000 baud symbol; the
+// Phase 2 receiver needs at least that, and the control channel's 19.2 kHz is too little), with
+// the filter at +/-5 kHz: H-DQPSK with its root raised cosine (rolloff 0.2) occupies +/-3.6 kHz,
+// so this leaves 1.4 kHz for the carrier's offset, keeps the neighbouring 12.5 kHz channel
+// (whose signal begins 8.9 kHz away) out, and stays well inside the 12 kHz Nyquist limit so
+// radiod's filter keeps its transition band. The receiver's own matched filter does the rest.
+// Everything else (encoding, gain, AGC, data group) is the control channel's
+static int const P2_samprate = 4 * P25P2_SYMRATE;
+static float const P2_edge = 5000;
 
 // Global variables
 static int Data_fd[MAX_MCAST];
@@ -317,6 +356,9 @@ static void conv_unit(struct decoder *dp,uint64_t sample,struct p25_frame const 
 static void conv_end(struct decoder *dp,uint64_t sample,char const *how);
 static void block_done(struct decoder *dp,int count);
 static int parse_talkgroups(uint16_t *list,int n,char const *arg);
+static void p2_burst(void *arg,struct p25p2_burst const *burst);
+static void p2_block(struct decoder *dp);
+static void p2_status_line(struct decoder const *dp);
 
 static struct option Options[] = {
   {"iface", required_argument, NULL, 'A'},
@@ -985,21 +1027,41 @@ static void *decode_task(void *arg){
     if(bp->samprate != dec.samprate){
       // First block, or the sample rate changed
       p25_audio_call_end(dec.audio);
+      for(int t=0; t < 2; t++)
+	p25_audio_call_end(dec.slot[t].audio);
       if(dec.p25 != NULL)
 	delete_p25p1(dec.p25);
+      dec.p25 = NULL;
+      if(dec.p2 != NULL)
+	delete_p25p2(dec.p2);
+      dec.p2 = NULL;
       dec.samprate = bp->samprate;
       dec.samples = 0;
       dec.next_report = (uint64_t)(Update * dec.samprate);
-      dec.p25 = create_p25p1(dec.samprate);
-      if(dec.p25 == NULL)
-	fprintf(stderr,"ssrc %u: can't create P25 receiver at %'.0lf Hz (needs at least %d Hz)\n",
-		sp->ssrc,dec.samprate,4 * P25_SYMRATE);
-      else {
-	p25p1_set_frame_handler(dec.p25,decoder_frame,&dec);
-	// A voice channel granted on a control channel is sent from the same site, so its carrier
-	// is off by about what the control channel's is
-	if(dec.voice && dec.seed)
-	  p25p1_seed_frequency(dec.p25,dec.seed_hz);
+      if(dec.rx == RX_PHASE2){
+	dec.p2 = create_p25p2(dec.samprate);
+	if(dec.p2 == NULL)
+	  fprintf(stderr,"ssrc %u: can't create P25 Phase 2 receiver at %'.0lf Hz (needs at least %d Hz)\n",
+		  sp->ssrc,dec.samprate,P2_samprate);
+	else {
+	  p25p2_set_burst_handler(dec.p2,p2_burst,&dec);
+	  // As for Phase 1, the control channel's carrier offset: kept until frame sync gives one
+	  if(dec.seed)
+	    p25p2_seed_frequency(dec.p2,dec.seed_hz,true);
+	  dec.scrambling = false; // set again from the site (p2_block)
+	}
+      } else {
+	dec.p25 = create_p25p1(dec.samprate);
+	if(dec.p25 == NULL)
+	  fprintf(stderr,"ssrc %u: can't create P25 receiver at %'.0lf Hz (needs at least %d Hz)\n",
+		  sp->ssrc,dec.samprate,4 * P25_SYMRATE);
+	else {
+	  p25p1_set_frame_handler(dec.p25,decoder_frame,&dec);
+	  // A voice channel granted on a control channel is sent from the same site, so its carrier
+	  // is off by about what the control channel's is
+	  if(dec.voice && dec.seed)
+	    p25p1_seed_frequency(dec.p25,dec.seed_hz);
+	}
       }
       p25_bandplan_init(&dec.plan);
     }
@@ -1008,6 +1070,9 @@ static void *decode_task(void *arg){
     dec.block_start = dec.samples;
     if(dec.p25 != NULL){
       p25p1_samples(dec.p25,bp->samples,bp->count); // decoder_frame() runs in here
+    } else if(dec.p2 != NULL){
+      p2_block(&dec); // the scrambling parameters, once the site knows them
+      p25p2_samples(dec.p2,bp->samples,bp->count); // p2_burst() runs in here
     }
     block_done(&dec,bp->count);
     if(dec.control)
@@ -1015,7 +1080,10 @@ static void *decode_task(void *arg){
     dec.samples += bp->count;
     FREE(bp);
     if(Verbose && Update > 0 && dec.samples >= dec.next_report){
-      status_line(&dec);
+      if(dec.p2 != NULL)
+	p2_status_line(&dec);
+      else
+	status_line(&dec);
       dec.next_report += (uint64_t)(Update * dec.samprate);
     }
   }
@@ -1024,9 +1092,13 @@ static void *decode_task(void *arg){
   if(dec.conv.active)
     conv_end(&dec,dec.conv.last,Terminate ? "p25d shutting down" : "channel closed");
   p25_audio_destroy(dec.audio);
+  for(int t=0; t < 2; t++)
+    p25_audio_destroy(dec.slot[t].audio);
   FREE(dec.work);
   if(dec.p25 != NULL)
     delete_p25p1(dec.p25);
+  if(dec.p2 != NULL)
+    delete_p25p2(dec.p2);
   return NULL;
 }
 
@@ -1034,6 +1106,8 @@ static void *decode_task(void *arg){
 // stopped without a terminator (the next voice unit overdue by half a second, as p25audio decides)
 static void block_done(struct decoder *dp,int count){
   p25_audio_poll(dp->audio,dp->frequency,decoder_time(dp,dp->block_start + count));
+  for(int t=0; t < 2; t++)
+    p25_audio_poll(dp->slot[t].audio,dp->frequency,decoder_time(dp,dp->block_start + count));
   if(dp->conv.active && dp->samples + count - dp->conv.last > (uint64_t)((0.18 + 0.5) * dp->samprate))
     conv_end(dp,dp->conv.last,"timeout");
 }
@@ -1320,10 +1394,10 @@ static struct fcall *find_call(struct site *site,uint32_t id){
       return &site->calls[i];
   return NULL;
 }
-// The call on a voice channel's frequency
-static struct fcall *find_call_freq(struct site *site,uint64_t freq_hz){
+// The call on a voice channel's frequency and slot (-1 FDMA)
+static struct fcall *find_call_freq(struct site *site,uint64_t freq_hz,int slot){
   for(int i=0; i < P25_TRUNK_MAX_CALLS; i++)
-    if(site->calls[i].used && site->calls[i].freq_hz == freq_hz && site->calls[i].slot < 0)
+    if(site->calls[i].used && site->calls[i].freq_hz == freq_hz && site->calls[i].slot == slot)
       return &site->calls[i];
   return NULL;
 }
@@ -1360,16 +1434,24 @@ static void add_log(struct decoder *dp,int *nwork,int64_t when,char const *fmt,.
   va_end(ap);
 }
 
-// Which receiver a voice channel needs, from the call's flags. The one place to add Phase 2:
-// a TDMA receiver would be chosen here and created by the voice channel's decode thread
-enum receiver { RX_NONE, RX_PHASE1 };
+// Which receiver a voice channel needs, from the call's flags; the voice channel's decode thread
+// creates it (link_voice())
 static enum receiver choose_receiver(uint32_t flags,char const **why){
-  if(flags & P25_TRUNK_F_TDMA){
-    *why = "Phase 2 (TDMA), no receiver for it yet";
-    return RX_NONE;
-  }
   *why = NULL;
-  return RX_PHASE1;
+  return (flags & P25_TRUNK_F_TDMA) ? RX_PHASE2 : RX_PHASE1;
+}
+
+// The form a call's channel is asked for in: the control channel's, and for Phase 2 its own
+// sample rate and filter (P2_samprate, P2_edge). Under Ctl_mutex
+static void call_format(struct chanctl_format *f,struct site const *site,bool tdma){
+  *f = site->format;
+  if(tdma){
+    f->samprate = P2_samprate;
+    f->low = -P2_edge;
+    f->high = +P2_edge;
+    int const pt = pt_from_info(P2_samprate,f->channels,f->encoding); // as radiod chooses it
+    f->pt = pt > 0 ? pt : 0; // 0: unknown, taken from the new channel's status
+  }
 }
 
 // The call's identity for a log line: "group tg 2501 src 1118028" and the like
@@ -1417,8 +1499,12 @@ static bool want_channel(struct site *site,struct fcall *fc,char const **why){
   }
   pthread_mutex_lock(&Ctl_mutex);
   uint32_t ssrc = 0;
-  if(site->ctl != NULL && site->have_format)
-    ssrc = chanctl_ssrc(site->ctl,(double)fc->freq_hz,&site->format);
+  if(site->ctl != NULL && site->have_format){
+    struct chanctl_format format;
+    call_format(&format,site,(fc->flags & P25_TRUNK_F_TDMA) != 0);
+    // The two slots of a Phase 2 channel get the same SSRC: one radiod channel serves both
+    ssrc = chanctl_ssrc(site->ctl,(double)fc->freq_hz,&format);
+  }
   pthread_mutex_unlock(&Ctl_mutex);
   if(ssrc == 0){
     *why = "radiod's command address or the control channel's format not known yet";
@@ -1437,13 +1523,22 @@ static void ask_channel(struct decoder *dp,int *nwork,struct fcall const *fc){
     w->ssrc = fc->ssrc;
     w->freq_hz = fc->freq_hz;
     w->call_id = fc->id;
+    w->tdma = (fc->flags & P25_TRUNK_F_TDMA) != 0;
   }
 }
 
+// The call no longer needs its channel. The channel is let go only when no other call needs it
+// (the other slot of a Phase 2 channel)
 static void let_go(struct decoder *dp,int *nwork,struct fcall *fc){
   if(!fc->requested)
     return;
   fc->requested = false;
+  struct site const * const site = dp->site;
+  for(int i=0; site != NULL && i < P25_TRUNK_MAX_CALLS; i++){
+    struct fcall const * const other = &site->calls[i];
+    if(other != fc && other->used && other->requested && other->ssrc == fc->ssrc)
+      return;
+  }
   struct work * const w = add_work(dp,nwork,WORK_RELEASE);
   if(w != NULL){
     w->ssrc = fc->ssrc;
@@ -1535,7 +1630,7 @@ static int take_events(struct decoder *dp,struct site *site,int nwork){
       } else if(fc->requested){
 	// Still on: ask again. chanctl sends only when needed, and this keeps the channel's lifetime fresh
 	ask_channel(dp,&nwork,fc);
-      } else if((e->flags & P25_TRUNK_F_FOLLOW) && !fc->refused && fc->slot < 0){
+      } else if((e->flags & P25_TRUNK_F_FOLLOW) && !fc->refused){
 	// Now followed (no longer encrypted, or room under --max-calls): it may be heard from here on
 	char const *why = NULL;
 	if(want_channel(site,fc,&why)){
@@ -1596,7 +1691,8 @@ static void site_unlock(struct site *site,struct decoder *dp,int nwork){
 	int r = -1;
 	errno = ENOENT;
 	if(site->ctl != NULL && site->have_format){
-	  struct chanctl_format const format = site->format;
+	  struct chanctl_format format;
+	  call_format(&format,site,w->tdma);
 	  r = chanctl_request(site->ctl,w->ssrc,(double)w->freq_hz,&format,Lifetime);
 	}
 	int const err = errno;
@@ -1716,14 +1812,30 @@ static void link_voice(struct decoder *dp){
 	dp->trunk_freq = fc->freq_hz;
 	dp->seed = fc->seed;
 	dp->seed_hz = fc->seed_hz;
+	char const *why;
+	dp->rx = choose_receiver(fc->flags,&why);
 	break;
       }
     }
     pthread_mutex_unlock(&site->lock);
   }
   pthread_mutex_unlock(&Sites_mutex);
+  if(dp->voice && dp->rx == RX_PHASE2){
+    // One radiod channel, two timeslots, each its own streams. A trunked group call's streams
+    // have the talkgroup as their SSRC (p2_unit()); any other call's have the channel's SSRC for
+    // timeslot 0 and that plus one for timeslot 1, so two such calls on one channel don't share a
+    // stream. Channel SSRCs are radiod's kHz numbers, and P25 channels lie at least 6.25 kHz
+    // apart, so the one above a channel's is no other channel's
+    for(int t=0; t < 2; t++){
+      dp->slot[t].audio = p25_audio_create(Audio_group,Frames_group,dp->sp->ssrc + (uint32_t)t);
+      p25_alias_init(&dp->slot[t].alias);
+    }
+    p25_audio_destroy(dp->audio); // the Phase 1 streams are not used here
+    dp->audio = NULL;
+  }
   if(dp->voice && Verbose)
-    decoder_event(dp,dp->samples,"voice channel for calls granted on ssrc %u, receiver %s",dp->site->ssrc,
+    decoder_event(dp,dp->samples,"voice channel (%s) for calls granted on ssrc %u, receiver %s",
+		  dp->rx == RX_PHASE2 ? "Phase 2, two timeslots" : "Phase 1",dp->site->ssrc,
 		  dp->seed ? "seeded with the control channel's carrier offset" : "not seeded");
   if(dp->voice && dp->seed && Verbose > 1)
     decoder_event(dp,dp->samples,"seed %.9g Hz",dp->seed_hz); // exactly, for comparing with an offline decode
@@ -1812,7 +1924,7 @@ static void voice_unit(struct decoder *dp,uint64_t sample,struct p25_frame const
   }
   nwork = take_events(dp,site,nwork); // a call this unit started is in the table now
   if(unit){
-    struct fcall * const fc = label.call_id != 0 ? find_call(site,label.call_id) : find_call_freq(site,dp->trunk_freq);
+    struct fcall * const fc = label.call_id != 0 ? find_call(site,label.call_id) : find_call_freq(site,dp->trunk_freq,-1);
     if(fc != NULL){
       // Held units released since the last unit, by this thread's call into the logic just now or
       // another thread's: they are all units this thread has already handed to the voice output
@@ -1873,6 +1985,314 @@ static void voice_unit(struct decoder *dp,uint64_t sample,struct p25_frame const
     p25_audio_set_stream(dp->audio,ssrc,desc);
   }
   p25_audio_unit(dp->audio,frame,when,ldu ? audio_label(&label) : P25_AUDIO_UNLABELLED);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 (TDMA) voice channels. One receiver, two timeslots; each timeslot is fed to the site's
+// trunking logic as its own (frequency, slot), in Phase 1's terms: a MAC PTT as a header (it
+// carries the talkgroup and the encryption), a MAC END PTT as a terminator, a MAC voice channel
+// user structure as the link control of the next voice burst, a 2V's ESS as an encryption sync,
+// and each 4V and 2V as a voice unit. Grants and updates in MAC structures go to the logic as
+// the trunking messages they abbreviate. IDLE and HANGTIME end nothing there: the call goes on
+// while grants name it, and times out as a Phase 1 call does. Then each burst goes to that
+// timeslot's voice output under the label the logic gave
+
+// Once per block: the scrambling parameters, from the control channel's network status (WACN,
+// system ID) and NAC. Until the site has heard its network status the receiver has none: voice
+// bursts and scrambled signalling are then not decoded at all (the receiver delivers them
+// without contents), so nothing is decoded from bursts descrambled with a guess
+static void p2_block(struct decoder *dp){
+  if(dp->scrambling || dp->site == NULL)
+    return;
+  struct site * const site = dp->site;
+  bool known = false;
+  uint32_t wacn = 0;
+  uint16_t sysid = 0,nac = 0;
+  pthread_mutex_lock(&site->lock);
+  if(site->trunk != NULL){
+    struct p25_trunk_site const * const st = p25_trunk_site(site->trunk);
+    if(st->network_known && site->nac != 0){
+      known = true;
+      wacn = st->wacn;
+      sysid = st->net_sysid;
+      nac = site->nac;
+    }
+    struct p25_bandplan const * const plan = p25_trunk_bandplan(site->trunk);
+    if(plan != NULL)
+      dp->plan = *plan; // to log the channels MAC structures name
+  }
+  pthread_mutex_unlock(&site->lock);
+  if(known){
+    p25p2_set_scrambling(dp->p2,wacn,sysid,nac);
+    dp->scrambling = true;
+    if(Verbose || dp->scrambling_said)
+      decoder_event(dp,dp->samples,"Phase 2 scrambling: WACN %05x, system %03x, NAC %03x",wacn,sysid,nac);
+  } else if(!dp->scrambling_said){
+    dp->scrambling_said = true;
+    decoder_event(dp,dp->samples,"Phase 2 scrambling parameters not known yet (no network status on the control channel): voice not decoded until they are");
+  }
+}
+
+// Has this text been logged for the timeslot in the last couple of seconds? If not, note it
+static bool p2_seen(struct decoder *dp,struct p2slot *s,uint64_t sample,char const *text){
+  uint32_t h = 2166136261u; // FNV-1a
+  for(char const *cp = text; *cp != '\0'; cp++)
+    h = (h ^ (uint8_t)*cp) * 16777619u;
+  uint64_t const hold = (uint64_t)(2 * dp->samprate);
+  int oldest = 0;
+  for(int i=0; i < 8; i++){
+    if(s->recent[i].hash == h && s->recent[i].sample != 0){
+      bool const seen = sample + 1 - s->recent[i].sample < hold;
+      s->recent[i].sample = sample + 1;
+      return seen;
+    }
+    if(s->recent[i].sample < s->recent[oldest].sample)
+      oldest = i;
+  }
+  s->recent[oldest].hash = h;
+  s->recent[oldest].sample = sample + 1;
+  return false;
+}
+
+// Log a burst: MAC PDUs and their structures, and ESS, once per change; voice bursts with -v;
+// the end of a transmission with its counts
+static void p2_log(struct decoder *dp,struct p2slot *s,int ts,uint64_t sample,struct p25p2_burst const *b,
+		   struct p25_mac_pdu const *pdu){
+  char text[512];
+  if(pdu != NULL){
+    if((pdu->type == P25_MAC_END_PTT || pdu->type == P25_MAC_IDLE || pdu->type == P25_MAC_HANGTIME) && s->voice_units > 0){
+      // The end of a transmission (an IDLE or HANGTIME too when its END PTT was missed)
+      decoder_event(dp,sample,"slot %d %s after %d voice bursts (%.1f s), %d bits corrected",ts,p25_mac_pdu_name(pdu->type),
+		    s->voice_units,0.072 * s->voice_units,s->voice_errors); // five voice bursts per 360 ms
+      s->voice_units = s->voice_errors = 0;
+      s->have_es = false;
+    }
+    if(pdu->type == P25_MAC_PTT || pdu->type == P25_MAC_END_PTT || pdu->nstruct == 0 || Verbose){
+      p25_mac_format(text,sizeof text,pdu,-1,&dp->plan);
+      if(!p2_seen(dp,s,sample,text))
+	decoder_event(dp,sample,"slot %d %s",ts,text);
+    }
+    if(pdu->type != P25_MAC_PTT && pdu->type != P25_MAC_END_PTT){
+      for(int i=0; i < pdu->nstruct; i++){
+	if(pdu->s[i].mac_kind == P25_MAC_NULL || pdu->s[i].mac_kind == P25_MAC_NULL_AZB)
+	  continue;
+	p25_mac_format(text,sizeof text,pdu,i,&dp->plan);
+	if(!p2_seen(dp,s,sample,text))
+	  decoder_event(dp,sample,"slot %d %s",ts,text);
+      }
+    }
+    return;
+  }
+  if(b->mac != NULL){
+    if(Verbose > 1)
+      decoder_event(dp,sample,"slot %d %s failed its check",ts,p25p2_duid_name(b->duid));
+    return;
+  }
+  if(b->voice == NULL){
+    if(Verbose > 1)
+      decoder_event(dp,sample,"slot %d %s%s",ts,p25p2_duid_name(b->duid),b->descrambled ? "" : " (not descrambled)");
+    return;
+  }
+  int errors = 0;
+  for(int i=0; i < b->nframes; i++)
+    errors += b->voice[i].errors[0] + b->voice[i].errors[1];
+  s->voice_units++;
+  s->voice_errors += errors;
+  if(b->ess != NULL && b->ess->ok && (!s->have_es || s->es_key[0] != b->ess->algid
+				      || s->es_key[1] != (b->ess->kid >> 8) || s->es_key[2] != (b->ess->kid & 0xff))){
+    // The message indicator changes every voice cycle of an encrypted call: log the first, and
+    // any change of algorithm or key
+    s->have_es = true;
+    s->es_key[0] = b->ess->algid;
+    s->es_key[1] = (uint8_t)(b->ess->kid >> 8);
+    s->es_key[2] = (uint8_t)b->ess->kid;
+    decoder_event(dp,sample,"slot %d ESS algid=0x%02x kid=0x%04x mi=%02x%02x%02x%02x%02x%02x%02x%02x%02x",ts,b->ess->algid,b->ess->kid,
+		  b->ess->mi[0],b->ess->mi[1],b->ess->mi[2],b->ess->mi[3],b->ess->mi[4],b->ess->mi[5],b->ess->mi[6],
+		  b->ess->mi[7],b->ess->mi[8]);
+  }
+  if(Verbose)
+    decoder_event(dp,sample,"slot %d %s%s, %d voice bits corrected",ts,p25p2_duid_name(b->duid),
+		  b->duid == P25P2_DUID_2V ? (b->ess != NULL && b->ess->ok ? " ESS ok" : " ESS not decoded") : "",errors);
+}
+
+static bool voice_user_kind(int kind){
+  return kind == P25_LC_GRP_V_CH_USR || kind == P25_LC_MOT_GRG_V_CH_USR || kind == P25_LC_UU_V_CH_USR
+    || kind == P25_LC_TEL_INT_V_CH_USR;
+}
+
+// One burst from the Phase 2 receiver, in the decode thread
+static void p2_burst(void *arg,struct p25p2_burst const *b){
+  struct decoder * const dp = arg;
+  int const ts = b->timeslot;
+  if(ts < 0 || ts > 1 || !dp->voice)
+    return;
+  struct p2slot * const s = &dp->slot[ts];
+  uint64_t const sample = dp->block_start; // to the block, as for Phase 1
+  int64_t const when = decoder_time(dp,sample);
+  bool const voice = b->voice != NULL && b->nframes > 0;
+  struct p25_mac_pdu pdu;
+  bool const have_pdu = b->mac != NULL && b->mac->crc_ok
+    && p25_mac_decode(&pdu,(enum p25_mac_chan)b->mac->chan,b->mac->octets,b->mac->nbits) >= 0;
+  p2_log(dp,s,ts,sample,b,have_pdu ? &pdu : NULL);
+  struct p25_alias_result alias;
+  bool new_alias = false;
+  for(int i=0; have_pdu && i < pdu.nstruct; i++)
+    if(p25_alias_mac(&s->alias,&pdu.s[i],&alias) && alias.len > 0)
+      new_alias = true;
+
+  struct p25_trunk_label label;
+  memset(&label,0,sizeof label);
+  int release = 0;
+  char call_alias[P25_ALIAS_MAX] = "";
+  int nwork = 0;
+  struct site * const site = dp->site;
+  pthread_mutex_lock(&site->lock);
+  struct p25_trunk * const t = site->trunk;
+  uint16_t const nac = site->nac;
+  uint64_t const freq = dp->trunk_freq;
+  if(t != NULL){
+    int64_t const now = site_time(site,when);
+    struct p25_msg m;
+    memset(&m,0,sizeof m);
+    if(have_pdu){
+      switch(pdu.type){
+      case P25_MAC_PTT:
+	m.family = P25_FAMILY_HDU; // what a Phase 1 header says: talkgroup and encryption
+	m.kind = P25_HDU;
+	m.mfid = P25_MFID_STD;
+	m.group = pdu.group;
+	m.algid = pdu.algid;
+	m.kid = pdu.kid;
+	memcpy(m.mi,pdu.mi,sizeof m.mi);
+	p25_trunk_voice_msg(t,freq,ts,&m,now);
+	p25_trunk_voice_unit(t,freq,ts,P25_DUID_HDU,now);
+	s->have_user = false;
+	break;
+      case P25_MAC_END_PTT:
+	p25_trunk_voice_unit(t,freq,ts,P25_DUID_TDU,now);
+	s->have_user = false;
+	break;
+      default:
+	for(int i=0; i < pdu.nstruct; i++){
+	  struct p25_mac_struct const * const ms = &pdu.s[i];
+	  if(ms->mac_kind == P25_MAC_GRP_V_CH_GRANT_UPDT_MULT || ms->mac_kind == P25_MAC_GRP_V_CH_GRANT_UPDT_MULT_EXP){
+	    // Several updates in one structure: one at a time, as single updates
+	    for(int g=0; g < ms->ngrants; g++){
+	      memset(&m,0,sizeof m);
+	      m.family = P25_FAMILY_MAC;
+	      m.kind = ms->mac_kind == P25_MAC_GRP_V_CH_GRANT_UPDT_MULT ? P25_GRP_V_CH_GRANT_UPDT : P25_GRP_V_CH_GRANT_UPDT_EXP;
+	      m.svc = ms->grant[g].svc;
+	      m.ch = ms->grant[g].ch;
+	      m.ch_b = ms->grant[g].ch_ul;
+	      m.has_b = m.kind == P25_GRP_V_CH_GRANT_UPDT_EXP;
+	      m.group = ms->grant[g].group;
+	      p25_trunk_control(t,&m,nac,now);
+	    }
+	  } else if(ms->mac_kind != P25_MAC_MSG)
+	    continue;
+	  else if(voice_user_kind(ms->msg.kind)){
+	    // Who holds the timeslot, for the next voice burst. Only while voice is under way:
+	    // an idle or hang time PDU names the call, not a transmission
+	    if(pdu.type == P25_MAC_ACTIVE || pdu.type == P25_MAC_SIGNAL){
+	      s->user = ms->msg;
+	      s->user.family = P25_FAMILY_LC;
+	      s->have_user = true;
+	    }
+	  } else
+	    p25_trunk_control(t,&ms->msg,nac,now); // grants, updates and the like
+	}
+	if(pdu.type == P25_MAC_IDLE || pdu.type == P25_MAC_HANGTIME)
+	  s->have_user = false;
+	break;
+      }
+    } else if(voice){
+      if(b->duid == P25P2_DUID_2V && b->ess != NULL && b->ess->ok){
+	m.family = P25_FAMILY_ES;
+	m.kind = P25_ENC_SYNC;
+	m.algid = b->ess->algid;
+	m.kid = b->ess->kid;
+	memcpy(m.mi,b->ess->mi,sizeof m.mi);
+	p25_trunk_voice_msg(t,freq,ts,&m,now);
+	p25_trunk_voice_unit(t,freq,ts,P25_DUID_LDU2,now);
+      } else if(s->have_user){
+	p25_trunk_voice_msg(t,freq,ts,&s->user,now);
+	p25_trunk_voice_unit(t,freq,ts,P25_DUID_LDU1,now);
+	s->have_user = false;
+      } else
+	p25_trunk_voice_unit(t,freq,ts,P25_DUID_LDU2,now); // the call's identity carries on
+      label = *p25_trunk_label(t);
+    }
+  }
+  nwork = take_events(dp,site,nwork); // a call this burst started is in the table now
+  struct fcall * const fc = label.call_id != 0 ? find_call(site,label.call_id) : find_call_freq(site,freq,ts);
+  if(fc != NULL){
+    if(new_alias)
+      strlcpy(fc->alias,alias.text,sizeof fc->alias);
+    if(voice){
+      release = fc->release;
+      fc->release = 0;
+      strlcpy(call_alias,fc->alias,sizeof call_alias);
+      fc->units++;
+      if(b->duid == P25P2_DUID_2V && (b->ess == NULL || !b->ess->ok))
+	fc->words_bad++;
+      for(int i=0; i < b->nframes; i++)
+	fc->bits_fixed += b->voice[i].errors[0] + b->voice[i].errors[1];
+      if(fc->requested){
+	struct work * const w = add_work(dp,&nwork,WORK_REFRESH); // voice is arriving: keep the channel
+	if(w != NULL)
+	  w->ssrc = fc->ssrc;
+      }
+    }
+  }
+  site_unlock(site,dp,nwork);
+
+  if(new_alias)
+    decoder_event(dp,sample,"slot %d talker alias \"%s\"",ts,alias.text);
+  if(voice && label.call_id != s->call_id){
+    // Another call (or none) on this timeslot: what was held for the last one is never decoded
+    if(s->call_id != 0)
+      p25_audio_call_end(s->audio);
+    s->call_id = label.call_id;
+  }
+  if(release != 0)
+    p25_audio_release(s->audio,release == 1);
+  if(voice && label.call_id != 0){
+    // Stream identity as for Phase 1: a group call's streams have the talkgroup as their SSRC;
+    // other calls the timeslot's (0: the SSRC it was created with, the channel's plus the slot)
+    char desc[256];
+    uint32_t ssrc = 0;
+    int n;
+    if(label.call_type == P25_TRUNK_GROUP && label.destination != 0){
+      ssrc = label.destination;
+      n = snprintf(desc,sizeof desc,"P25 TG %u",label.destination);
+    } else
+      n = snprintf(desc,sizeof desc,"P25 %s %u",label.call_type == P25_TRUNK_TELEPHONE ? "telephone" : "unit",label.destination);
+    if(n > 0 && (size_t)n < sizeof desc && label.source != 0)
+      n += snprintf(desc + n,sizeof desc - n," src %u",label.source);
+    if(n > 0 && (size_t)n < sizeof desc && strlen(call_alias) > 0)
+      n += snprintf(desc + n,sizeof desc - n," \"%s\"",call_alias);
+    if(n > 0 && (size_t)n < sizeof desc)
+      snprintf(desc + n,sizeof desc - n," NAC %03x slot %d",nac,ts);
+    p25_audio_set_stream(s->audio,ssrc,desc);
+  }
+  p25_audio_burst(s->audio,b,when,voice ? audio_label(&label) : P25_AUDIO_UNLABELLED);
+}
+
+// Periodic -v line for a Phase 2 voice channel
+static void p2_status_line(struct decoder const *dp){
+  struct session const * const sp = dp->sp;
+  struct p25p2_stats st;
+  memset(&st,0,sizeof st);
+  p25p2_get_stats(dp->p2,&st);
+  decoder_event(dp,dp->samples,"status: Phase 2 %s, offset %+.1f Hz, scrambling %s, fragments %'llu missed %'llu, slot 0 voice frames %'llu MAC %'llu bad %'llu, slot 1 voice frames %'llu MAC %'llu bad %'llu, %'.0lf Hz, packets %'llu drops %'llu dupes %'llu filled %'llu resyncs %'llu overruns %'llu",
+		st.locked ? "locked" : "searching",st.frequency_offset,dp->scrambling ? "set" : "not known",
+		(unsigned long long)st.fragments,(unsigned long long)st.missed_fragments,
+		(unsigned long long)st.voice_frames[0],(unsigned long long)st.mac_ok[0],(unsigned long long)st.mac_bad[0],
+		(unsigned long long)st.voice_frames[1],(unsigned long long)st.mac_ok[1],(unsigned long long)st.mac_bad[1],
+		dp->samprate,
+		(unsigned long long)atomic_load(&sp->packets),(unsigned long long)atomic_load(&sp->drops),
+		(unsigned long long)atomic_load(&sp->dupes),(unsigned long long)atomic_load(&sp->filled),
+		(unsigned long long)atomic_load(&sp->resyncs),(unsigned long long)atomic_load(&sp->overruns));
 }
 
 // ---------------------------------------------------------------------------

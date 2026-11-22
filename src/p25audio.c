@@ -245,9 +245,9 @@ static struct p25_audio_group *open_group(char const *target,char const *iface,i
       uint32_t const addr = make_maddr(host);
       sin->sin_addr.s_addr = htonl(addr);
       if(service_name != NULL){
-        char ttlmsg[128];
-        snprintf(ttlmsg,sizeof ttlmsg,"TTL=%d",ttl);
-        avahi_start(service_name,"_rtp._udp",DEFAULT_RTP_PORT,host,addr,ttlmsg);
+	char ttlmsg[128];
+	snprintf(ttlmsg,sizeof ttlmsg,"TTL=%d",ttl);
+	avahi_start(service_name,"_rtp._udp",DEFAULT_RTP_PORT,host,addr,ttlmsg);
       }
     }
   }
@@ -426,6 +426,10 @@ struct p25_audio {
   uint64_t p2_ref;
   int p2_k2;
   bool p2_after_ptt;
+  // Phase 2 gap rule: the place (superframe * 6 + position 0-5, the SACCH being 5) of the last
+  // burst of this timeslot that decoded (voice, or a MAC PDU passing its CRC), since voice began
+  bool p2_heard_set;
+  int64_t p2_heard;
 
   void (*tap)(void *,int64_t,uint64_t);
   void *tap_arg;
@@ -820,6 +824,7 @@ static void end_transmission(struct p25_audio *a){
   a->in_superframe = false;
   a->cycle = INT64_MIN;
   a->p2_after_ptt = false;
+  a->p2_heard_set = false;
   a->last_unit = 0;
 }
 
@@ -832,6 +837,17 @@ void p25_audio_poll(struct p25_audio *a,double frequency,int64_t when){
     // The next voice unit is overdue by more than Hang: the call is over even without a terminator
     end_transmission(a);
   }
+}
+
+// Voice was lost, for long enough to hide the end of one transmission and the start of another.
+// What is known to be clear is so no longer, until a header, sync, PTT or ESS says so again.
+// Units still waiting for that word are never sent: the word, when it comes, may be another
+// transmission's and cannot vouch for them. (Units known clear when they came, waiting only for
+// the trunking logic, stay: they are sent if the logic releases them and what follows is clear)
+static void voice_gap(struct p25_audio *a){
+  if(!a->clear)
+    discard_held(a);
+  a->clear = false;
 }
 
 // Encryption parameters received (header, encryption sync, PTT, ESS) at 'at': they apply to the
@@ -1010,7 +1026,7 @@ void p25_audio_unit(struct p25_audio *a,struct p25_frame const *frame,int64_t wh
 	// Voice units lost: what came between might have been a terminator and the header of
 	// another transmission. Clear only once a header or sync says so again (until then units
 	// wait, and are sent in order then: the speech is the same, only later)
-	a->clear = false;
+	voice_gap(a);
       }
       a->last_unit = t;
       a->last_dibit = frame->dibit;
@@ -1061,11 +1077,33 @@ static int64_t floor_div(int64_t a,int64_t b){
   return q;
 }
 
-// Phase 2 call details and encryption from a signalling burst's MAC PDU
+// A MAC voice channel user structure naming another talkgroup (or unit) or another talker than
+// the transmission's: a new transmission whose END PTT and PTT were both missed, as new_talker()
+// is for Phase 1 link control
+static bool new_mac_talker(struct p25_audio const *a,struct p25_msg const *msg){
+  if(!a->have_call)
+    return false;
+  bool unit_call;
+  uint32_t target;
+  switch(msg->kind){
+  case P25_LC_GRP_V_CH_USR:
+  case P25_LC_MOT_GRG_V_CH_USR:
+    unit_call = false;
+    target = msg->group;
+    break;
+  case P25_LC_UU_V_CH_USR:
+    unit_call = true;
+    target = msg->tgt;
+    break;
+  default:
+    return false;
+  }
+  return unit_call != a->unit_call || target != a->target || (a->source != 0 && msg->src != 0 && msg->src != a->source);
+}
+
+// Phase 2 call details and encryption from a signalling burst's MAC PDU (its CRC passed)
 static void mac_info(struct p25_audio *a,struct p25p2_burst const *b){
   struct p25p2_mac const * const m = b->mac;
-  if(m == NULL || !m->crc_ok)
-    return;
   struct p25_mac_pdu pdu;
   if(p25_mac_decode(&pdu,(enum p25_mac_chan)m->chan,m->octets,m->nbits) < 0)
     return;
@@ -1080,19 +1118,27 @@ static void mac_info(struct p25_audio *a,struct p25p2_burst const *b){
     a->source = pdu.src;
     break;
   case P25_MAC_END_PTT:
+  case P25_MAC_IDLE:
+  case P25_MAC_HANGTIME:
+    // No voice on this timeslot now: whatever comes next is another transmission. The voice
+    // channel user structures of an idle or hang time PDU name the call, not a transmission
     end_transmission(a);
     break;
   default:
-    for(int i=0; i < pdu.nstruct; i++)
-      if(pdu.s[i].mac_kind == P25_MAC_MSG)
-	voice_user(a,&pdu.s[i].msg);
+    for(int i=0; i < pdu.nstruct; i++){
+      if(pdu.s[i].mac_kind != P25_MAC_MSG)
+	continue;
+      if(new_mac_talker(a,&pdu.s[i].msg))
+	end_transmission(a);
+      voice_user(a,&pdu.s[i].msg);
+    }
     break;
   }
 }
 
-// Phase 2: the voice cycle of the burst at voice burst k of superframe sf, and its place in it (0-3 a
-// 4V, 4 the 2V). A cycle is the four 4V bursts after a 2V and that 2V, 18 frames: the ESS collected
-// over it applies to the next
+// Phase 2 voice cycles: the voice cycle of the burst at voice burst k of superframe sf, and its
+// place in it (0-3 a 4V, 4 the 2V). A cycle is the four 4V bursts after a 2V and that 2V, 18
+// frames: the ESS collected over it applies to the next
 static void p2_cycle(struct p25_audio const *a,int64_t sf,int k,int64_t *cycle,int *c){
   int64_t const air = sf * 5 + k - (a->p2_k2 + 1);
   *cycle = floor_div(air,5);
@@ -1108,18 +1154,23 @@ static void p2_place(struct p25_audio const *a,struct held_unit *h){
     h->f[i].position = (uint8_t)(4 * c + i);
 }
 
+// The gap rule. Places on a timeslot, counting its SACCH, between the last burst that decoded and
+// this voice burst, where nothing decoded: lost voice, or a lost FACCH or SACCH. A lost END PTT
+// and a lost PTT each take at least one place, so two or more missing places may hide the end of
+// one transmission and the start of another. One cannot: a FACCH stealing a voice burst, or one
+// burst lost to noise, leaves the transmission as it was
+enum { P2_GAP_PLACES = 2 };
+static int64_t p2_missing(struct p25_audio const *a,int64_t place){
+  if(!a->p2_heard_set || place <= a->p2_heard)
+    return 0;
+  return place - a->p2_heard - 1;
+}
+
 void p25_audio_burst(struct p25_audio *a,struct p25p2_burst const *b,int64_t when,enum p25_audio_label label){
   if(a == NULL || b == NULL)
     return;
   int64_t const t = when != 0 ? when : gps_time_ns();
-  if(b->mac != NULL){
-    mac_info(a,b);
-    return;
-  }
-  if(b->voice == NULL || b->nframes <= 0 || b->nframes > MAX_UNIT_FRAMES)
-    return;
-  a->last_unit = t;
-  // The burst's place: superframe from the dibit clock, voice burst k (0-4) from its slot
+  // The burst's place: superframe from the dibit clock, position k (0-4 voice, 5 SACCH) from its slot
   int const k = b->superframe_slot / 2;
   uint64_t const sf_start = b->dibit - (uint64_t)b->superframe_slot * P2_SLOT_DIBITS;
   if(!a->p2_ref_set){
@@ -1127,6 +1178,29 @@ void p25_audio_burst(struct p25_audio *a,struct p25p2_burst const *b,int64_t whe
     a->p2_ref_set = true;
   }
   int64_t const sf = floor_div((int64_t)(sf_start - a->p2_ref) + P2_SUPERFRAME_DIBITS / 2,P2_SUPERFRAME_DIBITS);
+  int64_t const place = sf * 6 + k;
+  bool const mac = b->mac != NULL;
+  if(mac ? !b->mac->crc_ok : (b->voice == NULL || b->nframes <= 0 || b->nframes > MAX_UNIT_FRAMES || k > 4))
+    return; // nothing decoded in this place
+  if(p2_missing(a,place) >= P2_GAP_PLACES){
+    // Whatever decoded here, voice or signalling (a PTT says for itself what follows). Clear only
+    // once a PTT or an ESS says so again (until then bursts wait, and are sent in order then: the
+    // speech is the same, only later). The encryption parameters received so far may be another
+    // transmission's too: frames carry none (ALGID 0) until the next PTT or ESS
+    voice_gap(a);
+    memset(&a->last,0,sizeof a->last);
+    memset(&a->current,0,sizeof a->current);
+    a->pending_fresh = false;
+  }
+  if(mac){
+    mac_info(a,b);
+    if(a->p2_heard_set && place > a->p2_heard)
+      a->p2_heard = place; // heard, in a transmission already under way
+    return;
+  }
+  a->p2_heard = place;
+  a->p2_heard_set = true;
+  a->last_unit = t;
   if(a->p2_after_ptt){
     a->p2_k2 = (k + 4) % 5; // this burst begins a voice cycle
     a->p2_after_ptt = false;
@@ -1164,7 +1238,8 @@ void p25_audio_burst(struct p25_audio *a,struct p25p2_burst const *b,int64_t whe
     f->errs2 = (uint8_t)(v->data_errors[0] + v->data_errors[1]);
   }
   p2_place(a,&u);
-  // This burst's own encryption sync counts, for the next cycle
+  // This burst's own encryption sync counts at once for the rule (an ALGID other than 0x80 makes
+  // the whole transmission not clear, this burst included); its parameters are for the next cycle
   if(b->duid == P25P2_DUID_2V && b->ess != NULL && b->ess->ok)
     got_crypto(a,b->ess->algid,b->ess->kid,b->ess->mi,cycle);
   voice_arrival(a,&u,label);
@@ -1187,6 +1262,7 @@ void p25_audio_call_end(struct p25_audio *a){
   if(a == NULL)
     return;
   end_transmission(a);
+  a->p2_ref_set = false; // Phase 2: superframes are counted afresh (the receiver may be a new one)
 }
 
 void p25_audio_set_stream(struct p25_audio *a,uint32_t ssrc,char const *description){

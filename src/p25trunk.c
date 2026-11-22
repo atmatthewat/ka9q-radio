@@ -1234,7 +1234,9 @@ void p25_trunk_control(struct p25_trunk *t, struct p25_msg const *m, uint16_t na
     }
   }
   bool const mbt = m->family == P25_FAMILY_MBT;
-  if(m->family != P25_FAMILY_TSBK && !mbt){
+  // A Phase 2 voice channel's MAC structures: the same messages, read as the TSBKs they
+  // abbreviate (those that carry service options do so in both forms); not a control channel's
+  if(m->family != P25_FAMILY_TSBK && !mbt && m->family != P25_FAMILY_MAC){
     finish(t);
     return;
   }

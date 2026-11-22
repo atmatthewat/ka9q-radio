@@ -246,7 +246,8 @@ struct p25_trunk *create_p25_trunk(struct p25_trunk_config const *config,p25_tru
 void delete_p25_trunk(struct p25_trunk *t);
 
 // A decoded message from the control channel (a TSBK or multi-block trunking message).
-// Trunking messages that turn up on a voice channel go here too.
+// Trunking messages that turn up on a voice channel go here too, and so do a Phase 2 voice
+// channel's MAC structures (P25_FAMILY_MAC: grants and updates as the TSBKs they abbreviate).
 void p25_trunk_control(struct p25_trunk *t,struct p25_msg const *msg,uint16_t nac,int64_t now);
 
 // From a voice channel the caller is receiving, identified by its frequency and slot (-1 FDMA),
