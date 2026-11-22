@@ -1,6 +1,8 @@
 # systemd unit for the P25 decoder
 # The instance is the I/Q multicast group to decode, e.g., systemctl enable --now p25d@p25-iq.local
 # Every channel (SSRC) on the group is decoded; events from all instances are appended to /var/log/p25d.log
+# Trunked calls are followed (p25d asks radiod for their voice channels and releases them on stop).
+# For voice output add -R, e.g. with systemctl edit: ExecStart= then ExecStart=@sbindir@/p25d -R p25-pcm.local %i
 
 [Unit]
 Description=P25 decoder %i

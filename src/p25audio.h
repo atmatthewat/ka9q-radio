@@ -54,9 +54,33 @@ struct p25_audio_stats {
   uint64_t muted;          // of those, muted
   uint64_t lost;           // frames filled in for missing voice data units
   uint64_t encrypted;      // voice data units not decoded because the call is encrypted
+  uint64_t units;          // voice data units decoded
+  uint64_t held;           // voice data units held while their encryption was not known
+  uint64_t discarded;      // held units never confirmed clear, not decoded
   uint64_t packets;        // RTP data packets sent
   uint64_t status;         // status packets sent
   uint64_t errors;         // send failures
+};
+
+// Speech decoded from an encrypted voice unit, or from one not yet known to be clear, is never
+// sent. A unit is decoded only when
+//  - this module has seen, in the same transmission, a header or encryption sync word that passed
+//    error correction with ALGID 0x80 (clear), and nothing since saying otherwise (a header or
+//    sync with another ALGID, or link control that is protected or has the service options'
+//    encryption bit set, marks the rest of the transmission encrypted), and
+//  - when the channel has trunking logic, that logic labelled the unit clear: at once
+//    (P25_AUDIO_CLEAR) or later (P25_AUDIO_HOLD, then p25_audio_release(a,true)).
+// Units waiting for either are kept (their IMBE frames copied, at most P25_AUDIO_MAX_HELD) and,
+// once both allow, decoded and sent in order with their original timestamps. Held units are
+// discarded if the call turns out encrypted, if the transmission ends first, or if more than
+// P25_AUDIO_MAX_HELD wait (the oldest go).
+enum { P25_AUDIO_MAX_HELD = 8 };
+enum p25_audio_label {
+  P25_AUDIO_UNLABELLED = 0, // no trunking logic on this channel: only this module's own rule applies
+  P25_AUDIO_CLEAR,          // the trunking logic says clear
+  P25_AUDIO_HOLD,           // the trunking logic does not know yet; see p25_audio_release()
+  P25_AUDIO_ENCRYPTED,      // the trunking logic says encrypted: not decoded, nor any unit held before it
+  P25_AUDIO_NONE,           // the trunking logic knows no call on this channel: not decoded
 };
 
 // One channel's stream; used only by that channel's decode thread
@@ -69,11 +93,25 @@ void p25_audio_destroy(struct p25_audio *a); // ends a transmission in progress
 // Once per block of samples fed to the receiver: the channel frequency (for the status), and the
 // time at the block, to end a transmission that stopped without a terminator
 void p25_audio_poll(struct p25_audio *a,double frequency,int64_t when);
-// Every data unit from the receiver's frame callback, 'when' being the time at its end:
+// Every data unit from the receiver's frame callback, 'when' being the time at its end, with the
+// trunking logic's label for a voice unit (P25_AUDIO_UNLABELLED on a channel without it):
 // HDU and LDUs start a transmission (marker bit) and carry the talkgroup, source and encryption;
-// LDUs are decoded and sent, lost ones (counted from frame->dibit) filled with repeated, then
-// muted, frames; an encrypted call is not decoded; TDU and TDULC end the transmission
+// LDUs are decoded and sent under the rule above, lost ones (counted from frame->dibit) filled with
+// repeated, then muted, frames; TDU and TDULC end the transmission
+void p25_audio_unit(struct p25_audio *a,struct p25_frame const *frame,int64_t when,enum p25_audio_label label);
+// The same, unlabelled
 void p25_audio_frame(struct p25_audio *a,struct p25_frame const *frame,int64_t when);
+// The trunking logic decided about the units it labelled P25_AUDIO_HOLD: clear (they are decoded
+// once this module's own rule also allows) or not (they are discarded)
+void p25_audio_release(struct p25_audio *a,bool clear);
+// The trunking logic ended the call on this channel: units still held are discarded and the
+// transmission ends
+void p25_audio_call_end(struct p25_audio *a);
+// The stream's SSRC and the description its status carries (NULL: built from the voice channel's
+// own link control). A change of SSRC ends a transmission in progress
+void p25_audio_set_stream(struct p25_audio *a,uint32_t ssrc,char const *description);
+// Diagnostics: called with each voice unit's time and dibit position just before it goes to the vocoder
+void p25_audio_set_unit_tap(struct p25_audio *a,void (*tap)(void *arg,int64_t when,uint64_t dibit),void *arg);
 // Lower level: send PCM for the current transmission, starting one if needed (frames of 160)
 void p25_audio_pcm(struct p25_audio *a,int16_t const *pcm,int count,int64_t when);
 void p25_audio_end(struct p25_audio *a);

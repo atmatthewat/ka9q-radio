@@ -1,6 +1,8 @@
 // P25 decoder daemon for ka9q-radio
 // Reads complex baseband (I/Q) RTP streams from radiod, runs one P25 Phase 1 receiver per SSRC
-// and logs what it decodes, one timestamped line per event, on standard output
+// and logs what it decodes, one timestamped line per event, on standard output.
+// Follows trunked calls: on a voice channel grant it asks radiod for that channel, and it sends
+// the clear voice it decodes as RTP audio streams
 // Copyright 2026, Matthew Kaufman, KA6SQG
 
 #include <assert.h>
@@ -28,11 +30,24 @@
 #include "radio.h"
 #include "import.h"
 #include "timing.h"
+#include "defaults.h"
+#include "chanctl.h"
 #include "p25p1.h"
 #include "p25msg.h"
+#include "p25trunk.h"
+#include "p25alias.h"
+#include "p25audio.h"
 
 #define MAX_MCAST 20   // Maximum number of input groups
 #define RESEQ 32       // Resequencing queue, packets. radiod sends one to three packets per 20 ms block
+#define MAX_TALKGROUPS 4096 // In the allow and deny lists together
+#define MAX_RADIOS 8   // radiod instances whose channels p25d may ask for
+#define MAX_EVENTS 128 // Trunking events waiting to be acted on, per site
+#define MAX_WORK 256   // Log lines and channel requests waiting for a site's lock to be let go
+#define MAX_REFUSED 64 // Frequencies radiod refused, per site, remembered so each is logged once
+
+struct site;
+struct work;
 
 // One block of complex samples on its way from the input thread to a decode thread
 // Also the resequencing queue entry for the packet it came from
@@ -70,6 +85,21 @@ struct decoder {
   bool have_es;
   int voice_units;         // voice data units and bits corrected in their frames since the last terminator
   int voice_errors;
+  struct p25_audio *audio; // voice output stream, NULL without --pcm-out or a vocoder
+
+  // Call following. A control channel's thread feeds its site's trunking logic; the thread of a
+  // voice channel p25d asked for feeds the same site's logic its voice units and is told what to do
+  // with them. A channel that is neither (conventional, or configured and never granted) has neither
+  struct site *site;       // the site, or NULL
+  bool control;            // this channel carries the site's trunking
+  bool voice;              // this is a voice channel the site asked for
+  uint64_t trunk_freq;     // voice: the frequency the trunking logic knows the channel by
+  uint32_t call_id;        // voice: call of the last voice unit
+  bool seed;               // voice: seed the receiver's frequency with seed_hz when it is created
+  float seed_hz;
+  struct p25_alias alias;  // talker aliases from link control
+  struct work *work;       // to act on after a site's lock is let go
+  uint16_t site_nac;       // control: NAC of the last trunking message
 };
 
 // One for each channel (SSRC) being decoded
@@ -111,6 +141,70 @@ struct session {
   atomic_uint_fast64_t resyncs;    // Timestamp discontinuities not filled
   atomic_uint_fast64_t overruns;   // Blocks dropped because the decoder fell behind
   atomic_uint_fast64_t unusable;   // Packets of unknown or unsupported format
+
+  // Call following: the decode thread sets site once trunking blocks decode here; from then on
+  // the input thread keeps the site's command handle and channel format up to date from this status
+  _Atomic(struct site *) site;
+};
+
+// A call the trunking logic reported, as p25d acts on it
+struct fcall {
+  bool used;
+  uint32_t id;               // the trunking logic's call_id
+  enum p25_trunk_call_type type;
+  uint16_t talkgroup;
+  uint32_t source;
+  uint32_t target;
+  uint64_t freq_hz;
+  int slot;
+  uint32_t flags;            // P25_TRUNK_F_* as last reported
+  bool requested;            // its channel was asked for and not released
+  bool refused;              // radiod refused its channel
+  uint32_t ssrc;             // of its voice channel, when requested
+  bool seed;                 // the control channel's carrier offset, for the voice channel's receiver
+  float seed_hz;
+  int64_t start;
+  char alias[P25_ALIAS_MAX];
+  int units;                 // voice units received for it, link control and encryption sync words that
+  int words_bad;             // failed, and bits corrected in the voice frames
+  int bits_fixed;
+  int release;               // for the voice channel's thread: held units released, 1 clear, 2 not clear
+};
+
+// One per control channel: its trunking logic and the calls followed from it
+// Lock order: Sites_mutex, then a site's lock, then Ctl_mutex. Output_mutex is taken alone
+struct site {
+  struct site *next;         // in Sites (Sites_mutex)
+  struct sockaddr_storage sender; // the control channel: radiod's address and the SSRC (fixed)
+  uint32_t ssrc;
+
+  pthread_mutex_t lock;      // everything from here to 'ctl'
+  struct p25_trunk *trunk;   // NULL while the control channel is not being received
+  double freq;               // control channel, Hz, and the NAC it last decoded with
+  uint16_t nac;
+  int64_t now;               // last time given to the trunking logic: it must not go back
+  struct fcall calls[P25_TRUNK_MAX_CALLS];
+  uint64_t refused[MAX_REFUSED];
+  int nrefused;
+  struct p25_trunk_event events[MAX_EVENTS]; // reported by the trunking logic, not yet acted on
+  int nevents;
+  uint64_t lost_events;
+
+  // Under Ctl_mutex: radiod's command handle and the control channel's format, from its status
+  struct chanctl *ctl;
+  struct chanctl_format format;
+  bool have_format;
+};
+
+// What a thread does once it has let go of a site's lock
+enum work_kind { WORK_LOG, WORK_REQUEST, WORK_RELEASE, WORK_REFRESH };
+struct work {
+  enum work_kind kind;
+  int64_t when;              // WORK_LOG: time of the event
+  uint32_t ssrc;
+  uint64_t freq_hz;
+  uint32_t call_id;
+  char text[400];
 };
 
 // Command line params
@@ -124,10 +218,24 @@ static struct sockaddr_storage *Source_socket; // Remains NULL if Source == NULL
 static uint32_t Ssrc;                 // Decode only this SSRC, when specified
 static int64_t Timeout = 20;          // Seconds without data before a channel is closed
 static int Update = 10;               // Seconds of stream between -v status lines
+static char const *Output;            // Voice output group (--pcm-out), NULL for none
+static char const *Name = "p25d";     // Service name it is advertised under
+static int Mcast_ttl = DEFAULT_TTL;   // of the voice output
+static int IP_tos = DEFAULT_IP_TOS;
+static bool Follow = true;            // Ask radiod for the voice channels of calls granted on a control channel
+static bool Follow_encrypted;         // Including encrypted calls (logged, never heard)
+static int Max_calls;                 // Most calls followed at once, 0 = no limit
+static uint16_t Allow[MAX_TALKGROUPS],Deny[MAX_TALKGROUPS]; // Talkgroups to follow (none: all) and not to follow
+static int Nallow,Ndeny;
 
 // Tuning constants
 static double const Max_fill = 1.0;   // Fill gaps up to this many seconds with zeroes; resynchronize on longer ones
 static double const Max_queue = 5.0;  // Seconds of samples queued to a decoder before blocks are dropped
+// A voice channel asked for goes away this long after the last request or refresh: a little over
+// the time after which the trunking logic ends a call it hears nothing of, so a lost release can't
+// leave it behind for long
+static double const Lifetime = P25_TRUNK_CALL_TIMEOUT * 1e-9 + 2;
+static int const Ctl_ttl = 1;         // Commands to radiod, as tune and control send them
 
 // Global variables
 static int Data_fd[MAX_MCAST];
@@ -136,6 +244,13 @@ static struct session *Sessions;
 static pthread_mutex_t Output_mutex = PTHREAD_MUTEX_INITIALIZER; // One line at a time on stdout
 static volatile sig_atomic_t Terminate;
 static volatile sig_atomic_t Signal;
+static struct p25_audio_group *Audio_group;
+static pthread_mutex_t Sites_mutex = PTHREAD_MUTEX_INITIALIZER; // the Sites list
+static struct site *Sites;            // Never freed before exit, so a decode thread can keep a pointer
+static pthread_mutex_t Ctl_mutex = PTHREAD_MUTEX_INITIALIZER;   // Radios[], every chanctl call, site ctl/format
+static struct chanctl *Radios[MAX_RADIOS];
+static struct sockaddr_storage Radio_addr[MAX_RADIOS];
+static int Nradios;
 
 static void closedown(int);
 static void verbosity(int);
@@ -163,23 +278,43 @@ static void decoder_event(struct decoder const *dp,uint64_t sample,char const *f
 static void decoder_dump(struct decoder const *dp,uint64_t sample,char const *label,uint8_t const *data,size_t len) __attribute__((unused));
 static void status_line(struct decoder const *dp);
 static void decoder_frame(void *arg,struct p25_frame const *frame);
+static int64_t decoder_time(struct decoder const *dp,uint64_t sample);
+static void observe_status(struct session *sp);
+static struct site *get_site(struct session const *sp);
+static void site_unlock(struct site *site,struct decoder *dp,int nwork);
+static void log_line(uint32_t ssrc,double frequency,int64_t when,char const *fmt,...) __attribute__((format(printf,4,5)));
+static void control_message(struct decoder *dp,uint64_t sample,struct p25_msg const *msg);
+static void control_block(struct decoder *dp);
+static void control_lost(struct decoder *dp);
+static void voice_unit(struct decoder *dp,uint64_t sample,struct p25_frame const *frame);
+static void link_voice(struct decoder *dp);
+static int parse_talkgroups(uint16_t *list,int n,char const *arg);
 
 static struct option Options[] = {
   {"iface", required_argument, NULL, 'A'},
   {"input", required_argument, NULL, 'I'},
+  {"encrypted", no_argument, NULL, 'e'},
+  {"talkgroups", required_argument, NULL, 'g'},
   {"locale", required_argument, NULL, 'l'},
+  {"max-calls", required_argument, NULL, 'm'},
+  {"name", required_argument, NULL, 'N'},
+  {"no-follow", no_argument, NULL, 'n'},
   {"source", required_argument, NULL, 'o'},
+  {"tos", required_argument, NULL, 'p'},
+  {"pcm-out", required_argument, NULL, 'R'},
   {"ssrc", required_argument, NULL, 'S'},
   {"timeout", required_argument, NULL, 't'},
+  {"ttl", required_argument, NULL, 'T'},
   {"update", required_argument, NULL, 'u'},
+  {"exclude", required_argument, NULL, 'x'},
   {"verbose", no_argument, NULL, 'v'},
   {"version", no_argument, NULL, 'V'},
   {NULL, 0, NULL, 0},
 };
-static char const Optstring[] = "A:I:l:o:S:t:u:vV";
+static char const Optstring[] = "A:eg:I:l:m:nN:o:p:R:S:t:T:u:vVx:";
 
 static void usage(void){
-  fprintf(stderr,"Usage: %s [-v|--verbose] [-V|--version] [-l|--locale locale] [-A|--iface interface] [-o|--source <source-name-or-address>] [-S|--ssrc ssrc] [-t|--timeout seconds] [-u|--update seconds] [-I|--input] iq_mcast_address [iq_mcast_address ...]\n",App_path);
+  fprintf(stderr,"Usage: %s [-v|--verbose] [-V|--version] [-l|--locale locale] [-A|--iface interface] [-o|--source <source-name-or-address>] [-S|--ssrc ssrc] [-t|--timeout seconds] [-u|--update seconds] [-R|--pcm-out audio_mcast_address] [-N|--name service_name] [-T|--ttl ttl] [-p|--tos tos] [-n|--no-follow] [-g|--talkgroups list] [-x|--exclude list] [-m|--max-calls n] [-e|--encrypted] [-I|--input] iq_mcast_address [iq_mcast_address ...]\n",App_path);
 }
 
 int main(int argc,char *argv[]){
@@ -201,11 +336,38 @@ int main(int argc,char *argv[]){
       }
       Input[Ninputs++] = optarg;
       break;
+    case 'e':
+      Follow_encrypted = true;
+      break;
+    case 'g':
+      Nallow = parse_talkgroups(Allow,Nallow,optarg);
+      break;
     case 'l':
       Locale = optarg;
       break;
+    case 'm':
+      Max_calls = atoi(optarg);
+      break;
+    case 'n':
+      Follow = false;
+      break;
+    case 'N':
+      Name = optarg;
+      break;
     case 'o':
       Source = optarg;
+      break;
+    case 'p':
+      IP_tos = (int)strtol(optarg,NULL,0);
+      break;
+    case 'R':
+      Output = optarg;
+      break;
+    case 'T':
+      Mcast_ttl = (int)strtol(optarg,NULL,0);
+      break;
+    case 'x':
+      Ndeny = parse_talkgroups(Deny,Ndeny,optarg);
       break;
     case 'S':
       {
@@ -254,6 +416,13 @@ int main(int argc,char *argv[]){
     usage();
     exit(EX_USAGE);
   }
+  if(Ssrc != 0 && Follow){
+    // The voice channels it would ask for would be ignored
+    fprintf(stderr,"%s: --ssrc given, not following calls\n",App_path);
+    Follow = false;
+  }
+  if(p25_vocoder_name(P25_CODEC_IMBE) == NULL)
+    fprintf(stderr,"%s: built without a vocoder (mbelib): no voice output\n",App_path);
   if(Source != NULL){
     Source_socket = calloc(1,sizeof(struct sockaddr_storage));
     assert(Source_socket != NULL);
@@ -278,6 +447,12 @@ int main(int argc,char *argv[]){
     if(Verbose)
       fprintf(stderr,"%s: listening to %s\n",App_path,Input[i]);
   }
+  if(Output != NULL && p25_vocoder_name(P25_CODEC_IMBE) != NULL){
+    if((Audio_group = p25_audio_open(Output,Default_mcast_iface,Mcast_ttl,IP_tos,Name)) == NULL)
+      exit(EX_TEMPFAIL); // Let systemd restart us
+    if(Verbose)
+      fprintf(stderr,"%s: voice to %s (%s)\n",App_path,Output,p25_vocoder_name(P25_CODEC_IMBE));
+  }
   // Graceful signal catch
   signal(SIGINT,closedown);
   signal(SIGQUIT,closedown);
@@ -288,6 +463,7 @@ int main(int argc,char *argv[]){
 
   input_loop(); // Returns on a signal
   cleanup();
+  p25_audio_close(Audio_group);
   if(Verbose)
     fprintf(stderr,"%s: caught signal %d: %s\n",App_path,(int)Signal,strsignal(Signal));
   exit((Signal == SIGTERM || Signal == SIGINT) ? EX_OK : EX_SOFTWARE);
@@ -374,6 +550,8 @@ static void process_status(int fd){
   sp->pt_table[type].encoding = sp->chan.output.encoding;
   sp->pt_table[type].samprate = sp->chan.output.samprate;
   sp->pt_table[type].channels = sp->chan.output.channels;
+  if(Follow)
+    observe_status(sp);
 
   if(new_session && Verbose)
     session_event(sp,0,"new channel: %s, %'d Hz, %d channels, %s, %s demod, filter %+.0f to %+.0f Hz, agc %s, from %s",
@@ -637,6 +815,7 @@ static struct session *create_session(struct sockaddr_storage const *sender,uint
   pthread_mutex_init(&sp->qmutex,NULL);
   pthread_cond_init(&sp->qcond,NULL);
   atomic_init(&sp->terminate,false);
+  atomic_init(&sp->site,NULL);
 
   sp->prev = NULL;
   sp->next = Sessions;
@@ -697,6 +876,22 @@ static void close_session(struct session *sp,char const *reason){
 static void cleanup(void){
   while(Sessions != NULL)
     close_session(Sessions,"shutdown");
+  // Every decode thread has stopped, and each control channel's has let its calls' channels go.
+  // chanctl_destroy() releases any that are left
+  pthread_mutex_lock(&Ctl_mutex);
+  for(int i=0; i < Nradios; i++)
+    chanctl_destroy(Radios[i]);
+  Nradios = 0;
+  pthread_mutex_unlock(&Ctl_mutex);
+  pthread_mutex_lock(&Sites_mutex);
+  while(Sites != NULL){
+    struct site *site = Sites;
+    Sites = site->next;
+    delete_p25_trunk(site->trunk);
+    pthread_mutex_destroy(&site->lock);
+    FREE(site);
+  }
+  pthread_mutex_unlock(&Sites_mutex);
 }
 
 // One per channel: take blocks off the queue and run the receiver over them
@@ -711,6 +906,12 @@ static void *decode_task(void *arg){
   struct decoder dec = {
     .sp = sp,
   };
+  if(Follow && (dec.work = calloc(MAX_WORK,sizeof *dec.work)) == NULL){
+    fprintf(stderr,"ssrc %u: out of memory\n",sp->ssrc);
+    return NULL;
+  }
+  dec.audio = p25_audio_create(Audio_group,sp->ssrc); // NULL without --pcm-out
+  p25_alias_init(&dec.alias);
   while(true){
     pthread_mutex_lock(&sp->qmutex);
     while(sp->queue == NULL && !atomic_load(&sp->terminate)){
@@ -729,8 +930,12 @@ static void *decode_task(void *arg){
     if(bp == NULL)
       break; // Told to terminate, and nothing left
 
+    dec.frequency = bp->frequency;
+    if(Follow && !dec.voice && !dec.control)
+      link_voice(&dec); // before the receiver is created, so it can be seeded
     if(bp->samprate != dec.samprate){
       // First block, or the sample rate changed
+      p25_audio_call_end(dec.audio);
       if(dec.p25 != NULL)
 	delete_p25p1(dec.p25);
       dec.samprate = bp->samprate;
@@ -740,8 +945,13 @@ static void *decode_task(void *arg){
       if(dec.p25 == NULL)
 	fprintf(stderr,"ssrc %u: can't create P25 receiver at %'.0lf Hz (needs at least %d Hz)\n",
 		sp->ssrc,dec.samprate,4 * P25_SYMRATE);
-      else
+      else {
 	p25p1_set_frame_handler(dec.p25,decoder_frame,&dec);
+	// A voice channel granted on a control channel is sent from the same site, so its carrier
+	// is off by about what the control channel's is
+	if(dec.voice && dec.seed)
+	  p25p1_seed_frequency(dec.p25,dec.seed_hz);
+      }
       p25_bandplan_init(&dec.plan);
     }
     dec.frequency = bp->frequency;
@@ -750,6 +960,9 @@ static void *decode_task(void *arg){
     if(dec.p25 != NULL){
       p25p1_samples(dec.p25,bp->samples,bp->count); // decoder_frame() runs in here
     }
+    p25_audio_poll(dec.audio,dec.frequency,decoder_time(&dec,dec.block_start + bp->count));
+    if(dec.control)
+      control_block(&dec);
     dec.samples += bp->count;
     FREE(bp);
     if(Verbose && Update > 0 && dec.samples >= dec.next_report){
@@ -757,6 +970,10 @@ static void *decode_task(void *arg){
       dec.next_report += (uint64_t)(Update * dec.samprate);
     }
   }
+  if(dec.control)
+    control_lost(&dec);
+  p25_audio_destroy(dec.audio);
+  FREE(dec.work);
   if(dec.p25 != NULL)
     delete_p25p1(dec.p25);
   return NULL;
@@ -807,6 +1024,10 @@ static bool lc_seen(struct decoder *dp,uint64_t sample,uint8_t const lc[9]){
 static void decoder_frame(void *arg,struct p25_frame const *frame){
   struct decoder * const dp = (struct decoder *)arg;
   uint64_t const sample = dp->block_start; // to the block; a block is one RTP packet
+  if(dp->voice)
+    voice_unit(dp,sample,frame); // the trunking logic, then the voice output under its labels
+  else
+    p25_audio_frame(dp->audio,frame,decoder_time(dp,sample)); // voice output on this module's own rule
   struct p25_msg msg;
   switch(frame->duid){
   case P25_DUID_TSDU:
@@ -818,8 +1039,13 @@ static void decoder_frame(void *arg,struct p25_frame const *frame){
       }
       uint8_t tsbk[12];
       p25_pack_bits(tsbk,frame->bits,96);
-      if(p25_decode_tsbk(&msg,tsbk) == 0)
+      if(p25_decode_tsbk(&msg,tsbk) == 0){
 	log_message(dp,sample,frame,&msg,frame->crc == 1 ? " (1 bit corrected)" : "");
+	if(Follow && !dp->voice){
+	  dp->site_nac = frame->nac;
+	  control_message(dp,sample,&msg);
+	}
+      }
     }
     break;
   case P25_DUID_HDU:
@@ -884,8 +1110,13 @@ static void decoder_frame(void *arg,struct p25_frame const *frame){
     if(frame->pdu != NULL){
       uint8_t octets[(P25_PDU_MAX_BITS + 7) / 8];
       p25_pack_bits(octets,frame->pdu->payload,frame->pdu->nbits);
-      if(p25_decode_pdu(&msg,octets,frame->pdu->nbits / 8) == 0)
+      if(p25_decode_pdu(&msg,octets,frame->pdu->nbits / 8) == 0){
 	log_message(dp,sample,frame,&msg,"");
+	if(Follow && !dp->voice && msg.family == P25_FAMILY_MBT){
+	  dp->site_nac = frame->nac;
+	  control_message(dp,sample,&msg); // multi-block trunking: grants among them
+	}
+      }
     } else if(Verbose > 1)
       decoder_event(dp,sample,"NAC %03x PDU header failed CRC, sync %.1f",frame->nac,frame->correlation);
     break;
@@ -902,8 +1133,9 @@ static void status_line(struct decoder const *dp){
   struct p25p1_stats st = {0};
   if(dp->p25 != NULL)
     p25p1_get_stats(dp->p25,&st);
-  decoder_event(dp,dp->samples,"status: %s, offset %+.1f Hz, syncs %'llu weak %'llu, TSBK %'llu bad %'llu, LDU %'llu, words bad %'llu, %'.0lf Hz, packets %'llu drops %'llu dupes %'llu filled %'llu resyncs %'llu overruns %'llu",
+  decoder_event(dp,dp->samples,"status: %s, offset %+.1f Hz, filter %s, syncs %'llu weak %'llu, TSBK %'llu bad %'llu, LDU %'llu, words bad %'llu, %'.0lf Hz, packets %'llu drops %'llu dupes %'llu filled %'llu resyncs %'llu overruns %'llu",
 		st.locked ? "locked" : "searching",st.frequency_offset,
+		st.rxfilter == P25_FILTER_GENTLE ? "gentle" : "sharp",
 		(unsigned long long)st.syncs,(unsigned long long)st.weak_syncs,
 		(unsigned long long)(st.tsbk_ok + st.tsbk_fixed),(unsigned long long)st.tsbk_bad,
 		(unsigned long long)(st.ldu1 + st.ldu2),(unsigned long long)st.word_bad,
@@ -911,6 +1143,706 @@ static void status_line(struct decoder const *dp){
 		(unsigned long long)atomic_load(&sp->packets),(unsigned long long)atomic_load(&sp->drops),
 		(unsigned long long)atomic_load(&sp->dupes),(unsigned long long)atomic_load(&sp->filled),
 		(unsigned long long)atomic_load(&sp->resyncs),(unsigned long long)atomic_load(&sp->overruns));
+}
+
+// ---------------------------------------------------------------------------
+// Call following
+//
+// Threads: the input thread sees every status packet and keeps one chanctl handle per radiod
+// (Ctl_mutex). Each control channel's decode thread owns a site: its trunking logic, fed every
+// trunking message and ticked once per block. The decode thread of a voice channel p25d asked for
+// feeds the same logic its link control, encryption sync and data units, and gets back the label
+// that says what to do with each voice unit. The trunking logic reports what happened through
+// trunk_event(), which only copies the event: whoever called into the logic acts on the events
+// (bookkeeping under the site's lock, then log lines and commands to radiod after letting it go),
+// so no lock is held while writing the log or sending, and the site lock is never taken while
+// holding Ctl_mutex.
+
+// Find or create the chanctl handle for the radiod that sent this status, and show it the status.
+// For a control channel, also keep its site's handle and channel format current. Input thread
+static void observe_status(struct session *sp){
+  struct sockaddr_storage const *radio = &sp->frontend.metadata_dest_socket;
+  if(radio->ss_family != AF_INET && radio->ss_family != AF_INET6)
+    return; // radiod's command address isn't known (yet)
+  pthread_mutex_lock(&Ctl_mutex);
+  struct chanctl *ctl = NULL;
+  for(int i=0; i < Nradios; i++){
+    if(address_match(&Radio_addr[i],radio) == 1 && getportnumber(&Radio_addr[i]) == getportnumber(radio)){
+      ctl = Radios[i];
+      break;
+    }
+  }
+  if(ctl == NULL && Nradios < MAX_RADIOS){
+    ctl = chanctl_create(radio,Default_mcast_iface,Ctl_ttl);
+    if(ctl == NULL)
+      fprintf(stderr,"%s: can't open radiod command channel %s: %s\n",App_path,formatsock(radio,false),strerror(errno));
+    else {
+      Radio_addr[Nradios] = *radio;
+      Radios[Nradios++] = ctl;
+      if(Verbose)
+	fprintf(stderr,"%s: radiod commands to %s\n",App_path,formatsock(radio,false));
+    }
+  }
+  if(ctl != NULL){
+    chanctl_observe(ctl,&sp->frontend,&sp->chan);
+    struct site * const site = atomic_load(&sp->site);
+    if(site != NULL){
+      site->ctl = ctl;
+      site->have_format = chanctl_format(&site->format,&sp->frontend,&sp->chan) == 0;
+    }
+  }
+  pthread_mutex_unlock(&Ctl_mutex);
+}
+
+// The trunking logic's handler: it runs inside a p25_trunk_*() call, under the site's lock.
+// Keep the event for site_unlock()
+static void trunk_event(void *arg,struct p25_trunk_event const *event){
+  struct site * const site = arg;
+  if(site->nevents < MAX_EVENTS)
+    site->events[site->nevents++] = *event;
+  else
+    site->lost_events++;
+}
+
+// The site of a control channel, created the first time trunking blocks decode on it, or found
+// again if the channel comes back
+static struct site *get_site(struct session const *sp){
+  pthread_mutex_lock(&Sites_mutex);
+  struct site *site;
+  for(site = Sites; site != NULL; site = site->next)
+    if(site->ssrc == sp->ssrc && address_match(&site->sender,&sp->sender) == 1)
+      break;
+  if(site == NULL && (site = calloc(1,sizeof *site)) != NULL){
+    site->sender = sp->sender;
+    site->ssrc = sp->ssrc;
+    pthread_mutex_init(&site->lock,NULL);
+    site->next = Sites;
+    Sites = site;
+  }
+  pthread_mutex_unlock(&Sites_mutex);
+  return site;
+}
+
+// Make sure the site has trunking logic. Under its lock
+static struct p25_trunk *site_trunk(struct site *site){
+  if(site->trunk == NULL){
+    // Policy as the options set it. The limit on calls followed at once is applied here rather
+    // than in the trunking logic, which would count calls p25d can't receive (Phase 2, refused)
+    struct p25_trunk_config const config = {
+      .follow_encrypted = Follow_encrypted,
+      .allow = Nallow > 0 ? Allow : NULL,
+      .nallow = Nallow,
+      .deny = Ndeny > 0 ? Deny : NULL,
+      .ndeny = Ndeny,
+    };
+    site->trunk = create_p25_trunk(&config,trunk_event,site);
+  }
+  return site->trunk;
+}
+
+// A time for the trunking logic: the sender's time of the sample, never going back (the
+// control and voice threads each run a little behind the stream, by different amounts)
+static int64_t site_time(struct site *site,int64_t when){
+  if(when == 0)
+    when = gps_time_ns();
+  if(when < site->now)
+    when = site->now;
+  site->now = when;
+  return when;
+}
+
+static struct fcall *find_call(struct site *site,uint32_t id){
+  if(id == 0)
+    return NULL;
+  for(int i=0; i < P25_TRUNK_MAX_CALLS; i++)
+    if(site->calls[i].used && site->calls[i].id == id)
+      return &site->calls[i];
+  return NULL;
+}
+// The call on a voice channel's frequency
+static struct fcall *find_call_freq(struct site *site,uint64_t freq_hz){
+  for(int i=0; i < P25_TRUNK_MAX_CALLS; i++)
+    if(site->calls[i].used && site->calls[i].freq_hz == freq_hz && site->calls[i].slot < 0)
+      return &site->calls[i];
+  return NULL;
+}
+static bool was_refused(struct site const *site,uint64_t freq_hz){
+  for(int i=0; i < site->nrefused; i++)
+    if(site->refused[i] == freq_hz)
+      return true;
+  return false;
+}
+static int requested_count(struct site const *site){
+  int n = 0;
+  for(int i=0; i < P25_TRUNK_MAX_CALLS; i++)
+    n += site->calls[i].used && site->calls[i].requested;
+  return n;
+}
+
+static struct work *add_work(struct decoder *dp,int *nwork,enum work_kind kind){
+  if(*nwork >= MAX_WORK)
+    return NULL;
+  struct work * const w = &dp->work[(*nwork)++];
+  memset(w,0,sizeof *w);
+  w->kind = kind;
+  return w;
+}
+static void add_log(struct decoder *dp,int *nwork,int64_t when,char const *fmt,...) __attribute__((format(printf,4,5)));
+static void add_log(struct decoder *dp,int *nwork,int64_t when,char const *fmt,...){
+  struct work * const w = add_work(dp,nwork,WORK_LOG);
+  if(w == NULL)
+    return;
+  w->when = when;
+  va_list ap;
+  va_start(ap,fmt);
+  vsnprintf(w->text,sizeof w->text,fmt,ap);
+  va_end(ap);
+}
+
+// Which receiver a voice channel needs, from the call's flags. The one place to add Phase 2:
+// a TDMA receiver would be chosen here and created by the voice channel's decode thread
+enum receiver { RX_NONE, RX_PHASE1 };
+static enum receiver choose_receiver(uint32_t flags,char const **why){
+  if(flags & P25_TRUNK_F_TDMA){
+    *why = "Phase 2 (TDMA), no receiver for it yet";
+    return RX_NONE;
+  }
+  *why = NULL;
+  return RX_PHASE1;
+}
+
+// The call's identity for a log line: "group tg 2501 src 1118028" and the like
+static int call_text(char *buf,size_t size,struct fcall const *fc){
+  int n;
+  if(fc->type == P25_TRUNK_GROUP || (fc->type == P25_TRUNK_DATA && fc->talkgroup != 0))
+    n = snprintf(buf,size,"%s tg %u src %u",fc->type == P25_TRUNK_DATA ? "data" : "group",fc->talkgroup,fc->source);
+  else
+    n = snprintf(buf,size,"%s tgt %u src %u",fc->type == P25_TRUNK_UNIT ? "unit" : fc->type == P25_TRUNK_TELEPHONE ? "telephone" : "data",
+		 fc->target,fc->source);
+  if(strlen(fc->alias) > 0 && n >= 0 && (size_t)n < size)
+    n += snprintf(buf + n,size - n," alias \"%s\"",fc->alias);
+  if(n >= 0 && (size_t)n < size){
+    if(fc->slot >= 0)
+      n += snprintf(buf + n,size - n," voice %.6lf MHz slot %d",fc->freq_hz * 1e-6,fc->slot);
+    else if(fc->freq_hz != 0)
+      n += snprintf(buf + n,size - n," voice %.6lf MHz",fc->freq_hz * 1e-6);
+    else
+      n += snprintf(buf + n,size - n," voice channel %s","unknown");
+  }
+  return n;
+}
+static char const *flag_text(uint32_t flags,char *buf,size_t size){
+  snprintf(buf,size,"%s%s%s",flags & P25_TRUNK_F_EMERGENCY ? " emergency" : "",
+	   flags & P25_TRUNK_F_ENCRYPTED ? " encrypted" : "",flags & P25_TRUNK_F_PATCHED ? " patched" : "");
+  return buf;
+}
+
+// Ask for a call's channel. Under the site's lock (Ctl_mutex nests inside it)
+static bool want_channel(struct site *site,struct fcall *fc,char const **why){
+  if(fc->freq_hz == 0){
+    *why = "channel not in the band plan";
+    return false;
+  }
+  if(choose_receiver(fc->flags,why) == RX_NONE)
+    return false;
+  if(was_refused(site,fc->freq_hz)){
+    *why = "radiod refused this frequency";
+    fc->refused = true;
+    return false;
+  }
+  if(Max_calls > 0 && requested_count(site) >= Max_calls){
+    *why = "already following the most calls allowed (--max-calls)";
+    return false;
+  }
+  pthread_mutex_lock(&Ctl_mutex);
+  uint32_t ssrc = 0;
+  if(site->ctl != NULL && site->have_format)
+    ssrc = chanctl_ssrc(site->ctl,(double)fc->freq_hz,&site->format);
+  pthread_mutex_unlock(&Ctl_mutex);
+  if(ssrc == 0){
+    *why = "radiod's command address or the control channel's format not known yet";
+    return false;
+  }
+  fc->ssrc = ssrc;
+  fc->requested = true;
+  *why = NULL;
+  return true; // the caller logs the call, then asks (ask_channel())
+}
+
+// Ask radiod for the call's channel (again: chanctl sends only when needed)
+static void ask_channel(struct decoder *dp,int *nwork,struct fcall const *fc){
+  struct work * const w = add_work(dp,nwork,WORK_REQUEST);
+  if(w != NULL){
+    w->ssrc = fc->ssrc;
+    w->freq_hz = fc->freq_hz;
+    w->call_id = fc->id;
+  }
+}
+
+static void let_go(struct decoder *dp,int *nwork,struct fcall *fc){
+  if(!fc->requested)
+    return;
+  fc->requested = false;
+  struct work * const w = add_work(dp,nwork,WORK_RELEASE);
+  if(w != NULL){
+    w->ssrc = fc->ssrc;
+    w->freq_hz = fc->freq_hz;
+    w->call_id = fc->id;
+  }
+}
+
+static void log_end(struct decoder *dp,int *nwork,struct site const *site,struct fcall const *fc,int64_t when,char const *reason){
+  char id[256],flags[64],ssrc[32] = "";
+  call_text(id,sizeof id,fc);
+  if(fc->ssrc != 0 && !fc->refused)
+    snprintf(ssrc,sizeof ssrc," ssrc %u",fc->ssrc);
+  if(fc->ssrc != 0 && fc->units + fc->words_bad > 0)
+    add_log(dp,nwork,when,"NAC %03x call end %s%s%s after %.1f s, %d voice units, %d words bad, %d bits corrected, %s",
+	    site->nac,id,ssrc,flag_text(fc->flags,flags,sizeof flags),(when - fc->start) * 1e-9,
+	    fc->units,fc->words_bad,fc->bits_fixed,reason);
+  else
+    add_log(dp,nwork,when,"NAC %03x call end %s%s%s after %.1f s, %s%s",site->nac,id,ssrc,flag_text(fc->flags,flags,sizeof flags),
+	    (when - fc->start) * 1e-9,fc->refused ? "not followed (radiod refused the channel), " : fc->ssrc != 0 ? "no voice received, " : "",reason);
+}
+
+// Act on the events the trunking logic reported. Under the site's lock
+static int take_events(struct decoder *dp,struct site *site,int nwork){
+  if(site->lost_events > 0){
+    add_log(dp,&nwork,site->now,"NAC %03x %llu trunking events lost",site->nac,(unsigned long long)site->lost_events);
+    site->lost_events = 0;
+  }
+  for(int k=0; k < site->nevents; k++){
+    struct p25_trunk_event const * const e = &site->events[k];
+    struct fcall *fc = NULL;
+    char id[256],flags[64];
+    switch(e->type){
+    case P25_TRUNK_CALL_START:
+      for(int i=0; i < P25_TRUNK_MAX_CALLS && e->call_id != 0; i++){
+	if(!site->calls[i].used){
+	  fc = &site->calls[i];
+	  break;
+	}
+      }
+      if(fc == NULL){
+	add_log(dp,&nwork,e->time,"NAC %03x call not tracked (%s): %s",site->nac,p25_trunk_why_name(e->why_not),e->text);
+	break;
+      }
+      memset(fc,0,sizeof *fc);
+      fc->used = true;
+      fc->id = e->call_id;
+      fc->type = e->call_type;
+      fc->talkgroup = e->talkgroup;
+      fc->source = e->source;
+      fc->target = e->target;
+      fc->freq_hz = e->freq_hz;
+      fc->slot = e->slot;
+      fc->flags = e->flags;
+      fc->start = e->time;
+      fc->seed = (e->flags & P25_TRUNK_F_SEED) != 0;
+      fc->seed_hz = e->seed_offset_hz;
+      {
+	char const *why = p25_trunk_why_name(e->why_not);
+	bool const follow = (e->flags & P25_TRUNK_F_FOLLOW) && want_channel(site,fc,&why);
+	call_text(id,sizeof id,fc);
+	if(follow){
+	  add_log(dp,&nwork,e->time,"NAC %03x call start %s ssrc %u%s",site->nac,id,fc->ssrc,flag_text(fc->flags,flags,sizeof flags));
+	  ask_channel(dp,&nwork,fc);
+	} else
+	  add_log(dp,&nwork,e->time,"NAC %03x call start %s%s, not followed: %s",site->nac,id,flag_text(fc->flags,flags,sizeof flags),why);
+      }
+      break;
+    case P25_TRUNK_CALL_UPDATE:
+      if(Verbose > 1)
+	add_log(dp,&nwork,e->time,"NAC %03x trunk %s",site->nac,e->text);
+      if((fc = find_call(site,e->call_id)) == NULL)
+	break;
+      fc->talkgroup = e->talkgroup;
+      fc->source = e->source;
+      fc->target = e->target;
+      if(e->flags & P25_TRUNK_F_RELEASE){
+	// Held voice units: tell the voice channel's thread. Not clear wins over clear
+	int const r = (e->flags & P25_TRUNK_F_ENCRYPTED) ? 2 : 1;
+	if(r > fc->release)
+	  fc->release = r;
+	break;
+      }
+      fc->flags = e->flags;
+      if(fc->requested && !(e->flags & P25_TRUNK_F_FOLLOW)){
+	let_go(dp,&nwork,fc);
+	call_text(id,sizeof id,fc);
+	add_log(dp,&nwork,e->time,"NAC %03x call %s no longer followed: %s",site->nac,id,p25_trunk_why_name(e->why_not));
+      } else if(fc->requested){
+	// Still on: ask again. chanctl sends only when needed, and this keeps the channel's lifetime fresh
+	ask_channel(dp,&nwork,fc);
+      } else if((e->flags & P25_TRUNK_F_FOLLOW) && !fc->refused && fc->slot < 0){
+	// Now followed (no longer encrypted, or room under --max-calls): it may be heard from here on
+	char const *why = NULL;
+	if(want_channel(site,fc,&why)){
+	  call_text(id,sizeof id,fc);
+	  add_log(dp,&nwork,e->time,"NAC %03x call now followed %s ssrc %u%s",site->nac,id,fc->ssrc,flag_text(fc->flags,flags,sizeof flags));
+	  ask_channel(dp,&nwork,fc);
+	}
+      }
+      break;
+    case P25_TRUNK_CALL_TALKER:
+      if(Verbose > 1)
+	add_log(dp,&nwork,e->time,"NAC %03x trunk %s",site->nac,e->text);
+      if((fc = find_call(site,e->call_id)) != NULL){
+	if(fc->source != e->source)
+	  fc->alias[0] = '\0'; // someone else
+	fc->source = e->source;
+      }
+      break;
+    case P25_TRUNK_CALL_END:
+      if((fc = find_call(site,e->call_id)) == NULL)
+	break;
+      fc->flags = e->flags;
+      if(fc->requested || fc->ssrc != 0 || Verbose)
+	log_end(dp,&nwork,site,fc,e->time,p25_trunk_end_name(e->end_reason));
+      let_go(dp,&nwork,fc);
+      fc->used = false;
+      break;
+    case P25_TRUNK_SITE:
+    case P25_TRUNK_CONTROL:
+    case P25_TRUNK_PATCH:
+    case P25_TRUNK_OTHER:
+      if(Verbose)
+	add_log(dp,&nwork,e->time,"NAC %03x trunk %s",site->nac,e->text);
+      break;
+    }
+  }
+  site->nevents = 0;
+  return nwork;
+}
+
+// Let go of the site's lock, then do what its events (and 'nwork' items already queued) called for
+static void site_unlock(struct site *site,struct decoder *dp,int nwork){
+  nwork = take_events(dp,site,nwork);
+  double const freq = site->freq;
+  uint32_t const ssrc = site->ssrc;
+  uint16_t const nac = site->nac;
+  pthread_mutex_unlock(&site->lock);
+
+  for(int i=0; i < nwork; i++){
+    struct work const * const w = &dp->work[i];
+    switch(w->kind){
+    case WORK_LOG:
+      log_line(ssrc,freq,w->when,"%s",w->text);
+      break;
+    case WORK_REQUEST:
+      {
+	pthread_mutex_lock(&Ctl_mutex);
+	int r = -1;
+	errno = ENOENT;
+	if(site->ctl != NULL && site->have_format){
+	  struct chanctl_format const format = site->format;
+	  r = chanctl_request(site->ctl,w->ssrc,(double)w->freq_hz,&format,Lifetime);
+	}
+	int const err = errno;
+	pthread_mutex_unlock(&Ctl_mutex);
+	if(r >= 0)
+	  break;
+	// Refused: log once per frequency, and stop asking for it
+	pthread_mutex_lock(&site->lock);
+	bool first = false;
+	if((err == ERANGE || err == EEXIST) && !was_refused(site,w->freq_hz)){
+	  first = true;
+	  if(site->nrefused < MAX_REFUSED)
+	    site->refused[site->nrefused++] = w->freq_hz;
+	}
+	struct fcall * const fc = find_call(site,w->call_id);
+	if(fc != NULL && (err == ERANGE || err == EEXIST)){
+	  fc->requested = false;
+	  fc->refused = true;
+	}
+	pthread_mutex_unlock(&site->lock);
+	if(first || (err != ERANGE && err != EEXIST && Verbose))
+	  log_line(ssrc,freq,0,"NAC %03x can't follow calls on %.6lf MHz (ssrc %u): %s%s",nac,w->freq_hz * 1e-6,w->ssrc,
+		   err == ERANGE ? "outside the front end's coverage" : err == EEXIST ? "that SSRC is another channel" : strerror(err),
+		   first ? "; not asking for it again" : "");
+      }
+      break;
+    case WORK_RELEASE:
+      {
+	// Not if the same batch asks for the channel again (the frequency was granted to the next call)
+	bool again = false;
+	for(int j=i+1; j < nwork; j++)
+	  if(dp->work[j].kind == WORK_REQUEST && dp->work[j].ssrc == w->ssrc)
+	    again = true;
+	if(again)
+	  break;
+	pthread_mutex_lock(&Ctl_mutex);
+	if(site->ctl != NULL)
+	  chanctl_release(site->ctl,w->ssrc);
+	pthread_mutex_unlock(&Ctl_mutex);
+      }
+      break;
+    case WORK_REFRESH:
+      pthread_mutex_lock(&Ctl_mutex);
+      if(site->ctl != NULL)
+	chanctl_refresh(site->ctl,w->ssrc);
+      pthread_mutex_unlock(&Ctl_mutex);
+      break;
+    }
+  }
+}
+
+// A trunking message decoded on a channel that is not a voice channel p25d asked for: it is a
+// control channel, of its own site
+static void control_message(struct decoder *dp,uint64_t sample,struct p25_msg const *msg){
+  if(dp->site == NULL){
+    if((dp->site = get_site(dp->sp)) == NULL)
+      return;
+    dp->control = true;
+    atomic_store(&dp->sp->site,dp->site); // the input thread fills in the command handle and format
+  }
+  struct site * const site = dp->site;
+  pthread_mutex_lock(&site->lock);
+  site->freq = dp->frequency;
+  site->nac = dp->site_nac;
+  struct p25_trunk * const t = site_trunk(site);
+  if(t != NULL)
+    p25_trunk_control(t,msg,dp->site_nac,site_time(site,decoder_time(dp,sample)));
+  site_unlock(site,dp,0);
+}
+
+// Once per block of a control channel: calls time out, and the carrier offset for seeding
+static void control_block(struct decoder *dp){
+  struct site * const site = dp->site;
+  pthread_mutex_lock(&site->lock);
+  if(site->trunk != NULL){
+    site->freq = dp->frequency;
+    if(dp->p25 != NULL)
+      p25_trunk_set_control(site->trunk,(uint64_t)llrint(dp->frequency),p25p1_frequency_offset(dp->p25));
+    p25_trunk_tick(site->trunk,site_time(site,decoder_time(dp,dp->block_start)));
+  }
+  site_unlock(site,dp,0);
+}
+
+// The control channel's stream has gone (its session closed): end its calls, let their channels go
+static void control_lost(struct decoder *dp){
+  struct site * const site = dp->site;
+  pthread_mutex_lock(&site->lock);
+  int nwork = take_events(dp,site,0);
+  int64_t const now = site_time(site,0);
+  for(int i=0; i < P25_TRUNK_MAX_CALLS; i++){
+    struct fcall * const fc = &site->calls[i];
+    if(!fc->used)
+      continue;
+    if(fc->requested || fc->ssrc != 0 || Verbose)
+      log_end(dp,&nwork,site,fc,now,Terminate ? "p25d shutting down" : "control channel lost");
+    let_go(dp,&nwork,fc);
+    fc->used = false;
+  }
+  delete_p25_trunk(site->trunk); // a new one if the channel comes back
+  site->trunk = NULL;
+  site_unlock(site,dp,nwork);
+}
+
+// A voice channel p25d asked for? If some site's call has this SSRC, it is that site's
+static void link_voice(struct decoder *dp){
+  struct session const * const sp = dp->sp;
+  pthread_mutex_lock(&Sites_mutex);
+  for(struct site *site = Sites; site != NULL && !dp->voice; site = site->next){
+    if(address_match(&site->sender,&sp->sender) != 1)
+      continue; // another radiod's
+    pthread_mutex_lock(&site->lock);
+    for(int i=0; i < P25_TRUNK_MAX_CALLS; i++){
+      struct fcall const * const fc = &site->calls[i];
+      if(fc->used && fc->requested && fc->ssrc == sp->ssrc){
+	dp->site = site;
+	dp->voice = true;
+	dp->trunk_freq = fc->freq_hz;
+	dp->seed = fc->seed;
+	dp->seed_hz = fc->seed_hz;
+	break;
+      }
+    }
+    pthread_mutex_unlock(&site->lock);
+  }
+  pthread_mutex_unlock(&Sites_mutex);
+  if(dp->voice && Verbose)
+    decoder_event(dp,dp->samples,"voice channel for calls granted on ssrc %u, receiver %s",dp->site->ssrc,
+		  dp->seed ? "seeded with the control channel's carrier offset" : "not seeded");
+  if(dp->voice && dp->seed && Verbose > 1)
+    decoder_event(dp,dp->samples,"seed %.9g Hz",dp->seed_hz); // exactly, for comparing with an offline decode
+}
+
+// What the trunking logic's label says for the voice output. A held unit whose own label says
+// encrypted stays encrypted whatever the release says
+static enum p25_audio_label audio_label(struct p25_trunk_label const *l){
+  switch(l->decision){
+  case P25_TRUNK_VOICE_CLEAR:
+    return l->encrypted ? P25_AUDIO_ENCRYPTED : P25_AUDIO_CLEAR;
+  case P25_TRUNK_VOICE_HOLD:
+    return l->encrypted ? P25_AUDIO_ENCRYPTED : P25_AUDIO_HOLD;
+  case P25_TRUNK_VOICE_ENCRYPTED:
+    return P25_AUDIO_ENCRYPTED;
+  default:
+    return P25_AUDIO_NONE;
+  }
+}
+
+// One data unit on a voice channel p25d asked for: the word it carried, then the unit itself, to
+// the trunking logic (as p25trunk.h asks); then the voice output, under the label it gave
+static void voice_unit(struct decoder *dp,uint64_t sample,struct p25_frame const *frame){
+  struct site * const site = dp->site;
+  pthread_mutex_lock(&site->lock);
+  uint16_t const site_nac = site->nac;
+  pthread_mutex_unlock(&site->lock);
+  if(site_nac != 0 && frame->nac != site_nac)
+    return; // another system's, or a false frame sync: a "header" decoded from noise would end the call
+  int64_t const when = decoder_time(dp,sample);
+  int const duid = frame->duid;
+  bool const ldu = duid == P25_DUID_LDU1 || duid == P25_DUID_LDU2;
+  bool const unit = ldu || duid == P25_DUID_HDU || duid == P25_DUID_TDU || duid == P25_DUID_TDULC || duid == P25_DUID_PDU;
+  struct p25_word const *word = NULL;
+  if(duid == P25_DUID_HDU || duid == P25_DUID_TDULC)
+    word = frame->word;
+  else if(ldu && frame->ldu != NULL)
+    word = &frame->ldu->word;
+
+  struct p25_msg msg;
+  bool have = false;
+  uint8_t octets[15];
+  if(word != NULL && word->ok){
+    switch(duid){
+    case P25_DUID_HDU:
+      p25_pack_bits(octets,word->bits,120);
+      have = p25_decode_hdu(&msg,octets) == 0;
+      break;
+    case P25_DUID_LDU1:
+    case P25_DUID_TDULC:
+      p25_pack_bits(octets,word->bits,72);
+      have = p25_decode_lc(&msg,octets,duid == P25_DUID_TDULC) == 0;
+      break;
+    case P25_DUID_LDU2:
+      p25_pack_bits(octets,word->bits,96);
+      have = p25_decode_es(&msg,octets) == 0;
+      break;
+    }
+  } else if(duid == P25_DUID_TSDU && frame->crc >= 0){
+    p25_pack_bits(octets,frame->bits,96); // a trunking block on a voice channel: the logic takes it too
+    have = p25_decode_tsbk(&msg,octets) == 0;
+  }
+  struct p25_alias_result alias;
+  bool const new_alias = have && (duid == P25_DUID_LDU1 || duid == P25_DUID_TDULC) && p25_alias_lc(&dp->alias,&msg,&alias)
+    && alias.len > 0;
+
+  struct p25_trunk_label label;
+  memset(&label,0,sizeof label);
+  int release = 0;
+  char call_alias[P25_ALIAS_MAX] = "";
+  int nwork = 0;
+  pthread_mutex_lock(&site->lock);
+  struct p25_trunk * const t = site->trunk;
+  uint16_t const nac = site->nac;
+  if(t != NULL){
+    int64_t const now = site_time(site,when);
+    if(duid == P25_DUID_TSDU){
+      if(have)
+	p25_trunk_voice_word(t,dp->trunk_freq,-1,&msg,0,now);
+    } else if(unit){
+      if(have)
+	p25_trunk_voice_word(t,dp->trunk_freq,-1,&msg,word != NULL ? word->erasures : 0,now);
+      p25_trunk_voice_unit(t,dp->trunk_freq,-1,duid,now);
+      label = *p25_trunk_label(t);
+    }
+  }
+  nwork = take_events(dp,site,nwork); // a call this unit started is in the table now
+  if(unit){
+    struct fcall * const fc = label.call_id != 0 ? find_call(site,label.call_id) : find_call_freq(site,dp->trunk_freq);
+    if(fc != NULL){
+      // Held units released since the last unit, by this thread's call into the logic just now or
+      // another thread's: they are all units this thread has already handed to the voice output
+      release = fc->release;
+      fc->release = 0;
+      if(new_alias)
+	strlcpy(fc->alias,alias.text,sizeof fc->alias);
+      strlcpy(call_alias,fc->alias,sizeof call_alias);
+      if(ldu){
+	fc->units++;
+	if(word == NULL || !word->ok)
+	  fc->words_bad++;
+	for(int i=0; i < P25_IMBE_FRAMES; i++)
+	  fc->bits_fixed += frame->ldu->voice[i].total;
+	if(fc->requested){
+	  struct work * const w = add_work(dp,&nwork,WORK_REFRESH); // voice is arriving: keep the channel
+	  if(w != NULL)
+	    w->ssrc = fc->ssrc;
+	}
+      }
+    }
+  }
+  site_unlock(site,dp,nwork);
+
+  if(new_alias)
+    decoder_event(dp,sample,"NAC %03x talker alias src %u \"%s\"",frame->nac,label.source,alias.text);
+  if(ldu && label.call_id != dp->call_id){
+    // Another call (or none) on this channel: what was held for the last one is never decoded
+    p25_audio_call_end(dp->audio);
+    dp->call_id = label.call_id;
+  }
+  if(release != 0)
+    p25_audio_release(dp->audio,release == 1);
+  if(ldu && label.call_id != 0){
+    // Stream identity. A group call's stream has the talkgroup as its SSRC, so a listener sees one
+    // stream per talkgroup whichever voice channel carries it; other calls keep the channel's SSRC.
+    // Talkgroup numbers are unique only within one system: two systems with the same talkgroup
+    // number, monitored by one p25d (or several sharing an output group), would share an SSRC.
+    // For now run one p25d with its own output group per system; a per-system SSRC base or a
+    // talkgroup map may come later
+    char desc[256];
+    uint32_t ssrc = 0;
+    int n;
+    if(label.call_type == P25_TRUNK_GROUP && label.destination != 0){
+      ssrc = label.destination;
+      n = snprintf(desc,sizeof desc,"P25 TG %u",label.destination);
+    } else
+      n = snprintf(desc,sizeof desc,"P25 %s %u",label.call_type == P25_TRUNK_TELEPHONE ? "telephone" : "unit",label.destination);
+    if(n > 0 && (size_t)n < sizeof desc && label.source != 0)
+      n += snprintf(desc + n,sizeof desc - n," src %u",label.source);
+    if(n > 0 && (size_t)n < sizeof desc && strlen(call_alias) > 0)
+      n += snprintf(desc + n,sizeof desc - n," \"%s\"",call_alias);
+    if(n > 0 && (size_t)n < sizeof desc)
+      snprintf(desc + n,sizeof desc - n," NAC %03x",nac);
+    p25_audio_set_stream(dp->audio,ssrc,desc);
+  }
+  p25_audio_unit(dp->audio,frame,when,ldu ? audio_label(&label) : P25_AUDIO_UNLABELLED);
+}
+
+// Talkgroup list: numbers and ranges, comma separated ("100,200-299"), added to list[n]
+static int parse_talkgroups(uint16_t *list,int n,char const *arg){
+  char const *cp = arg;
+  while(*cp != '\0'){
+    char *end = NULL;
+    long const a = strtol(cp,&end,0);
+    long b = a;
+    if(end == cp || a < 1 || a > 65535)
+      goto bad;
+    cp = end;
+    if(*cp == '-'){
+      b = strtol(cp + 1,&end,0);
+      if(end == cp + 1 || b < a || b > 65535)
+	goto bad;
+      cp = end;
+    }
+    for(long g = a; g <= b; g++){
+      if(n == MAX_TALKGROUPS){
+	fprintf(stderr,"Too many talkgroups; max %d\n",MAX_TALKGROUPS);
+	exit(EX_USAGE);
+      }
+      list[n++] = (uint16_t)g;
+    }
+    if(*cp == ',')
+      cp++;
+    else if(*cp != '\0')
+      goto bad;
+  }
+  return n;
+ bad:
+  fprintf(stderr,"Bad talkgroup list \"%s\": numbers 1-65535 or ranges, comma separated\n",arg);
+  exit(EX_USAGE);
 }
 
 // Bytes per sample (one of I or Q) for the encodings we can decode, 0 for the rest
@@ -991,6 +1923,14 @@ static void log_event(uint32_t ssrc,double frequency,int64_t when,char const *fm
   vfprintf(stdout,fmt,ap);
   fputc('\n',stdout);
   pthread_mutex_unlock(&Output_mutex);
+}
+
+// A line for a site, from wherever it is acted on
+static void log_line(uint32_t ssrc,double frequency,int64_t when,char const *fmt,...){
+  va_list ap;
+  va_start(ap,fmt);
+  log_event(ssrc,frequency,when,fmt,ap);
+  va_end(ap);
 }
 
 // Event for a channel, from the input thread
