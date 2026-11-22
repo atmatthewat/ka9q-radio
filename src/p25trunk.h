@@ -85,9 +85,12 @@ enum p25_trunk_why {         // why a call is not followed
 // Event flags
 #define P25_TRUNK_F_FOLLOW      0x0001  // the caller should receive this call
 #define P25_TRUNK_F_EMERGENCY   0x0002
-#define P25_TRUNK_F_ENCRYPTED   0x0004  // treated as encrypted (service options or encryption sync)
+#define P25_TRUNK_F_ENCRYPTED   0x0004  // treated as encrypted (service options or encryption sync;
+                                        // RELEASE: also a header or sync confirmed it and none
+                                        // has said clear since, whatever the service options say)
 #define P25_TRUNK_F_ENC_KNOWN   0x0008  // encryption confirmed by a header or encryption sync
-#define P25_TRUNK_F_UNCONFIRMED 0x0010  // encrypted on the service options alone (held units)
+#define P25_TRUNK_F_UNCONFIRMED 0x0010  // encrypted, not confirmed (held units): on the service
+                                        // options alone, or on a header or sync they contradicted
 #define P25_TRUNK_F_SVC_KNOWN   0x0020  // service options came from a message that carries them
 #define P25_TRUNK_F_TDMA        0x0040  // a Phase 2 slot (slot >= 0)
 #define P25_TRUNK_F_PATCHED     0x0080  // on a supergroup: members[] are the talkgroups it carries
@@ -144,9 +147,12 @@ enum p25_trunk_voice {
   P25_TRUNK_VOICE_ENCRYPTED, // encrypted: do not decode
   P25_TRUNK_VOICE_HOLD,      // encryption not known yet: keep them until a RELEASE for the call.
                              // A released unit is encrypted if its own label said so or the
-                             // release has P25_TRUNK_F_ENCRYPTED; unconfirmed unless F_ENC_KNOWN
+                             // release has P25_TRUNK_F_ENCRYPTED; unconfirmed unless F_ENC_KNOWN.
+                             // A call a header or encryption sync confirmed encrypted is not
+                             // labelled CLEAR, nor its units released clear, on the service
+                             // options alone: only once a header or sync says clear
 };
-// How the reference labels a voice unit's frames: identity, and encryption as decided
+// How a voice unit's frames are labelled: identity, and encryption as decided
 struct p25_trunk_label {
   enum p25_trunk_voice decision;
   uint32_t call_id;
@@ -156,7 +162,8 @@ struct p25_trunk_label {
   uint8_t svc;
   bool emergency;
   bool encrypted;
-  bool unconfirmed;          // encrypted on the service options alone
+  bool unconfirmed;          // encrypted, not confirmed: on the service options alone, or on a
+                             // header or sync they contradicted
   bool carried;              // the link control did not decode: identity carried over
   uint8_t algid;
   uint16_t keyid;
@@ -181,7 +188,8 @@ struct p25_trunk_call {
   bool enc_confirmed;
   uint8_t algid;
   uint16_t keyid;
-  bool pending_ess;          // an encryption sync contradicting the call waits for a repeat
+  bool pending_ess;          // an encryption sync contradicting the call waits for a repeat (or
+                             // a confirmed encryption the service options contradicted)
   bool had_voice;
   int held_units;
   bool followed;

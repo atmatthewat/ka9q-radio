@@ -49,6 +49,7 @@ struct call {
   bool pending_ess;
   uint8_t pend_alg;
   uint16_t pend_kid;
+  bool contradicted;         // confirmed encrypted, then service options said clear: not known clear
   bool protected_seen;       // a protected link control came before the encryption was confirmed
   bool carried;              // the last LDU1's link control did not decode (or was protected)
   int held;                  // voice units held while the encryption is not known
@@ -713,9 +714,10 @@ static void set_source(struct p25_trunk *t, struct call *c, uint32_t src, bool n
 }
 
 // Voice units held while the encryption was not known: tell the caller what they were. Each is
-// encrypted if its own label said so or the release does (F_ENCRYPTED), and then unconfirmed
-// unless F_ENC_KNOWN. With keep, the last held unit is the one being passed now and is described
-// by its label instead.
+// encrypted if its own label said so or the release does (F_ENCRYPTED: the service options say
+// encrypted, or a header or sync confirmed it and none has said clear since), and then
+// unconfirmed unless F_ENC_KNOWN. With keep, the last held unit is the one being passed now and
+// is described by its label instead.
 static void release(struct p25_trunk *t, struct call *c, bool keep){
   if(c->held == 0)
     return;
@@ -723,7 +725,7 @@ static void release(struct p25_trunk *t, struct call *c, bool keep){
   c->held = 0;
   if(c->type == P25_TRUNK_GROUP)
     patch_files(t, c);
-  bool const enc = c->encrypted || confirmed_encrypted(c);
+  bool const enc = c->encrypted || confirmed_encrypted(c) || c->contradicted;
   if(n > 0){
     struct p25_trunk_event e;
     call_event(t, c, &e, P25_TRUNK_CALL_UPDATE);
@@ -807,17 +809,27 @@ static enum origin origin_of(enum grant_kind kind){
 // Service options from a grant or a channel user link control. Their encryption bit is the
 // call's first word on encryption: if it contradicts what a header or encryption sync confirmed
 // (a talker keying up encrypted in a clear call, or the reverse), the encryption is unconfirmed
-// again until the next one. Units held for a call now known clear are released.
+// again until the next one. One bit cannot undo what a header or sync said, though: a call
+// confirmed encrypted is not known clear until a header or sync says so. Its units are held
+// meanwhile, the confirmed ALGID and key wait as the pending sync (so the next sync repeating
+// them confirms the encryption again), and units still held when the hold limit runs out or the
+// call ends are encrypted. Units held for a call now known clear are released.
 static void note_svc(struct p25_trunk *t, struct call *c, uint8_t svc){
   c->svc = svc;
   c->svc_known = true;
   bool const enc = (svc & P25_SVC_ENCRYPTED) != 0;
   c->encrypted = enc;
   if(c->confirmed && enc != confirmed_encrypted(c)){
+    if(confirmed_encrypted(c)){
+      c->contradicted = true;
+      c->pending_ess = true;
+      c->pend_alg = c->alg;
+      c->pend_kid = c->kid;
+    } else
+      c->pending_ess = false;
     c->confirmed = false;
-    c->pending_ess = false;
   }
-  if(!enc && c->held > 0 && !c->confirmed){
+  if(!enc && c->held > 0 && !c->confirmed && !c->contradicted){
     c->alg = ALG_CLEAR;
     release(t, c, false);
   }
@@ -1398,7 +1410,8 @@ static struct lcd lcd_from_call(struct call const *c){
 }
 
 // CONTINUE: one voice unit for the call. Labels its frames as the call stands and decides
-// whether they wait for the encryption to be known (at most P25_TRUNK_HOLD_UNITS units)
+// whether they wait for the encryption to be known (at most P25_TRUNK_HOLD_UNITS units, then
+// encrypted if the service options say so or a header or sync said so and nothing since said clear)
 static int voice_frames(struct p25_trunk *t, struct call *c, struct lcd const *l, bool carried){
   struct p25_trunk_label *lb = &t->label;
   memset(lb, 0, sizeof *lb);
@@ -1422,7 +1435,8 @@ static int voice_frames(struct p25_trunk *t, struct call *c, struct lcd const *l
       memcpy(lb->members, c->files, sizeof c->files);
     }
   }
-  bool const hold = !c->confirmed && (l->enc || c->encrypted || !c->svc_known || c->protected_seen);
+  bool const hold = !c->confirmed && (l->enc || c->encrypted || !c->svc_known || c->protected_seen
+                                      || c->contradicted);
   if(l->src)
     set_source(t, c, l->src, false);
   c->encrypted = l->enc;
@@ -1521,7 +1535,10 @@ static int voice_ldu1(struct p25_trunk *t, struct key const *k, struct p25_msg c
 // Encryption sync from an LDU2 that decoded. It confirms the call's encryption when it agrees
 // with the service options (a clear ALGID and no encryption bit, or the reverse) or repeats the
 // previous one; one that contradicts them waits as pending, so a single miscorrected sync cannot
-// mark a clear call encrypted. True if it confirmed (or reconfirmed) the encryption.
+// mark a clear call encrypted. A confirmation the service options contradicted waits as pending
+// too (note_svc), so the next sync names the encryption: the same ALGID and key confirm it again,
+// a clear one that agrees with the service options makes the call clear. True if it confirmed
+// (or reconfirmed) the encryption.
 static bool accept_sync(struct call *c, uint8_t alg, uint16_t kid){
   if(c->confirmed && alg == c->alg && kid == c->kid){
     c->pending_ess = false;
@@ -1535,6 +1552,7 @@ static bool accept_sync(struct call *c, uint8_t alg, uint16_t kid){
     c->kid = kid;
     c->confirmed = true;
     c->pending_ess = false;
+    c->contradicted = false;
     return true;
   }
   c->pending_ess = true;
@@ -1568,6 +1586,7 @@ static void voice_hdu(struct p25_trunk *t, struct key const *k, struct p25_msg c
   c->kid = m->kid;
   c->confirmed = true;
   c->pending_ess = false;
+  c->contradicted = false;
   release(t, c, false);
 }
 
