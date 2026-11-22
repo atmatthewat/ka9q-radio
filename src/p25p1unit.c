@@ -177,26 +177,6 @@ bool p25_ldu_decode(struct p25_ldu *ldu,int duid,uint8_t bits[P25_LDU_BITS],floa
 // ---------------------------------------------------------------------------
 // IMBE voice frames (TIA-102.BABA). New: beyond extracting the 144 bits of each frame
 
-// Golay(23,12): bits 0-11 data, 12-22 parity; the Golay(24,12,8) code less its overall parity
-// bit. A 23-bit word within three errors of a codeword is within three of the 24-bit
-// codeword for one of the two values of the missing bit, so try both. Returns bits changed
-static int golay23_decode(uint8_t bits[23]){
-  uint8_t w[24];
-  memcpy(w,bits,23);
-  for(int p = 0; p < 2; p++){
-    w[23] = (uint8_t)p;
-    if(golay24_decode(w) < 0)
-      continue;
-    int n = 0;
-    for(int i = 0; i < 23; i++){
-      n += w[i] != bits[i];
-      bits[i] = w[i];
-    }
-    return n;
-  }
-  return -1; // not reached: the code is perfect
-}
-
 // Hamming(15,11,3): bits 0-10 data, 11-14 parity (8s bit first). The parity checks of data
 // bit i are the bits of the i-th of the 4-bit values of weight two or more, largest first
 static uint8_t const Hamming15_checksums[11] = {0xf, 0xe, 0xd, 0xc, 0xb, 0xa, 0x9, 0x7, 0x6, 0x5, 0x3};
@@ -245,7 +225,7 @@ void p25_imbe_decode(struct p25_imbe *f,uint8_t const raw[P25_IMBE_BITS]){
     int const row = (j % 6) ^ (col & 1);
     v[24 * row + col] = raw[j] & 1;
   }
-  f->errors[0] = golay23_decode(v);
+  f->errors[0] = golay23_decode(v,NULL);
   // c1-c6 (vector bits 23-136) are masked by the msb of p(n) = 173 p(n-1) + 13849 mod 65536,
   // n = 1 .. 114, p(0) = 16 u0
   uint32_t const u0 = (uint32_t)(get_hex(v) << 6 | get_hex(v + 6));
@@ -255,7 +235,7 @@ void p25_imbe_decode(struct p25_imbe *f,uint8_t const raw[P25_IMBE_BITS]){
     v[23 + n] ^= (uint8_t)(pr >> 15);
   }
   for(int c = 1; c < 4; c++)
-    f->errors[c] = golay23_decode(v + Imbe_cw_start[c]);
+    f->errors[c] = golay23_decode(v + Imbe_cw_start[c],NULL);
   for(int c = 4; c < 7; c++)
     f->errors[c] = hamming15_decode(v + Imbe_cw_start[c]);
   int k = 0;
