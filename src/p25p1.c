@@ -29,10 +29,32 @@ static int const Interp_phases = 32;
 // Frequency tracking corners
 static double const Afc_acquire_corner = 10.0; // Hz
 static double const Afc_track_corner = 1.0;
-// Receive lowpass between the frequency correction and the timing loop
+// Receive lowpass between the frequency correction and the timing loop, in two responses, both
+// -6 dB at 3300 Hz. True C4FM decodes better through a sharp one (symbol errors at 10 dB SNR in
+// 19.2 kHz: 0.07% against 0.25%); linear simulcast (CQPSK/LSM) decodes better through a gentle,
+// short one (fewer symbol errors at every SNR, and 5 to 12% more trunking blocks at 0 dB). The
+// gentle one is centred on the sharp one's delay line, so both have the same delay and the
+// choice can change between any two samples without disturbing the timing
 static double const Rx_cutoff = 3300.0; // Hz
-static double const Rx_rolloff = 0.7;
-static double const Rx_span = 31.0 / 19200.0; // filter length, seconds
+static double const Sharp_rolloff = 0.35;
+static double const Sharp_span = 63.0 / 19200.0; // filter length, seconds
+static double const Gentle_rolloff = 0.7;
+static double const Gentle_span = 31.0 / 19200.0;
+// The choice, made from the envelope's ripple at the symbol rate before the filter (see
+// digital.h). Measured with 0.2 s averaging: C4FM, and noise alone, never above 0.04 at any SNR,
+// even through a channel filter as narrow as +/-3.5 kHz; simulcast 0.09 or more down to -2 dB
+// SNR, where hardly anything decodes. Gentle above the upper threshold, sharp below the lower
+static float const Ripple_gentle = 0.06f;
+static float const Ripple_sharp = 0.04f;
+// Averaging time: the noise floor is about 1/sqrt(samples averaged); 0.2 s keeps it near 0.01.
+// After a constant-envelope signal or noise, simulcast passes Ripple_gentle in 20 to 160 ms
+static double const Envelope_time = 0.2; // seconds
+// Until the average has seen a few thousand samples its floor is higher than Ripple_gentle, so
+// gentle then also needs Ripple_start / sqrt(samples seen): three times the floor, which noise
+// alone exceeds about once in 10,000 looks. A stream faster than 19,200 Hz is counted at 19,200:
+// radiod's channel filter leaves no more independent noise samples than that
+static double const Ripple_start = 3.0;
+static double const Floor_rate = 19200.0; // Hz
 static double const Level_time = 1.0 / 9.6;   // seconds
 
 // Framing
@@ -84,6 +106,10 @@ struct p25p1 {
   struct level level;
   struct freqtrack afc;
   struct rxfilter rxf;
+  struct envelope envelope;
+  enum p25_rxfilter filter_mode; // automatic or forced
+  int sharp,gentle;          // their response numbers in rxf
+  uint64_t last_sync_dibit;  // dibit clock at the last frame sync accepted
   struct symsync sync;
   bool primed;
   float complex prev_symbol; // differential detector memory
@@ -329,6 +355,7 @@ static bool evaluate_window(struct p25p1 *p,bool is_searching){
   } else
     return false;
   observe_nac(p,(uint16_t)nac);
+  p->last_sync_dibit = p->dibit_clock;
   if(recovered)
     p->stats.recovered_nids++;
   if(!is_searching){
@@ -784,11 +811,16 @@ struct p25p1 *create_p25p1(double samprate){
   // behave like hard decisions
   for(int i=0; i < 2 * WINDOW; i++)
     p->ring[i].confidence = 1;
-  int ntaps = (int)lrint(Rx_span * samprate);
-  ntaps |= 1; // odd, so the filter has a centre tap
+  // Both odd, so each has a centre tap and the shorter one centres on the longer one's delay line
+  int const sharp_taps = (int)lrint(Sharp_span * samprate) | 1;
+  int const gentle_taps = (int)lrint(Gentle_span * samprate) | 1;
   init_level(&p->level,samprate,Level_time);
   init_freqtrack(&p->afc,samprate,Afc_acquire_corner);
-  if(init_rxfilter(&p->rxf,samprate,Rx_cutoff,ntaps,Rx_rolloff) != 0
+  init_envelope(&p->envelope,samprate,P25_SYMRATE,Envelope_time);
+  p->filter_mode = P25_FILTER_AUTO;
+  p->sharp = 0;
+  if(init_rxfilter(&p->rxf,samprate,Rx_cutoff,sharp_taps,Sharp_rolloff) != 0
+     || (p->gentle = add_rxfilter_response(&p->rxf,samprate,Rx_cutoff,gentle_taps,Gentle_rolloff)) < 0
      || init_symsync(&p->sync,samprate,P25_SYMRATE,Interp_phases,Acquire_bw,Track_bw,Loop_damping,Error_gain,Rate_limit) != 0){
     delete_p25p1(p);
     return NULL;
@@ -829,6 +861,13 @@ void p25p1_set_track_bandwidth(struct p25p1 *p,float track,float settled,float s
   if(settle_time >= 0)
     p->settle_dibits = (uint64_t)(settle_time * P25_SYMRATE);
 }
+void p25p1_set_rxfilter(struct p25p1 *p,enum p25_rxfilter mode){
+  p->filter_mode = mode;
+  if(mode == P25_FILTER_SHARP)
+    select_rxfilter(&p->rxf,p->sharp);
+  else if(mode == P25_FILTER_GENTLE)
+    select_rxfilter(&p->rxf,p->gentle);
+}
 void p25p1_seed_frequency(struct p25p1 *p,float offset){
   seed_freqtrack(&p->afc,offset);
 }
@@ -840,6 +879,8 @@ void p25p1_get_stats(struct p25p1 const *p,struct p25p1_stats *stats){
   stats->locked = sync_locked(p);
   stats->frequency_offset = p->afc.estimate;
   stats->timing_error = p->sync.error_ema;
+  stats->rxfilter = p->rxf.response == p->gentle ? P25_FILTER_GENTLE : P25_FILTER_SHARP;
+  stats->envelope_ripple = envelope_ripple(&p->envelope);
 }
 void p25p1_dibit(struct p25p1 *p,struct softdibit const *sd){
   frame_dibit(p,sd);
@@ -863,6 +904,29 @@ void p25p1_samples(struct p25p1 *p,float complex const *iq,int count){
     p->primed = true;
   }
   run_level(&p->level,buf,count);
+  // The envelope before the receive filter, which would add ripple of its own to a constant
+  // envelope; and before the frequency correction, which does not change it
+  run_envelope(&p->envelope,buf,count);
+  if(p->filter_mode == P25_FILTER_AUTO){
+    float const ripple = envelope_ripple(&p->envelope);
+    double const seen = (double)p->envelope.samples * fmin(1.0,Floor_rate / p->samprate);
+    float const gentle_above = fmaxf(Ripple_gentle,(float)(Ripple_start / sqrt(seen > 1 ? seen : 1)));
+    int r = p->rxf.response;
+    // Noise alone has no ripple either, so sharp only while the signal is known to be there:
+    // frame sync held for two averaging times and a frame sync within the last one. In a gap
+    // the choice stands, and the next transmission starts with the filter the last one used
+    uint64_t const average_dibits = (uint64_t)(Envelope_time * P25_SYMRATE);
+    bool const heard = p->tracking && p->dibit_clock - p->tracking_since >= 2 * average_dibits
+      && p->dibit_clock - p->last_sync_dibit < average_dibits;
+    if(ripple > gentle_above)
+      r = p->gentle;
+    else if(ripple < Ripple_sharp && heard)
+      r = p->sharp;
+    if(r != p->rxf.response){
+      select_rxfilter(&p->rxf,r);
+      p->stats.filter_changes++;
+    }
+  }
   // Frequency: correct with the estimate from the previous block, then estimate the residual.
   // Acquiring: from the lag-one products of the receive-filtered block. Unfiltered, noise away
   // from the signal pulls the estimate toward the centre of the stream; the unfiltered block still

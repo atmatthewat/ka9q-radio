@@ -11,18 +11,8 @@
 
 // ---------------- receive filter ----------------
 
-int init_rxfilter(struct rxfilter *f,double samprate,double cutoff,int ntaps,double rolloff){
-  assert(f != NULL);
-  if(f == NULL || ntaps < 1 || cutoff <= 0 || cutoff >= samprate / 2)
-    return -1;
-  memset(f,0,sizeof *f);
-  f->taps = calloc((size_t)ntaps,sizeof *f->taps);
-  f->history = calloc(2 * (size_t)ntaps,sizeof *f->history);
-  if(f->taps == NULL || f->history == NULL){
-    free_rxfilter(f);
-    return -1;
-  }
-  f->ntaps = ntaps;
+// 'ntaps' taps of the response into taps[0..ntaps-1]
+static void design_rxfilter(float *taps,double samprate,double cutoff,int ntaps,double rolloff){
   double const fc = cutoff / samprate; // cycles/sample
   double const mid = (ntaps - 1) / 2.0;
   double sum = 0;
@@ -36,35 +26,116 @@ int init_rxfilter(struct rxfilter *f,double samprate,double cutoff,int ntaps,dou
       rc = fabs(d) < 1e-9 ? M_PI / 4 : cos(M_PI * rolloff * x) / d;
     }
     double const window = ntaps > 1 ? 0.54 - 0.46 * cos(2 * M_PI * i / (ntaps - 1)) : 1.0;
-    f->taps[i] = (float)(sinc * rc * window);
-    sum += f->taps[i];
+    taps[i] = (float)(sinc * rc * window);
+    sum += taps[i];
   }
   for(int i=0; i < ntaps; i++)
-    f->taps[i] = (float)(f->taps[i] / sum);
+    taps[i] = (float)(taps[i] / sum);
+}
+int init_rxfilter(struct rxfilter *f,double samprate,double cutoff,int ntaps,double rolloff){
+  assert(f != NULL);
+  if(f == NULL || ntaps < 1 || cutoff <= 0 || cutoff >= samprate / 2)
+    return -1;
+  memset(f,0,sizeof *f);
+  f->responses[0] = calloc((size_t)ntaps,sizeof *f->taps);
+  f->history = calloc(2 * (size_t)ntaps,sizeof *f->history);
+  if(f->responses[0] == NULL || f->history == NULL){
+    free_rxfilter(f);
+    return -1;
+  }
+  f->ntaps = ntaps;
+  design_rxfilter(f->responses[0],samprate,cutoff,ntaps,rolloff);
+  f->counts[0] = ntaps;
+  f->nresponses = 1;
+  select_rxfilter(f,0);
   return 0;
+}
+int add_rxfilter_response(struct rxfilter *f,double samprate,double cutoff,int ntaps,double rolloff){
+  assert(f != NULL && f->history != NULL);
+  // Centred on the delay line only if the two lengths differ by an even number
+  if(f->nresponses >= RXFILTER_RESPONSES || ntaps < 1 || ntaps > f->ntaps || (f->ntaps - ntaps) % 2 != 0
+     || cutoff <= 0 || cutoff >= samprate / 2)
+    return -1;
+  int const r = f->nresponses;
+  f->responses[r] = calloc((size_t)f->ntaps,sizeof *f->taps);
+  if(f->responses[r] == NULL)
+    return -1;
+  f->firsts[r] = (f->ntaps - ntaps) / 2;
+  f->counts[r] = ntaps;
+  design_rxfilter(f->responses[r] + f->firsts[r],samprate,cutoff,ntaps,rolloff);
+  f->nresponses++;
+  return r;
+}
+void select_rxfilter(struct rxfilter *f,int response){
+  assert(f != NULL);
+  if(response < 0 || response >= f->nresponses)
+    return;
+  f->response = response;
+  f->taps = f->responses[response];
+  f->first = f->firsts[response];
+  f->count = f->counts[response];
 }
 void free_rxfilter(struct rxfilter *f){
   if(f == NULL)
     return;
-  free(f->taps);
+  for(int r=0; r < RXFILTER_RESPONSES; r++)
+    free(f->responses[r]);
   free(f->history);
   memset(f,0,sizeof *f);
 }
 void run_rxfilter(struct rxfilter *f,float complex *buffer,int count){
   assert(f != NULL && f->taps != NULL);
   int const n = f->ntaps;
-  float const * restrict const taps = f->taps;
+  int const m = f->count;
+  // Only the nonzero taps: a shorter response costs no more than it would on its own line
+  float const * restrict const taps = f->taps + f->first;
   for(int k=0; k < count; k++){
     f->history[f->pos] = f->history[f->pos + n] = buffer[k];
     if(++f->pos == n)
       f->pos = 0;
     // Oldest first from history[pos]; the taps are symmetric so the order is moot
-    float complex const * restrict const w = f->history + f->pos;
+    float complex const * restrict const w = f->history + f->pos + f->first;
     float complex acc = 0;
-    for(int i=0; i < n; i++)
+    for(int i=0; i < m; i++)
       acc += taps[i] * w[i];
     buffer[k] = acc;
   }
+}
+
+// ---------------- envelope ripple ----------------
+
+void init_envelope(struct envelope *e,double samprate,double symrate,double time_constant){
+  assert(e != NULL);
+  memset(e,0,sizeof *e);
+  double a = 1.0 / (time_constant * samprate);
+  if(a > 1)
+    a = 1;
+  e->alpha = (float)a;
+  e->rotor = 1;
+  double const w = -2 * M_PI * symrate / samprate;
+  e->step = (float)cos(w) + I * (float)sin(w);
+}
+void run_envelope(struct envelope *e,float complex const *buffer,int count){
+  float const alpha = e->alpha;
+  float complex rotor = e->rotor;
+  float complex ripple = e->ripple;
+  float power = e->power;
+  for(int i=0; i < count; i++){
+    float const p = cnrmf(buffer[i]);
+    power += alpha * (p - power);
+    ripple += alpha * (p * rotor - ripple);
+    rotor *= e->step;
+    // Its magnitude drifts by a rounding error per sample: put it back on the unit circle now and then
+    if((i & 1023) == 1023)
+      rotor /= cabsf(rotor);
+  }
+  e->rotor = rotor / cabsf(rotor);
+  e->ripple = ripple;
+  e->power = power;
+  e->samples += (uint64_t)count;
+}
+float envelope_ripple(struct envelope const *e){
+  return e->power > 1e-20f ? cabsf(e->ripple) / e->power : 0;
 }
 
 // ---------------- level control ----------------

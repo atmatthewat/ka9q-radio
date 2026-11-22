@@ -12,15 +12,43 @@
 // Lowpass FIR with real taps for complex baseband
 // Raised-cosine shaped response: flat to cutoff * (1 - rolloff), -6 dB at the cutoff,
 // zero beyond cutoff * (1 + rolloff); rolloff 0 is a plain windowed sinc. Hamming window, unity DC gain
+// A second response may share the delay line, centred on it, so both have the same delay and
+// either may be selected between any two samples without a step in timing or phase
+enum { RXFILTER_RESPONSES = 2 };
 struct rxfilter {
-  int ntaps;
+  int ntaps;              // delay line length, that of the first response
   int pos;
-  float *taps;
+  float *taps;            // the response in use, ntaps long
+  int first,count;        // its nonzero taps
+  int response;           // which one is in use
+  int nresponses;
+  float *responses[RXFILTER_RESPONSES];
+  int firsts[RXFILTER_RESPONSES],counts[RXFILTER_RESPONSES];
   float complex *history; // Stored twice so each output is one contiguous dot product
 };
 int init_rxfilter(struct rxfilter *f,double samprate,double cutoff,int ntaps,double rolloff);
+// Another response, centred on the first one's delay line: no more taps, and odd if it is odd (even if
+// even). Returns its number, or -1
+int add_rxfilter_response(struct rxfilter *f,double samprate,double cutoff,int ntaps,double rolloff);
+void select_rxfilter(struct rxfilter *f,int response); // from the next sample
 void free_rxfilter(struct rxfilter *f);
 void run_rxfilter(struct rxfilter *f,float complex *buffer,int count); // in place
+
+// Envelope ripple at the symbol rate: |mean of |x|^2 e^(-j 2 pi symrate t)| / mean of |x|^2
+// A linear modulation (pi/4 DQPSK, QPSK) dips between symbols and so has a strong component at
+// the symbol rate; a constant-envelope one (C4FM, 4FSK) has none, and neither has white noise.
+// So unlike the spread of |x| this does not rise as the signal weakens: noise only adds a floor
+// of about the spread of |x|^2 over the square root of the samples averaged
+struct envelope {
+  float alpha;            // per-sample smoothing factor
+  float complex rotor,step; // e^(-j 2 pi symrate t)
+  float complex ripple;   // smoothed |x|^2 e^(-j 2 pi symrate t)
+  float power;            // smoothed |x|^2
+  uint64_t samples;       // seen since init
+};
+void init_envelope(struct envelope *e,double samprate,double symrate,double time_constant);
+void run_envelope(struct envelope *e,float complex const *buffer,int count);
+float envelope_ripple(struct envelope const *e); // 0 = constant envelope
 
 // Level control: scale to unity RMS with a slow power estimate
 // The timing loop's gain depends on amplitude, so this is needed whatever radiod's own AGC is doing

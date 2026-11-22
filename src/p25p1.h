@@ -52,6 +52,13 @@ struct p25_frame {
 };
 typedef void (*p25_frame_handler)(void *arg,struct p25_frame const *frame);
 
+// Receive filter: chosen from the envelope (the default), or forced
+enum p25_rxfilter {
+  P25_FILTER_AUTO,
+  P25_FILTER_SHARP,  // for true C4FM, constant envelope
+  P25_FILTER_GENTLE, // for linear simulcast (CQPSK/LSM)
+};
+
 struct p25p1_stats {
   uint64_t dibits;
   uint64_t syncs;        // strong frame syncs
@@ -66,6 +73,9 @@ struct p25p1_stats {
   uint64_t voice_frames,voice_errors; // IMBE frames seen and bits corrected in them
   uint64_t retimed;      // frame syncs found by re-sampling a near miss at better timing
   uint64_t midpoint_syncs; // frame syncs found half a symbol away from where the loop sat
+  uint64_t filter_changes; // automatic receive filter changes
+  enum p25_rxfilter rxfilter; // the one in use: P25_FILTER_SHARP or P25_FILTER_GENTLE
+  float envelope_ripple; // symbol-rate ripple of the envelope over its mean: 0.04 or less on C4FM, 0.09 or more on simulcast
   bool locked;           // frame sync held (three syncs since the last loss)
   float frequency_offset; // Hz
   float timing_error;    // smoothed normalized timing detector output; about 0.1 on a clean signal
@@ -94,5 +104,6 @@ void p25p1_set_sync_search(struct p25p1 *p,bool retime,bool midpoint); // timing
 // Timing loop bandwidths once frame sync is held: 'track' at once, 'settled' after 'settle_time'
 // seconds of held sync. A negative value keeps the default
 void p25p1_set_track_bandwidth(struct p25p1 *p,float track,float settled,float settle_time);
+void p25p1_set_rxfilter(struct p25p1 *p,enum p25_rxfilter mode); // P25_FILTER_AUTO is the default
 float p25p1_frequency_offset(struct p25p1 const *p); // Hz, estimated carrier offset
 #endif
