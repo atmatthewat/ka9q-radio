@@ -18,13 +18,13 @@ enum {
 
 // Data unit IDs as sent in the NID
 enum p25_duid {
-  P25_HDU = 0,    // header
-  P25_TDU = 3,    // terminator
-  P25_LDU1 = 5,   // voice, link control
-  P25_TSDU = 7,   // trunking signalling, one to three blocks
-  P25_LDU2 = 10,  // voice, encryption sync
-  P25_PDU = 12,   // packet data
-  P25_TDULC = 15, // terminator with link control
+  P25_DUID_HDU = 0,    // header
+  P25_DUID_TDU = 3,    // terminator
+  P25_DUID_LDU1 = 5,   // voice, link control
+  P25_DUID_TSDU = 7,   // trunking signalling, one to three blocks
+  P25_DUID_LDU2 = 10,  // voice, encryption sync
+  P25_DUID_PDU = 12,   // packet data
+  P25_DUID_TDULC = 15, // terminator with link control
 };
 
 // One assembled data unit, status symbols removed. Valid only during the callback

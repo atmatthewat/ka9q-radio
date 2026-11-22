@@ -153,20 +153,20 @@ struct p25p1 {
 
 static int unit_size(int unit){
   switch(unit){
-  case P25_HDU:
+  case P25_DUID_HDU:
     return 648 + 10;
-  case P25_TDU:
+  case P25_DUID_TDU:
     return 28;
-  case P25_LDU1:
-  case P25_LDU2:
+  case P25_DUID_LDU1:
+  case P25_DUID_LDU2:
     return 1568;
   case 6: // VSELP voice, obsolete
   case 9:
     return 1680;
-  case P25_TDULC:
+  case P25_DUID_TDULC:
     return 308;
-  case P25_TSDU:
-  case P25_PDU:
+  case P25_DUID_TSDU:
+  case P25_DUID_PDU:
   case UNIT_TSBK2:
   case UNIT_TSBK3:
     return 196;
@@ -175,7 +175,7 @@ static int unit_size(int unit){
   }
 }
 static bool unit_trailing_status(int unit){
-  return unit == P25_HDU || unit == P25_TDU || unit == P25_LDU1 || unit == P25_LDU2 || unit == P25_TDULC;
+  return unit == P25_DUID_HDU || unit == P25_DUID_TDU || unit == P25_DUID_LDU1 || unit == P25_DUID_LDU2 || unit == P25_DUID_TDULC;
 }
 static inline bool searching(struct p25p1 const *p){
   return !p->assembling && p->trailing == 0;
@@ -279,7 +279,7 @@ static bool decode_nid(struct p25p1 *p,struct wdibit const *w,bool allow_known,i
     // Only for data units whose payload has its own CRC: a terminator or voice unit from noise
     // would end a call or put noise into it
     int const d = bits[12] << 3 | bits[13] << 2 | bits[14] << 1 | bits[15];
-    if(d != P25_TSDU && d != P25_PDU)
+    if(d != P25_DUID_TSDU && d != P25_DUID_PDU)
       return false;
     *recovered = true;
   }
@@ -420,7 +420,7 @@ static int decode_block(struct p25p1 *p,uint8_t out[96]){
 // A complete data unit. Returns true if another block of the same data unit follows
 static bool dispatch(struct p25p1 *p){
   switch(p->unit){
-  case P25_TSDU:
+  case P25_DUID_TSDU:
   case UNIT_TSBK2:
   case UNIT_TSBK3:
     {
@@ -436,38 +436,38 @@ static bool dispatch(struct p25p1 *p){
 	p->last_tsbk_dibit = p->dibit_clock;
 	p->have_tsbk = true;
       }
-      emit(p,P25_TSDU,p->tsbk_block,96,block,NULL,NULL,crc);
+      emit(p,P25_DUID_TSDU,p->tsbk_block,96,block,NULL,NULL,crc);
       // The first bit of a good block says whether it is the last. A block that fails its CRC
       // does not say, so carry on: up to three blocks
       bool const last = crc >= 0 && block[0] != 0;
       if(last || p->unit == UNIT_TSBK3)
 	return false;
-      p->unit = p->unit == P25_TSDU ? UNIT_TSBK2 : UNIT_TSBK3;
+      p->unit = p->unit == P25_DUID_TSDU ? UNIT_TSBK2 : UNIT_TSBK3;
       p->tsbk_block++;
       return true;
     }
-  case P25_PDU:
+  case P25_DUID_PDU:
     {
       // Header block only for now; data blocks follow once the packet assembler is in
       uint8_t block[96];
       int const crc = decode_block(p,block);
       p->stats.pdu++;
-      emit(p,P25_PDU,0,96,block,NULL,NULL,crc);
+      emit(p,P25_DUID_PDU,0,96,block,NULL,NULL,crc);
       return false;
     }
-  case P25_HDU:
+  case P25_DUID_HDU:
     p->stats.hdu++;
     break;
-  case P25_LDU1:
+  case P25_DUID_LDU1:
     p->stats.ldu1++;
     break;
-  case P25_LDU2:
+  case P25_DUID_LDU2:
     p->stats.ldu2++;
     break;
-  case P25_TDU:
+  case P25_DUID_TDU:
     p->stats.tdu++;
     break;
-  case P25_TDULC:
+  case P25_DUID_TDULC:
     p->stats.tdulc++;
     break;
   default:

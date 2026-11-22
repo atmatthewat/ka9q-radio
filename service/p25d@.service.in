@@ -1,0 +1,25 @@
+# systemd unit for the P25 decoder
+# The instance is the I/Q multicast group to decode, e.g., systemctl enable --now p25d@p25-iq.local
+# Every channel (SSRC) on the group is decoded; events from all instances are appended to /var/log/p25d.log
+
+[Unit]
+Description=P25 decoder %i
+Wants=lan.target
+After=lan.target
+
+[Service]
+User=radio
+Group=radio
+Type=simple
+StandardOutput=append:/var/log/p25d.log
+StandardError=journal
+ExecStart=@sbindir@/p25d %i
+Restart=always
+RestartSec=5
+TimeoutStopSec=5
+SyslogIdentifier=p25d@%i
+LogRateLimitBurst=200
+LogRateLimitIntervalSec=20
+
+[Install]
+WantedBy=multi-user.target
