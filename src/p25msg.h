@@ -40,6 +40,7 @@ enum p25_family {
   P25_FAMILY_PDU,    // any other packet data unit
   P25_FAMILY_HDU,
   P25_FAMILY_ES,     // LDU2 encryption sync
+  P25_FAMILY_MAC,    // Phase 2 MAC structure (p25p2mac.c)
 };
 
 // What a message is, whatever family carried it (a group voice grant may come in a TSBK or

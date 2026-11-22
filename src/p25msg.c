@@ -1143,7 +1143,7 @@ char const *p25_kind_name(enum p25_kind kind){
 }
 
 char const *p25_family_name(enum p25_family family){
-  static char const *const names[] = { "TSBK", "LC", "TDULC", "MBT", "PDU", "HDU", "ES" };
+  static char const *const names[] = { "TSBK", "LC", "TDULC", "MBT", "PDU", "HDU", "ES", "MAC" };
   if(family < 0 || family >= (int)(sizeof names / sizeof names[0]))
     return "?";
   return names[family];
