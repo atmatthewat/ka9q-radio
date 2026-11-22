@@ -59,18 +59,18 @@
 //
 // What un-confirms. Becoming encrypted: at the next voice unit what is held goes out as
 // encrypted frames on a frame stream that asked for them, and is otherwise dropped, and no
-// speech follows. A gap in the voice long enough to hide the end of one transmission and the
-// start of the next (voice_gap()): clear is withdrawn until a new word says so, and if the state
-// was not clear everything held is dropped, because the word that would release it might
-// belong to the next transmission (units held while clear, waiting only for the trunking
-// logic, stay). The gaps:
-//  - Phase 1: more than one and a half voice units between two LDUs, that is, one or more
-//    LDUs lost (an LDU follows every 864 dibits);
-//  - Phase 2: two or more places of the timeslot in a row (voice bursts, FACCH, SACCH) where
-//    nothing decoded, since a lost END PTT and a lost PTT each take at least one; on Phase 2
-//    the encryption parameters received so far are forgotten too.
-// Link control or a MAC voice channel user word naming another talkgroup, unit or talker than
-// the transmission's means one ended and another began unseen: the transmission is ended there.
+// speech follows. Link control or a MAC voice channel user word naming another talkgroup, unit
+// or talker than the transmission's means one ended and another began unseen: the transmission
+// is ended there.
+//
+// What is let through. A fade shorter than Hang does not end the transmission and does not
+// withdraw 'clear'. If it hid the end of a clear transmission and the start of an encrypted one
+// (terminator and header or PTT all lost, and no word naming another talker decoded yet), the
+// new one is decoded until its first encryption sync or ESS says encrypted: at most one
+// superframe, 18 frames (360 ms), more only while those words fail too. Likewise units held
+// unconfirmed before a fade are sent if a word after it says clear. That burst at a weak signal
+// is accepted, for simplicity. The encryption parameters carried by frames after a fade are the
+// last received, flagged fresh only when they came just before the frames' superframe.
 //
 // What ends a transmission (end_transmission(): held units dropped, streams closed): Phase 1
 // a header (it starts a new one), TDU or TDULC; Phase 2 a MAC PTT (likewise), END PTT, IDLE or
@@ -493,7 +493,6 @@ struct p25_audio {
   uint64_t ldu1_dibit;     // and where it ended
   int64_t cycle;           // Phase 2: voice cycle of the last burst
   int64_t last_unit;       // time at the end of the last voice unit seen
-  uint64_t last_dibit;     // Phase 1: and its last dibit
   struct held_unit held[P25_AUDIO_MAX_HELD]; // oldest first
   int nheld;
   int held_frames;
@@ -505,10 +504,6 @@ struct p25_audio {
   uint64_t p2_ref;
   int p2_k2;
   bool p2_after_ptt;
-  // Phase 2 gap rule: the place (superframe * 6 + position 0-5, the SACCH being 5) of the last
-  // burst of this timeslot that decoded (voice, or a MAC PDU passing its CRC), since voice began
-  bool p2_heard_set;
-  int64_t p2_heard;
 
   void (*tap)(void *,int64_t,uint64_t);
   void *tap_arg;
@@ -903,7 +898,6 @@ static void end_transmission(struct p25_audio *a){
   a->in_superframe = false;
   a->cycle = INT64_MIN;
   a->p2_after_ptt = false;
-  a->p2_heard_set = false;
   a->last_unit = 0;
 }
 
@@ -916,17 +910,6 @@ void p25_audio_poll(struct p25_audio *a,double frequency,int64_t when){
     // The next voice unit is overdue by more than Hang: the call is over even without a terminator
     end_transmission(a);
   }
-}
-
-// Voice was lost, for long enough to hide the end of one transmission and the start of another.
-// What is known to be clear is so no longer, until a header, sync, PTT or ESS says so again.
-// Units still waiting for that word are never sent: the word, when it comes, may be another
-// transmission's and cannot vouch for them. (Units known clear when they came, waiting only for
-// the trunking logic, stay: they are sent if the logic releases them and what follows is clear)
-static void voice_gap(struct p25_audio *a){
-  if(!a->clear)
-    discard_held(a);
-  a->clear = false;
 }
 
 // Encryption parameters received (header, encryption sync, PTT, ESS) at 'at': they apply to the
@@ -1101,14 +1084,7 @@ void p25_audio_unit(struct p25_audio *a,struct p25_frame const *frame,int64_t wh
       bool const ldu1 = frame->duid == P25_DUID_LDU1;
       if(ldu1 && new_talker(a,frame))
 	end_transmission(a);
-      if(a->last_unit != 0 && frame->dibit - a->last_dibit > LDU_DIBITS * 3 / 2){
-	// Voice units lost: what came between might have been a terminator and the header of
-	// another transmission. Clear only once a header or sync says so again (until then units
-	// wait, and are sent in order then: the speech is the same, only later)
-	voice_gap(a);
-      }
       a->last_unit = t;
-      a->last_dibit = frame->dibit;
       if(ldu1 || !a->in_superframe || !next_unit(frame->dibit,(int64_t)a->ldu1_dibit))
 	new_superframe(a,next_unit(frame->dibit,a->pending_at));
       a->in_superframe = ldu1;
@@ -1233,18 +1209,6 @@ static void p2_place(struct p25_audio const *a,struct held_unit *h){
     h->f[i].position = (uint8_t)(4 * c + i);
 }
 
-// The gap rule. Places on a timeslot, counting its SACCH, between the last burst that decoded and
-// this voice burst, where nothing decoded: lost voice, or a lost FACCH or SACCH. A lost END PTT
-// and a lost PTT each take at least one place, so two or more missing places may hide the end of
-// one transmission and the start of another. One cannot: a FACCH stealing a voice burst, or one
-// burst lost to noise, leaves the transmission as it was
-enum { P2_GAP_PLACES = 2 };
-static int64_t p2_missing(struct p25_audio const *a,int64_t place){
-  if(!a->p2_heard_set || place <= a->p2_heard)
-    return 0;
-  return place - a->p2_heard - 1;
-}
-
 void p25_audio_burst(struct p25_audio *a,struct p25p2_burst const *b,int64_t when,enum p25_audio_label label){
   if(a == NULL || b == NULL)
     return;
@@ -1257,28 +1221,13 @@ void p25_audio_burst(struct p25_audio *a,struct p25p2_burst const *b,int64_t whe
     a->p2_ref_set = true;
   }
   int64_t const sf = floor_div((int64_t)(sf_start - a->p2_ref) + P2_SUPERFRAME_DIBITS / 2,P2_SUPERFRAME_DIBITS);
-  int64_t const place = sf * 6 + k;
   bool const mac = b->mac != NULL;
   if(mac ? !b->mac->crc_ok : (b->voice == NULL || b->nframes <= 0 || b->nframes > MAX_UNIT_FRAMES || k > 4))
     return; // nothing decoded in this place
-  if(p2_missing(a,place) >= P2_GAP_PLACES){
-    // Whatever decoded here, voice or signalling (a PTT says for itself what follows). Clear only
-    // once a PTT or an ESS says so again (until then bursts wait, and are sent in order then: the
-    // speech is the same, only later). The encryption parameters received so far may be another
-    // transmission's too: frames carry none (ALGID 0) until the next PTT or ESS
-    voice_gap(a);
-    memset(&a->last,0,sizeof a->last);
-    memset(&a->current,0,sizeof a->current);
-    a->pending_fresh = false;
-  }
   if(mac){
     mac_info(a,b);
-    if(a->p2_heard_set && place > a->p2_heard)
-      a->p2_heard = place; // heard, in a transmission already under way
     return;
   }
-  a->p2_heard = place;
-  a->p2_heard_set = true;
   a->last_unit = t;
   if(a->p2_after_ptt){
     a->p2_k2 = (k + 4) % 5; // this burst begins a voice cycle

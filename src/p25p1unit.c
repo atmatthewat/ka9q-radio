@@ -32,7 +32,11 @@
 // Hamming correction of a bit whose confidence is high is refused and the word erased, since one
 // error in a confident bit is less likely than two errors elsewhere; if that erases anything,
 // Reed-Solomon runs on the result and writes its corrected hexbits back into the payload. The
-// word is then decoded again from hard bits.
+// word is then decoded again from hard bits. The Hamming parity bits are left as received, so
+// that second decode is a check on the first: measured on generated LDUs, when the soft result
+// is right the hard one agrees (all but 1 of 623,000 words), and when it is wrong the hard one
+// refuses about half of them. Taking the soft result as the word instead fails 4% fewer
+// encryption sync words at 6 dB Es/N0 but accepts 56% more wrong ones.
 //
 // IMBE frames (TIA-102.BABA). 144 bits: c0-c3 Golay(23,12), c4-c6 Hamming(15,11), c7 seven bits
 // unprotected, 88 information bits u0-u7 in all. They are interleaved over the frame, and c1-c6
@@ -191,7 +195,7 @@ bool p25_ldu_decode(struct p25_ldu *ldu,int duid,uint8_t bits[P25_LDU_BITS],floa
         ldu->soft_rs = 1;
         ldu->soft_rs_fixed = r;
         for(int i = 0; i < 24; i++)
-          put_hex(bits + ldu_word(i),hex[i]); // the Hamming parity bits are left as they are
+          put_hex(bits + ldu_word(i),hex[i]); // the Hamming parity bits are left as they are (see above)
       }
     }
   }

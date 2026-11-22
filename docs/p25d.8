@@ -137,11 +137,13 @@ the talkgroup number as its SSRC; any other call, and a conventional channel,
 uses the voice channel's SSRC. The frame stream (\-F) has the same SSRC,
 timestamps and marker bits, one packet per vocoder frame.
 .PP
-No speech is ever sent from an encrypted voice unit, or from one not yet known
-to be clear: a unit is decoded only after a header or encryption sync of the
-same transmission has said it is unencrypted, and on a trunked channel only
-when the call tracking agrees. Units that arrive before that are held, then
-sent in order or dropped.
+Encrypted voice is not decoded: a transmission's voice is decoded only after
+a header or encryption sync of that transmission has said it is unencrypted,
+and on a trunked channel only when the call tracking agrees. Voice that
+arrives before that is held, then sent in order or dropped. A fade shorter
+than half a second does not end a transmission, so at a weak signal up to one
+superframe (360 ms) of an encrypted transmission that began during the fade
+can be decoded before its own encryption sync stops it.
 .SH NOTES
 .TP
 .B "The vocoder is not a complete one."

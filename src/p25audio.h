@@ -89,15 +89,20 @@ struct p25_audio_stats {
   uint64_t frame_encrypted; // of those, flagged encrypted
 };
 
-// Nothing from an encrypted voice unit, or from one not yet known to be clear, is ever decoded to
-// speech or sent as a clear frame. A unit is clear only when
-//  - this module has seen, in the same transmission, a header or encryption sync word (Phase 2:
-//    a MAC PTT or an ESS) that passed error correction with ALGID 0x80 (clear), and nothing since
-//    saying otherwise (a header, sync or PTT with another ALGID, or link control or a MAC voice
-//    channel user structure that is protected or has the service options' encryption bit set,
-//    marks the rest of the transmission encrypted), and
-//  - when the channel has trunking logic, that logic labelled the unit clear: at once
-//    (P25_AUDIO_CLEAR) or later (P25_AUDIO_HOLD, then p25_audio_release(a,true)).
+// A transmission's voice is decoded to speech (and sent as clear frames) once a word that passed
+// error correction has said unencrypted in it (a header or encryption sync; Phase 2: a MAC PTT or
+// an ESS; ALGID 0x80, or the all-zero LDU2 sync), and from then until the transmission ends,
+// unless something says encrypted (a header, sync, PTT or ESS with another ALGID, or link control
+// or a MAC voice channel user structure that is protected or has the service options' encryption
+// bit), which holds for the rest of the transmission. On a channel with trunking logic that logic
+// must also label the unit clear: at once (P25_AUDIO_CLEAR) or later (P25_AUDIO_HOLD, then
+// p25_audio_release(a,true)).
+// A transmission ends at a terminator (TDU, TDULC), a header or MAC PTT (which starts the next), a
+// MAC END PTT, IDLE or HANGTIME, the trunking logic ending the call, a voice unit overdue by more
+// than half a second, or link control or a MAC voice channel user word naming another talkgroup,
+// unit or talker. A shorter fade does not end it: if one hid the end of a clear transmission and
+// the start of an encrypted one, up to one superframe (18 frames, 360 ms) of the new one may be
+// decoded before its own sync or ESS says encrypted.
 // Units waiting for either are kept (their frames copied, at most P25_AUDIO_MAX_HELD_FRAMES) and,
 // once both allow, sent in order with their original timestamps. Held units are discarded if the
 // transmission ends first, or if too many wait (the oldest go); if the call turns out encrypted
@@ -137,9 +142,7 @@ void p25_audio_frame(struct p25_audio *a,struct p25_frame const *frame,int64_t w
 // PTT, IDLE or HANGTIME ends it; MAC PTT, ESS and MAC voice channel user structures carry the call
 // and encryption, and a voice channel user naming another talkgroup or talker starts a new
 // transmission; 4V and 2V bursts are the voice units, placed in time by burst->dibit and
-// superframe_slot. After two or more places of the timeslot (voice bursts, FACCH, SACCH) where
-// nothing decoded, the transmission is not clear again until a PTT or ESS says so, since a lost
-// END PTT and PTT may lie there; bursts held unconfirmed from before such a gap are never sent
+// superframe_slot
 void p25_audio_burst(struct p25_audio *a,struct p25p2_burst const *burst,int64_t when,enum p25_audio_label label);
 // The trunking logic decided about the units it labelled P25_AUDIO_HOLD: clear (they are sent
 // once this module's own rule also allows) or not (treated as encrypted)

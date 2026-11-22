@@ -48,8 +48,10 @@
 // first 24 with the pattern's: the sum of cos(received - ideal), 24 for a perfect match, and
 // independent of amplitude. A window is accepted only when its NID also decodes:
 // a strong correlation (above 17) sets the channel's NAC, a weak one (above 10) is taken only
-// for that NAC. The correlator keeps running while a data unit is assembled, and a sync whose
-// NID decodes there ends the unit in progress.
+// for that NAC, once a strong one has set it. Where the NID of a data unit following the last
+// one directly would end, a NID decoding to that NAC is taken whatever the correlation. The
+// correlator keeps running while a data unit is assembled, and a sync whose NID decodes there
+// ends the unit in progress.
 //
 // The NID. 12 bits NAC, 4 bits DUID, protected by BCH(63,16,23), plus a parity bit outside the
 // code. It is decoded errors-only, then with the less certain bit of each weak dibit erased
@@ -98,13 +100,27 @@ static float const Acquire_bw = 0.08f;
 static float const Track_bw = 0.016f;
 static float const Settled_bw = 0.004f;
 static float const Settle_time = 0.5f; // seconds of held frame sync before the last step
+// How they were chosen: the acquisition and tracking bandwidths from a grid search, with three
+// noise seeds, counting the data units decoded from a recorded control channel with noise added.
+// The acquisition bandwidth was then doubled from that search's 0.04, which tracks as well and
+// acquires within the first voice data unit of a traffic channel. The damping was the best of 38
+// loop settings on a 30 second control channel recording
 // The bandwidths are the loop's natural frequency in radians per symbol; at damping 1 (critical:
 // no overshoot) the time constants are about 1 / bw symbols: 12.5, 62.5 and 250 symbols, or 2.6,
 // 13 and 52 ms
 static float const Loop_damping = 1.0f;
-// The timing detector's slope as set_gains() in dsync.c takes it, error per input sample
+// The timing detector's slope as set_gains() in dsync.c takes it, error per input sample, at
+// Error_gain_rate. The detector's slope per symbol of timing offset is the same at any sample
+// rate (measured: the S-curve's slope per input sample at 24 kHz is 0.77 to 0.83 of that at
+// 19.2 kHz, against 4/5 for the samples per symbol), so per input sample it is scaled by
+// Error_gain_rate / samprate, and the loop's bandwidths are per symbol at any rate.
+// 0.42 is a tuning constant, not the slope of any one signal (measured slopes differ about
+// threefold between signals): with damping 1 it gave the fewest bit errors in a sweep of loop
+// settings on a generated signal (2.0%, against 4.2% at a gain of 0.8 and damping 0.7)
 static float const Error_gain = 0.42f;
-// Symbol rate error the timing loop may integrate: transmitter plus receiver clock errors are tens of ppm
+static double const Error_gain_rate = 19200.0; // Hz
+// Symbol rate error the timing loop may integrate: transmitter plus receiver clock errors are tens
+// of ppm, and a recording decodes the same with the limit anywhere down to 100 ppm
 static float const Rate_limit = 0.0003f; // 300 ppm
 // Interpolator arms per input sample: steps of 1/32 sample, 1/128 symbol at 19,200 Hz
 static int const Interp_phases = 32;
@@ -423,8 +439,11 @@ static bool evaluate_window(struct p25p1 *p,bool is_searching){
   struct wdibit const * const w = p->ring + p->ring_pos;
   float const corr = window_correlation(p,w);
   p->last_correlation = corr;
-  // Also try where the next data unit's NID would end if it followed the last one directly
-  if(!(corr > Weak_sync || (is_searching && p->searched == WINDOW)))
+  // Where the next data unit's NID ends if it follows the last one directly (searching restarts
+  // at the end of each data unit), the NID alone may stand in for a frame sync too damaged to
+  // pass: taken as a weak sync if it decodes, without the known NAC substituted, to that NAC
+  bool const expected = is_searching && p->searched == WINDOW;
+  if(!(corr > Weak_sync || expected))
     return false;
   int nac,duid;
   bool recovered;
@@ -439,7 +458,9 @@ static bool evaluate_window(struct p25p1 *p,bool is_searching){
   if(corr > Strong_sync){
     p->stats.syncs++;
     p->nac = (uint16_t)nac;
-  } else if(corr > Weak_sync && nac == p->nac){
+  } else if((corr > Weak_sync || (expected && !recovered)) && p->stats.syncs != 0 && nac == p->nac){
+    // p->nac means something only once a strong sync has set it: before that it is 0, which
+    // would let a weak sync whose NID decodes to NAC 0 through
     p->stats.weak_syncs++;
     weak = true;
   } else
@@ -912,7 +933,8 @@ struct p25p1 *create_p25p1(double samprate){
   p->sharp = 0;
   if(init_rxfilter(&p->rxf,samprate,Rx_cutoff,sharp_taps,Sharp_rolloff) != 0
      || (p->gentle = add_rxfilter_response(&p->rxf,samprate,Rx_cutoff,gentle_taps,Gentle_rolloff)) < 0
-     || init_symsync(&p->sync,samprate,P25_SYMRATE,Interp_phases,Acquire_bw,Track_bw,Loop_damping,Error_gain,Rate_limit) != 0){
+     || init_symsync(&p->sync,samprate,P25_SYMRATE,Interp_phases,Acquire_bw,Track_bw,Loop_damping,
+		     Error_gain * (float)(Error_gain_rate / samprate),Rate_limit) != 0){
     delete_p25p1(p);
     return NULL;
   }
