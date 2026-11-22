@@ -1,5 +1,11 @@
 // Reed-Solomon codes over GF(64) with errors and erasures, the P25 codes among them,
 // and the BCH(63,16,23) code of the P25 NID decoded as a binary subcode of one.
+// Phil Karn's libfec (github.com/ka9q/libfec) has a general Reed-Solomon decoder,
+// decode_rs_char(), that could do the Reed-Solomon part here (symbol size 6, field polynomial
+// 0x43, first root alpha^1, with this file's rules for accepting a correction kept around it).
+// It is not used, for build convenience only: it would be one more library to install, and
+// the libfec-dev Debian packages is another revision whose decode_rs_char() numbers positions
+// differently in a shortened code. The two decoders gave the same results when compared
 // Copyright 2026, Matthew Kaufman, KA6SQG
 #include <assert.h>
 #include <pthread.h>
