@@ -1678,6 +1678,11 @@ CREDITS
        all-zero encryption sync.  Speech decoding uses mbelib
        (https://github.com/szechyjs/mbelib) when it is installed.
 
+       Much of what is here was first worked out, prototyped and run in
+       production by the author in the receivers behind scanrad.io.  None of
+       that is ka9q-radio code and none of it is in this tree; it is where the
+       author learned to decode P25.
+
 FILES
        p25d@.service
 	      systemd template unit; the instance name is the input group. Its
