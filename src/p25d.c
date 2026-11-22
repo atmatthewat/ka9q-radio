@@ -34,6 +34,7 @@
 #include "chanctl.h"
 #include "p25p1.h"
 #include "p25msg.h"
+#include "p25p1msg.h"
 #include "p25trunk.h"
 #include "p25alias.h"
 #include "p25audio.h"

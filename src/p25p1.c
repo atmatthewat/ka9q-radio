@@ -10,7 +10,9 @@
 #include <string.h>
 
 #include "digital.h"
-#include "dfec.h"
+#include "crc.h"
+#include "p25p1trellis.h"
+#include "rs63.h"
 #include "p25p1.h"
 
 // Timing loop bandwidths (normalized, per symbol): wide to acquire, narrower once frame sync is

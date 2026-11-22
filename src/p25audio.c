@@ -24,6 +24,7 @@
 #include "timing.h"
 #include "avahi.h"
 #include "p25msg.h"
+#include "p25p1msg.h"
 #include "p25audio.h"
 
 // One IMBE frame is 20 ms; the RTP clock is the sender's clock at 8 kHz

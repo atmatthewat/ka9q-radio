@@ -1,5 +1,5 @@
-// P25 Phase 1 message decoding: trunking signalling blocks, link control, multi-block
-// trunking, packet data headers, encryption sync and the identifier (band plan) table
+// P25 messages, both phases: the decoded message, its families and kinds, one-line log
+// formatting, names, and the identifier (band plan) table
 // Copyright 2026, Matthew Kaufman, KA6SQG
 
 #ifndef _P25MSG_H
@@ -9,15 +9,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-// Every input is the error-corrected message as octets, most significant bit first:
-//   TSBK    12 octets (80 bits of message, then the 16-bit CRC)       TIA-102.AABC
-//   LC       9 octets (LDU1 or TDULC link control word)               TIA-102.AABF
-//   PDU     12-octet header, then the data blocks as the sink decoded them (12 octets
-//           each, 18 for a confirmed packet's blocks); AMBTC is a PDU   TIA-102.BAAA, .AABC
-//   HDU     15 octets (MI, MFID, ALGID, KID, TGID)                    TIA-102.BAAA
-//   ES      12 octets (LDU2 encryption sync: MI, ALGID, KID)
-// Nothing allocates and nothing is global: a decoded message and a band plan are the
-// caller's, so channels can be decoded on separate threads.
+// The Phase 1 decoders (p25p1msg.h) and the Phase 2 MAC decoder (p25p2mac.h) fill a
+// struct p25_msg. Nothing allocates and nothing is global: a decoded message and a band
+// plan are the caller's, so channels can be decoded on separate threads.
 
 // Manufacturer IDs
 #define P25_MFID_STD 0x00
@@ -295,13 +289,6 @@ struct p25_bandplan {
   struct p25_band band[16];
 };
 
-// Decoders: 0 on success, -1 if the message is too short (msg is then zeroed)
-int p25_decode_tsbk(struct p25_msg *msg, uint8_t const tsbk[12]);
-int p25_decode_lc(struct p25_msg *msg, uint8_t const lc[9], bool terminator);
-int p25_decode_pdu(struct p25_msg *msg, uint8_t const *pdu, int len);
-int p25_decode_hdu(struct p25_msg *msg, uint8_t const hdu[15]);
-int p25_decode_es(struct p25_msg *msg, uint8_t const es[12]);
-
 // One log line, no newline: family, kind, then key=value fields. Channels are printed
 // as iden-number and, when the plan knows the identifier, with frequencies in MHz.
 // Returns the length snprintf would have written.
@@ -322,9 +309,5 @@ bool p25_bandplan_update(struct p25_bandplan *plan, struct p25_msg const *msg);
 // identifier has none), and the TDMA slot (0 for FDMA). False if the identifier is unknown.
 bool p25_chan_freq(struct p25_bandplan const *plan, struct p25_chan ch, uint64_t *downlink_hz,
                    uint64_t *uplink_hz, int *slot);
-
-// L3Harris talker GPS from its two link control words (block 1, block 2)
-void p25_harris_gps(uint8_t const block1[9], uint8_t const block2[9], double *latitude,
-                    double *longitude, uint32_t *seconds_of_day, uint16_t *heading);
 
 #endif

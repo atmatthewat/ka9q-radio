@@ -5,7 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "dfec.h"
+#include "crc.h"
+#include "golay.h"
+#include "rs63.h"
 #include "p25p2unit.h"
 
 // ---------------- DUID ----------------

@@ -8,7 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "dfec.h"
+#include "p25p2isch.h"
 #include "digital.h"
 #include "p25p2.h"
 

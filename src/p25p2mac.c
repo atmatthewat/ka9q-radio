@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include "p25p1msg.h"
 #include "p25p2mac.h"
 
 // The PDU: octets MSB first, nbits of them valid. Bits past nbits read as zero.
