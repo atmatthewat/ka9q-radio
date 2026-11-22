@@ -316,6 +316,9 @@ void lock_symsync(struct symsync *s,bool locked){
   s->locked = locked;
   set_gains(s,locked ? s->track_bw : s->acquire_bw);
 }
+void set_symsync_bandwidth(struct symsync *s,float bw){
+  set_gains(s,bw);
+}
 void reset_symsync_rate(struct symsync *s){
   s->ratio = s->base_ratio;
   s->integral = s->base_ratio;

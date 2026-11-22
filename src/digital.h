@@ -101,6 +101,7 @@ int init_symsync(struct symsync *s,double samprate,double symrate,int nphases,
 void free_symsync(struct symsync *s);
 void run_symsync(struct symsync *s,float complex const *buffer,int count,symsync_output out,void *arg);
 void lock_symsync(struct symsync *s,bool locked); // narrow or widen the loop
+void set_symsync_bandwidth(struct symsync *s,float bw); // until the next lock_symsync() change
 void reset_symsync_rate(struct symsync *s);       // forget the symbol rate error estimate
 // Output 'output' (0-based count) re-interpolated 'arms' interpolator steps later (negative: earlier)
 bool symsync_near(struct symsync const *s,uint64_t output,int arms,float complex *result);
