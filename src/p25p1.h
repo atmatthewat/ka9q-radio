@@ -1,15 +1,15 @@
 // P25 receiver for a complex baseband (IQ) stream
 // Phase 1 (FDMA): C4FM and the linear simulcast modulations (CQPSK/LSM) through one chain
 // Copyright 2026, Matthew Kaufman, KA6SQG
-#ifndef _P25_H
-#define _P25_H 1
+#ifndef _P25P1_H
+#define _P25P1_H 1
 
 #include <complex.h>
 #include <stdbool.h>
 #include <stdint.h>
 
 #include "digital.h"
-#include "p25unit.h"
+#include "p25p1unit.h"
 
 enum {
   P25_SYMRATE = 4800,

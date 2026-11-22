@@ -28,7 +28,7 @@
 #include "radio.h"
 #include "import.h"
 #include "timing.h"
-#include "p25.h"
+#include "p25p1.h"
 #include "p25msg.h"
 
 #define MAX_MCAST 20   // Maximum number of input groups

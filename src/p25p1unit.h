@@ -2,8 +2,8 @@
 // header, voice (LDU1, LDU2, with their IMBE voice frames), terminator link control,
 // trunking signalling blocks and packet data (header, blocks, sequence assembly)
 // Copyright 2026, Matthew Kaufman, KA6SQG
-#ifndef _P25UNIT_H
-#define _P25UNIT_H 1
+#ifndef _P25P1UNIT_H
+#define _P25P1UNIT_H 1
 
 #include <stdbool.h>
 #include <stdint.h>

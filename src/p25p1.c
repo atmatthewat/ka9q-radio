@@ -11,7 +11,7 @@
 
 #include "digital.h"
 #include "dfec.h"
-#include "p25.h"
+#include "p25p1.h"
 
 // Timing loop bandwidths (normalized, per symbol): wide to acquire, narrower once frame sync is
 // held, and narrower again once it has been held a while. Going straight to the narrowest on the

@@ -1,12 +1,12 @@
 // Error correction and field extraction for one assembled P25 Phase 1 data unit,
-// and IMBE voice frame decoding to vocoder input (see p25unit.h)
+// and IMBE voice frame decoding to vocoder input (see p25p1unit.h)
 // Copyright 2026, Matthew Kaufman, KA6SQG
 #include <assert.h>
 #include <stddef.h>
 #include <string.h>
 
 #include "dfec.h"
-#include "p25unit.h"
+#include "p25p1unit.h"
 
 // ---------------------------------------------------------------------------
 // Hexbit words (TIA-102.BAAA)
