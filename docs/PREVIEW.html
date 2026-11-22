@@ -1742,10 +1742,10 @@ journalctl -u radiod@hf -f</pre>
     trunked systems, both timeslots of a carrier from one radiod channel. Phase
     2 control channels are not decoded.</p>
 <p class="Pp">The speech of clear (unencrypted) calls can be sent as an 8 kHz
-    RTP audio stream that monitor plays and pcmrecord records, and the vocoder
-    frames themselves can be sent as an RTP stream for a vocoder of your own.
-    The receive filter is chosen for each channel from its signal and needs no
-    setting.</p>
+    RTP audio stream that monitor plays and pcmrecord records (when p25d is
+    built with mbelib), and the vocoder frames themselves can be sent as an RTP
+    stream for a vocoder of your own. The receive filter is chosen for each
+    channel from its signal and needs no setting.</p>
 <p class="Pp">This page is a summary. The package's docs/p25d.md describes the
     radiod configuration, call following, the encryption rule, the frame packet
     format and the log lines in full.</p>

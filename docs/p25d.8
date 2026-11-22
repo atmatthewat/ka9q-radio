@@ -18,7 +18,8 @@ timeslots of a carrier from one radiod channel. Phase 2 control channels are
 not decoded.
 .PP
 The speech of clear (unencrypted) calls can be sent as an 8 kHz RTP audio
-stream that monitor plays and pcmrecord records, and the vocoder frames
+stream that monitor plays and pcmrecord records (when p25d is built with
+mbelib), and the vocoder frames
 themselves can be sent as an RTP stream for a vocoder of your own. The receive
 filter is chosen for each channel from its signal and needs no setting.
 .PP
