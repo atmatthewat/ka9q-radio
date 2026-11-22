@@ -156,9 +156,11 @@ static void emit(struct p25_trunk *t, struct p25_trunk_event *e){
     t->handler(t->arg, e);
 }
 
-// Encrypted as a header or encryption sync confirmed it
+// Encrypted as a header or encryption sync confirmed it: any ALGID but the unencrypted one.
+// 0x00 received in a header or sync is an algorithm like any other (ALG_UNKNOWN stands for
+// "not known yet" only in a call nothing has confirmed)
 static bool confirmed_encrypted(struct call const *c){
-  return c->confirmed && c->alg != ALG_CLEAR && c->alg != ALG_UNKNOWN;
+  return c->confirmed && c->alg != ALG_CLEAR;
 }
 
 static bool in_list(uint16_t const *list, int n, uint16_t g){

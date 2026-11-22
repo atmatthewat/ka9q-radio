@@ -668,6 +668,8 @@ int p25_format(char *buf, size_t size, struct p25_msg const *m, struct p25_bandp
   case P25_ENC_SYNC:
     put(&o, " algid=0x%02x kid=0x%04x", m->algid, m->kid);
     put_hex(&o, "mi", m->mi, 9);
+    if(m->zero_es)
+      put(&o, " (sent as all zeros: taken as unencrypted)");
     break;
   case P25_KIND_COUNT:
     break;

@@ -978,7 +978,13 @@ int p25_decode_hdu(struct p25_msg *msg, uint8_t const hdu[15]){
   return 0;
 }
 
-// LDU2 encryption sync: MI 0-71, ALGID 72-79, KID 80-95
+// LDU2 encryption sync: MI 0-71, ALGID 72-79, KID 80-95.
+// One whose algorithm, key and message indicator are all zero is taken as unencrypted: algid
+// is given as 0x80 and zero_es set (the raw octets are kept as sent). Any other ALGID 0x00 is
+// an algorithm like the rest, so encrypted, and a header saying 0x00 is not excused. This is
+// what sdrtrunk does (GPL-3, Dennis Sheirer; its issue 2013), because it was seen on the air:
+// some L3Harris console transmissions that are not encrypted send such a sync, and without
+// this a clear call is taken as encrypted
 int p25_decode_es(struct p25_msg *msg, uint8_t const es[12]){
   memset(msg, 0, sizeof *msg);
   if(es == NULL)
@@ -989,5 +995,10 @@ int p25_decode_es(struct p25_msg *msg, uint8_t const es[12]){
   memcpy(msg->mi, es, 9);
   msg->algid = es[9];
   msg->kid = field(es, 80, 16);
+  static uint8_t const zeros[12];
+  if(memcmp(es, zeros, sizeof zeros) == 0){
+    msg->zero_es = true;
+    msg->algid = 0x80;
+  }
   return 0;
 }

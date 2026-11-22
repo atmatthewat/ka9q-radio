@@ -249,6 +249,7 @@ struct p25_msg {
   uint8_t mi[9];
   uint8_t algid;
   uint16_t kid;
+  bool zero_es;            // LDU2: sent as all zeros, taken as unencrypted (algid is 0x80 here)
 
   // Packet data header (PDU, MBT)
   bool confirmed;
