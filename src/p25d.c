@@ -59,6 +59,17 @@ struct decoder {
   uint64_t samples;        // samples fed to the decoder since it was created
   uint64_t next_report;    // sample count for the next -v status line
   struct p25_bandplan plan; // channel identifiers learned from this channel's trunking messages
+  // Link control words repeat through a transmission, interleaved with others; each distinct
+  // word is logged once, then again only after it has not been logged for a while
+  struct {
+    uint8_t lc[9];
+    uint64_t sample;       // when last logged
+    bool used;
+  } recent_lc[8];
+  uint8_t last_es[12];     // last encryption sync logged
+  bool have_es;
+  int voice_units;         // voice data units and bits corrected in their frames since the last terminator
+  int voice_errors;
 };
 
 // One for each channel (SSRC) being decoded
@@ -751,12 +762,52 @@ static void *decode_task(void *arg){
   return NULL;
 }
 
+// Log one decoded message for a channel, with the band plan's frequencies where it names channels
+static void log_message(struct decoder *dp,uint64_t sample,struct p25_frame const *frame,struct p25_msg *msg,char const *note){
+  p25_bandplan_update(&dp->plan,msg);
+  char text[512];
+  p25_format(text,sizeof(text),msg,&dp->plan);
+  decoder_event(dp,sample,"NAC %03x %s%s",frame->nac,text,note);
+}
+// The end of a transmission: a terminator, or the channel going quiet
+static void end_of_voice(struct decoder *dp,uint64_t sample,struct p25_frame const *frame,char const *what){
+  if(dp->voice_units > 0)
+    decoder_event(dp,sample,"NAC %03x %s after %d voice units (%.1f s), %d bits corrected",frame->nac,what,
+		  dp->voice_units,0.18 * dp->voice_units,dp->voice_errors);
+  else if(Verbose)
+    decoder_event(dp,sample,"NAC %03x %s",frame->nac,what);
+  dp->voice_units = dp->voice_errors = 0;
+  memset(dp->recent_lc,0,sizeof(dp->recent_lc)); // the next transmission's are logged afresh
+  dp->have_es = false;
+}
+// Has this link control word been logged within the last couple of seconds? If not, note it
+static bool lc_seen(struct decoder *dp,uint64_t sample,uint8_t const lc[9]){
+  uint64_t const hold = (uint64_t)(2 * dp->samprate);
+  int slot = 0;
+  for(int i=0; i < 8; i++){
+    if(dp->recent_lc[i].used && memcmp(dp->recent_lc[i].lc,lc,9) == 0){
+      if(sample - dp->recent_lc[i].sample < hold)
+	return true;
+      dp->recent_lc[i].sample = sample;
+      return false;
+    }
+    if(!dp->recent_lc[i].used || dp->recent_lc[i].sample < dp->recent_lc[slot].sample)
+      slot = dp->recent_lc[i].used && dp->recent_lc[slot].used ? i : (!dp->recent_lc[i].used ? i : slot);
+  }
+  memcpy(dp->recent_lc[slot].lc,lc,9);
+  dp->recent_lc[slot].sample = sample;
+  dp->recent_lc[slot].used = true;
+  return false;
+}
 // One data unit from the receiver, in the decode thread
-// Trunking messages are the program's output and are always logged, decoded to text.
-// -v adds the other data units as they arrive; -vv adds blocks that failed their CRC
+// Trunking messages, link control, encryption sync and the ends of transmissions are the
+// program's output and are always logged, decoded to text; link control and encryption sync
+// once per change, since they repeat through a transmission.
+// -v adds every data unit as it arrives; -vv adds blocks and words that failed their checks
 static void decoder_frame(void *arg,struct p25_frame const *frame){
   struct decoder * const dp = (struct decoder *)arg;
   uint64_t const sample = dp->block_start; // to the block; a block is one RTP packet
+  struct p25_msg msg;
   switch(frame->duid){
   case P25_DUID_TSDU:
     {
@@ -765,35 +816,78 @@ static void decoder_frame(void *arg,struct p25_frame const *frame){
 	  decoder_event(dp,sample,"NAC %03x TSBK block %d failed CRC, sync %.1f",frame->nac,frame->block,frame->correlation);
 	break;
       }
-      uint8_t tsbk[12] = {0};
-      for(int i=0; i < 96; i++)
-	tsbk[i / 8] |= (frame->bits[i] & 1) << (7 - i % 8);
-      struct p25_msg msg;
-      if(p25_decode_tsbk(&msg,tsbk) != 0)
-	break;
-      p25_bandplan_update(&dp->plan,&msg);
-      char text[512];
-      p25_format(text,sizeof(text),&msg,&dp->plan);
-      decoder_event(dp,sample,"NAC %03x %s%s",frame->nac,text,frame->crc == 1 ? " (1 bit corrected)" : "");
+      uint8_t tsbk[12];
+      p25_pack_bits(tsbk,frame->bits,96);
+      if(p25_decode_tsbk(&msg,tsbk) == 0)
+	log_message(dp,sample,frame,&msg,frame->crc == 1 ? " (1 bit corrected)" : "");
     }
     break;
   case P25_DUID_HDU:
-    if(Verbose)
-      decoder_event(dp,sample,"NAC %03x HDU, sync %.1f",frame->nac,frame->correlation);
+    if(frame->word != NULL && frame->word->ok){
+      uint8_t hdu[15];
+      p25_pack_bits(hdu,frame->word->bits,120);
+      if(p25_decode_hdu(&msg,hdu) == 0)
+	log_message(dp,sample,frame,&msg,"");
+    } else if(Verbose > 1)
+      decoder_event(dp,sample,"NAC %03x HDU not decoded, sync %.1f",frame->nac,frame->correlation);
     break;
   case P25_DUID_LDU1:
   case P25_DUID_LDU2:
-    if(Verbose)
-      decoder_event(dp,sample,"NAC %03x LDU%d, sync %.1f",frame->nac,frame->duid == P25_DUID_LDU1 ? 1 : 2,frame->correlation);
+    {
+      struct p25_ldu const * const ldu = frame->ldu;
+      if(ldu == NULL)
+	break;
+      int errors = 0;
+      for(int i=0; i < P25_IMBE_FRAMES; i++)
+	errors += ldu->voice[i].total;
+      dp->voice_units++;
+      dp->voice_errors += errors;
+      if(ldu->word.ok && frame->duid == P25_DUID_LDU1){
+	uint8_t lc[9];
+	p25_pack_bits(lc,ldu->word.bits,72);
+	if(!lc_seen(dp,sample,lc) && p25_decode_lc(&msg,lc,false) == 0)
+	  log_message(dp,sample,frame,&msg,"");
+      } else if(ldu->word.ok){
+	uint8_t es[12];
+	p25_pack_bits(es,ldu->word.bits,96);
+	if(!dp->have_es || memcmp(es,dp->last_es,sizeof(es)) != 0){
+	  // The message indicator changes every superframe of an encrypted call; log the first
+	  // and any change of algorithm or key, which are the last three octets
+	  bool const same_key = dp->have_es && memcmp(es + 9,dp->last_es + 9,3) == 0;
+	  memcpy(dp->last_es,es,sizeof(es));
+	  dp->have_es = true;
+	  if(!same_key && p25_decode_es(&msg,es) == 0)
+	    log_message(dp,sample,frame,&msg,"");
+	}
+      }
+      if(Verbose)
+	decoder_event(dp,sample,"NAC %03x LDU%d %s, %d voice bits corrected, sync %.1f",frame->nac,
+		      frame->duid == P25_DUID_LDU1 ? 1 : 2,
+		      ldu->word.ok ? "ok" : (frame->duid == P25_DUID_LDU1 ? "link control not decoded" : "encryption sync not decoded"),
+		      errors,frame->correlation);
+    }
     break;
   case P25_DUID_TDU:
+    end_of_voice(dp,sample,frame,"TDU");
+    break;
   case P25_DUID_TDULC:
-    if(Verbose)
-      decoder_event(dp,sample,"NAC %03x %s, sync %.1f",frame->nac,frame->duid == P25_DUID_TDU ? "TDU" : "TDULC",frame->correlation);
+    if(frame->word != NULL && frame->word->ok){
+      uint8_t lc[9];
+      p25_pack_bits(lc,frame->word->bits,72);
+      if(p25_decode_lc(&msg,lc,true) == 0)
+	log_message(dp,sample,frame,&msg,"");
+    } else if(Verbose > 1)
+      decoder_event(dp,sample,"NAC %03x TDULC link control not decoded",frame->nac);
+    end_of_voice(dp,sample,frame,"TDULC");
     break;
   case P25_DUID_PDU:
-    if(Verbose)
-      decoder_event(dp,sample,"NAC %03x PDU header%s, sync %.1f",frame->nac,frame->crc < 0 ? " failed CRC" : "",frame->correlation);
+    if(frame->pdu != NULL){
+      uint8_t octets[(P25_PDU_MAX_BITS + 7) / 8];
+      p25_pack_bits(octets,frame->pdu->payload,frame->pdu->nbits);
+      if(p25_decode_pdu(&msg,octets,frame->pdu->nbits / 8) == 0)
+	log_message(dp,sample,frame,&msg,"");
+    } else if(Verbose > 1)
+      decoder_event(dp,sample,"NAC %03x PDU header failed CRC, sync %.1f",frame->nac,frame->correlation);
     break;
   default:
     if(Verbose > 1)
@@ -808,11 +902,11 @@ static void status_line(struct decoder const *dp){
   struct p25p1_stats st = {0};
   if(dp->p25 != NULL)
     p25p1_get_stats(dp->p25,&st);
-  decoder_event(dp,dp->samples,"status: %s, offset %+.1f Hz, syncs %'llu weak %'llu, TSBK %'llu bad %'llu, LDU %'llu, %'.0lf Hz, packets %'llu drops %'llu dupes %'llu filled %'llu resyncs %'llu overruns %'llu",
+  decoder_event(dp,dp->samples,"status: %s, offset %+.1f Hz, syncs %'llu weak %'llu, TSBK %'llu bad %'llu, LDU %'llu, words bad %'llu, %'.0lf Hz, packets %'llu drops %'llu dupes %'llu filled %'llu resyncs %'llu overruns %'llu",
 		st.locked ? "locked" : "searching",st.frequency_offset,
 		(unsigned long long)st.syncs,(unsigned long long)st.weak_syncs,
 		(unsigned long long)(st.tsbk_ok + st.tsbk_fixed),(unsigned long long)st.tsbk_bad,
-		(unsigned long long)(st.ldu1 + st.ldu2),
+		(unsigned long long)(st.ldu1 + st.ldu2),(unsigned long long)st.word_bad,
 		dp->samprate,
 		(unsigned long long)atomic_load(&sp->packets),(unsigned long long)atomic_load(&sp->drops),
 		(unsigned long long)atomic_load(&sp->dupes),(unsigned long long)atomic_load(&sp->filled),

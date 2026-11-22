@@ -9,6 +9,7 @@
 #include <stdint.h>
 
 #include "digital.h"
+#include "p25unit.h"
 
 enum {
   P25_SYMRATE = 4800,
@@ -38,10 +39,15 @@ struct p25_frame {
   int nbits;
   uint8_t const *bits;  // one bit per byte, in transmitted order.
                         // TSDU: the 96 trellis-decoded bits of one block (80 + CRC);
-                        // others: the payload as received, before error correction
+                        // PDU: the header's 96 decoded bits;
+                        // others: the payload as received (LDU: after its soft pre-correction)
   float const *confidence; // per received bit, 0-1 (NULL for a decoded TSDU block)
   float const *phase;      // per received dibit, radians (NULL for a decoded TSDU block)
-  int crc;              // TSDU: 0 passed, 1 passed after one bit was corrected, -1 failed
+  int crc;              // TSDU, PDU: 0 passed, 1 passed after one bit was corrected, -1 failed
+  // Error-corrected contents, NULL when the data unit has none of that kind
+  struct p25_word const *word; // HDU: the header word; TDULC: link control (check word->ok)
+  struct p25_ldu const *ldu;   // LDU1: link control, LDU2: encryption sync (ldu->word.ok), and nine voice frames
+  struct p25_pdu const *pdu;   // PDU: a complete packet sequence, header and data blocks
   uint64_t dibit;       // position in the dibit stream of the data unit's last dibit
 };
 typedef void (*p25_frame_handler)(void *arg,struct p25_frame const *frame);
@@ -56,6 +62,8 @@ struct p25p1_stats {
   uint64_t sync_losses;
   uint64_t tsbk_ok,tsbk_fixed,tsbk_bad;
   uint64_t hdu,ldu1,ldu2,tdu,tdulc,pdu,other;
+  uint64_t word_ok,word_bad;   // header, link control and encryption sync words decoded and not
+  uint64_t voice_frames,voice_errors; // IMBE frames seen and bits corrected in them
   uint64_t retimed;      // frame syncs found by re-sampling a near miss at better timing
   uint64_t midpoint_syncs; // frame syncs found half a symbol away from where the loop sat
   bool locked;           // frame sync held (three syncs since the last loss)

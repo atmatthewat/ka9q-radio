@@ -49,6 +49,7 @@ enum {
 enum {
   UNIT_TSBK2 = 16,
   UNIT_TSBK3 = 17,
+  UNIT_PDU_DATA = 18,
   UNIT_NONE = -1,
 };
 // Sync thresholds on the soft correlation (24 = perfect). Per window, on noise a correlation
@@ -130,6 +131,10 @@ struct p25p1 {
   struct nac_entry nacs[3];
   uint64_t nac_clock;
   bool evaluating_replacement;
+  // decoded contents of the data unit being passed up
+  struct p25_word word;
+  struct p25_ldu ldu;
+  struct p25_pdu packet;     // packet data assembler
 
   // timing search
   bool retime,midpoint;
@@ -169,6 +174,7 @@ static int unit_size(int unit){
   case P25_DUID_PDU:
   case UNIT_TSBK2:
   case UNIT_TSBK3:
+  case UNIT_PDU_DATA:
     return 196;
   default:
     return -1;
@@ -331,6 +337,7 @@ static bool evaluate_window(struct p25p1 *p,bool is_searching){
       p->stats.abandoned++;
     p->assembling = false;
     p->trailing = 0;
+    p25_pdu_reset(&p->packet);
   }
   if(++p->consecutive_syncs == 3)
     sync_acquired(p);
@@ -389,27 +396,24 @@ static bool evaluate_replacement(struct p25p1 *p,struct softdibit const *window)
   p->last_correlation = saved_correlation;
   return false;
 }
-static void emit(struct p25p1 *p,int duid,int block,int nbits,uint8_t const *bits,float const *conf,float const *phase,int crc){
+static void emit(struct p25p1 *p,struct p25_frame *f){
   if(p->handler == NULL)
     return;
-  struct p25_frame const f = {
-    .duid = duid,
-    .block = block,
-    .nac = p->nac,
-    .correlation = p->frame_correlation,
-    .weak_sync = p->frame_weak,
-    .recovered_nid = p->frame_recovered,
-    .nbits = nbits,
-    .bits = bits,
-    .confidence = conf,
-    .phase = phase,
-    .crc = crc,
-    .dibit = p->dibit_clock,
-  };
-  p->handler(p->handler_arg,&f);
+  f->nac = p->nac;
+  f->correlation = p->frame_correlation;
+  f->weak_sync = p->frame_weak;
+  f->recovered_nid = p->frame_recovered;
+  f->dibit = p->dibit_clock;
+  p->handler(p->handler_arg,f);
 }
-// One rate 1/2 trellis block (trunking signalling, packet header): deinterleave, soft Viterbi
-// on the received phases, CRC. Returns the CRC result: 0 good, 1 good after one bit, -1 bad
+static void count_word(struct p25p1 *p,struct p25_word const *w){
+  if(w->ok)
+    p->stats.word_ok++;
+  else
+    p->stats.word_bad++;
+}
+// One rate 1/2 trellis block of trunking signalling: deinterleave, soft Viterbi on the received
+// phases, CRC. Returns the CRC result: 0 good, 1 good after one bit, -1 bad
 static int decode_block(struct p25p1 *p,uint8_t out[96]){
   float phases[98];
   p25_deinterleave_dibit_floats(phases,p->phase);
@@ -419,6 +423,7 @@ static int decode_block(struct p25p1 *p,uint8_t out[96]){
 }
 // A complete data unit. Returns true if another block of the same data unit follows
 static bool dispatch(struct p25p1 *p){
+  struct p25_frame f = { .duid = p->unit, .nbits = p->nbits, .bits = p->bits, .confidence = p->confidence, .phase = p->phase };
   switch(p->unit){
   case P25_DUID_TSDU:
   case UNIT_TSBK2:
@@ -436,7 +441,8 @@ static bool dispatch(struct p25p1 *p){
 	p->last_tsbk_dibit = p->dibit_clock;
 	p->have_tsbk = true;
       }
-      emit(p,P25_DUID_TSDU,p->tsbk_block,96,block,NULL,NULL,crc);
+      f = (struct p25_frame){ .duid = P25_DUID_TSDU, .block = p->tsbk_block, .nbits = 96, .bits = block, .crc = crc };
+      emit(p,&f);
       // The first bit of a good block says whether it is the last. A block that fails its CRC
       // does not say, so carry on: up to three blocks
       bool const last = crc >= 0 && block[0] != 0;
@@ -447,34 +453,59 @@ static bool dispatch(struct p25p1 *p){
       return true;
     }
   case P25_DUID_PDU:
+  case UNIT_PDU_DATA:
     {
-      // Header block only for now; data blocks follow once the packet assembler is in
-      uint8_t block[96];
-      int const crc = decode_block(p,block);
+      // A header announcing some number of data blocks, then the blocks, all under one frame sync
+      struct p25_block block;
+      int r;
+      if(p->unit == P25_DUID_PDU)
+	r = p25_pdu_header(&p->packet,&block,p->bits,p->phase,p->crc_correction && !p->frame_recovered);
+      else
+	r = p25_pdu_block(&p->packet,&block,p->bits,p->phase);
+      if(r == 0){
+	p->unit = UNIT_PDU_DATA;
+	return true;
+      }
       p->stats.pdu++;
-      emit(p,P25_DUID_PDU,0,96,block,NULL,NULL,crc);
+      f = (struct p25_frame){ .duid = P25_DUID_PDU, .nbits = block.nbits, .bits = block.bits, .crc = r > 0 ? block.crc : -1,
+			      .pdu = r > 0 ? &p->packet : NULL };
+      emit(p,&f);
       return false;
     }
   case P25_DUID_HDU:
     p->stats.hdu++;
+    p25_hdu_decode(&p->word,p->bits);
+    count_word(p,&p->word);
+    f.word = &p->word;
     break;
   case P25_DUID_LDU1:
-    p->stats.ldu1++;
-    break;
   case P25_DUID_LDU2:
-    p->stats.ldu2++;
+    if(p->unit == P25_DUID_LDU1)
+      p->stats.ldu1++;
+    else
+      p->stats.ldu2++;
+    p25_ldu_decode(&p->ldu,p->unit,p->bits,p->confidence);
+    count_word(p,&p->ldu.word);
+    for(int i=0; i < P25_IMBE_FRAMES; i++){
+      p->stats.voice_frames++;
+      p->stats.voice_errors += (uint64_t)p->ldu.voice[i].total;
+    }
+    f.ldu = &p->ldu;
     break;
   case P25_DUID_TDU:
     p->stats.tdu++;
     break;
   case P25_DUID_TDULC:
     p->stats.tdulc++;
+    p25_tdulc_decode(&p->word,p->bits);
+    count_word(p,&p->word);
+    f.word = &p->word;
     break;
   default:
     p->stats.other++;
     break;
   }
-  emit(p,p->unit,0,p->nbits,p->bits,p->confidence,p->phase,0);
+  emit(p,&f);
   return false;
 }
 // One dibit into the framer. The sync correlator sees every dibit, also while a data unit is
