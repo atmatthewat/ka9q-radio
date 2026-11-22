@@ -9,9 +9,67 @@
 #include "digital.h"
 #include "nco.h"
 
+// Theory of operation
+//
+// The chain. A decoder runs its complex baseband stream through these pieces in this order:
+// level control, frequency correction, receive lowpass, symbol timing, and then a one-symbol
+// differential detector whose output make_softdibit() turns into a dibit and a confidence. The
+// envelope ripple measure watches the stream beside the chain and only advises which receive
+// response to use. Nothing here knows about frames: the decoder closes the frequency loop
+// (update_freqtrack()) and tells the timing loop when it is locked (lock_symsync()).
+//
+// Receive filter. A windowed raised cosine lowpass with real symmetric taps, so its phase is
+// linear and its delay a constant (ntaps - 1) / 2 samples. Two responses of different lengths
+// share one delay line, the shorter centred on it, so they have the same delay and switching
+// between them moves nothing in time. init_rrcfilter() makes instead the root raised cosine
+// matched to a transmitter that shapes its symbols with one (P25 Phase 2).
+//
+// Envelope ripple. A linear modulation's envelope dips between symbols, so |x|^2 has a spectral
+// line at the symbol rate; a constant-envelope modulation has none. A one-pole average of
+// |x|^2 e^(-j 2 pi symrate t) measures that line, and dividing by the average of |x|^2 makes the
+// measure independent of level. Only the magnitude is kept: the phase depends on the timing.
+//
+// Level control. Divides by the square root of a slow one-pole average of |x|^2. The Gardner
+// detector's output goes as the square of the amplitude, so the timing loop's gains, and its
+// error limit, mean what they say only at a known level: unity RMS.
+//
+// Frequency. For a tone at f the lag-one product y[i] conj(y[i-1]) has angle 2 pi f / samprate,
+// so the angle of its sum over a block estimates the block's mean frequency, each pair of samples
+// weighted by the product of their amplitudes, unambiguously within +/- samprate / 2. It is the
+// mean of whatever the block holds: signal, noise, a neighbour, and for a 4-level FM signal the
+// mean of the data's deviation too (p25p1.c says what that costs and what it does about it).
+// The loop is first order. A block's residual added to the correction it was measured against
+// is an absolute measurement of the offset, so no integrator is needed for zero steady-state
+// error: the estimate moves toward each measurement through a one-pole lowpass whose corner is
+// the loop's bandwidth (update_freqtrack()). A drift of R Hz/s is followed about R / (2 pi corner)
+// Hz behind.
+//
+// Symbol timing. A fractional resampler makes two outputs per symbol, the symbol and the midpoint
+// between two symbols, each with an 8-tap interpolator chosen from a polyphase bank. The Gardner
+// detector (the midpoint times the difference of the symbols either side of it) needs neither
+// decisions nor carrier phase, so it works while frequency and frame sync are still unknown.
+// Its error drives a proportional-plus-integral loop whose output is the resampling ratio; the
+// integral is the loop's estimate of the symbol rate. The decoder runs the loop wide while it
+// searches and narrows it once frame sync is held. Every output's position is logged with the
+// input it came from, so a past output can be computed again at another timing (symsync_near()),
+// which lets the decoder try other timings on a frame sync that nearly passed without touching
+// the loop.
+//
+// Soft dibits. The decoders take z = y[k] conj(y[k-1]), the phase change over one symbol. For
+// pi/4 DQPSK that is the differential detector. For C4FM, an FM signal whose four deviations
+// (+-600 and +-1800 Hz at 4800 symbols/s) advance the phase by +-45 or +-135 degrees in a symbol,
+// it is the integral of the frequency over the symbol: the integrate-and-dump receiver. Both land
+// on the same four points, which is what lets one chain take both.
+
 // ---------------- receive filter ----------------
 
-// 'ntaps' taps of the response into taps[0..ntaps-1]
+// 'ntaps' taps of the response into taps[0..ntaps-1]: the raised cosine with zero spacing
+// 1 / (2 cutoff), h = sinc(x) cos(pi rolloff x) / (1 - (2 rolloff x)^2), x = 2 cutoff t, times a
+// Hamming window. Before windowing its spectrum is flat to cutoff (1 - rolloff), half amplitude
+// (-6 dB) at cutoff and zero beyond cutoff (1 + rolloff). At |2 rolloff x| = 1 the second factor
+// is 0/0; its limit is pi/4. The window trims the sidelobes left by truncation, and dividing by
+// the sum of the taps makes the DC gain one. The raised cosine here shapes a lowpass response;
+// it is a Nyquist pulse only if cutoff is half the symbol rate, which p25p1.c's is not
 static void design_rxfilter(float *taps,double samprate,double cutoff,int ntaps,double rolloff){
   double const fc = cutoff / samprate; // cycles/sample
   double const mid = (ntaps - 1) / 2.0;
@@ -66,6 +124,11 @@ int add_rxfilter_response(struct rxfilter *f,double samprate,double cutoff,int n
   f->nresponses++;
   return r;
 }
+// The root raised cosine: its square is a raised cosine with zeros at every symbol but the
+// centre, so a transmitter and receiver that both use it have no intersymbol interference at
+// the right sampling instants. h(x), x in symbols, is the textbook expression, with its two
+// 0/0 points (x = 0 and |4 alpha x| = 1) replaced by their limits; truncated at 'span' symbols
+// each side with no window, and scaled to unity DC gain
 int init_rrcfilter(struct rxfilter *f,double samprate,double symrate,double alpha,double span){
   assert(f != NULL);
   if(f == NULL || samprate <= 0 || symrate <= 0 || alpha <= 0 || alpha > 1 || span <= 0)
@@ -141,6 +204,9 @@ void run_rxfilter(struct rxfilter *f,float complex *buffer,int count){
 
 // ---------------- envelope ripple ----------------
 
+// Two one-pole averages with the same factor, alpha = 1 / (time_constant samprate): the power,
+// and the power mixed down by the symbol rate. The rotor is stepped by multiplication, not
+// computed from a phase accumulator, and so is renormalized now and then
 void init_envelope(struct envelope *e,double samprate,double symrate,double time_constant){
   assert(e != NULL);
   memset(e,0,sizeof *e);
@@ -177,6 +243,9 @@ float envelope_ripple(struct envelope const *e){
 
 // ---------------- level control ----------------
 
+// Each sample is divided by the RMS level averaged up to and including itself. The average is
+// slow against the symbol rate, so the gain does not follow the modulation's own envelope.
+// prime_level() starts the average at the first block's mean power instead of at 1
 void init_level(struct level *l,double samprate,double time_constant){
   assert(l != NULL);
   double a = 1.0 / (time_constant * samprate);
@@ -205,7 +274,9 @@ void run_level(struct level *l,float complex *buffer,int count){
 // ---------------- frequency tracking ----------------
 
 // A block whose lag-one coherence is at or below the floor is white-noise-like and carries
-// no frequency; full weight from floor + span up
+// no frequency; full weight from floor + span up. Coherence is |sum of y[i] conj(y[i-1])|
+// divided by the sum of |y[i-1]|^2: 1 for a pure tone, and for white noise alone of the order
+// of 1 / sqrt(samples in the block), since the products then add with random phases
 static double const Coherence_floor = 0.15;
 static double const Coherence_span = 0.25;
 // Above this filtered residual the unfiltered one may stand in for it (a cold start far off
@@ -231,7 +302,9 @@ static inline double lagone_hz(struct lagone const *s,double samprate){
   return atan2(s->im,s->re) * samprate / (2 * M_PI);
 }
 void set_freqtrack_corner(struct freqtrack *ft,double corner){
-  // Per-sample one-pole factor for this corner; a block of n samples applies it n times
+  // Per-sample one-pole factor for this corner; a block of n samples applies it n times.
+  // y += a (x - y) has |H(w)|^2 = a^2 / (1 - 2 (1 - a) cos w + (1 - a)^2); setting that to 1/2
+  // (-3 dB) at w gives a^2 + 2 (1 - c) a - 2 (1 - c) = 0, c = cos w, whose positive root is this
   double const w = 2 * M_PI * corner / ft->samprate;
   double const c = cos(w);
   ft->sample_factor = c - 1 + sqrt(c * c - 4 * c + 3);
@@ -240,7 +313,7 @@ void init_freqtrack(struct freqtrack *ft,double samprate,double corner){
   assert(ft != NULL);
   memset(ft,0,sizeof *ft);
   ft->samprate = samprate;
-  ft->max_offset = 6000;
+  ft->max_offset = 6000; // Hz: the estimate and every seed or adjustment are clamped to +/- this
   set_freqtrack_corner(ft,corner);
 }
 // A known offset becomes the estimate. Like every correction it applies from the next block;
@@ -272,6 +345,10 @@ void measure_freqtrack(struct freqtrack *ft,float complex const *buffer,int coun
   ft->unfiltered = lag_one(buffer,count);
   ft->unfiltered_pending = true;
 }
+// The filtered and unfiltered sums come from the same block after the same correction, so
+// they differ only in what the receive filter removed: noise and neighbours away from the
+// signal, which pull the unfiltered one toward the centre of the stream, and, far off centre,
+// part of the signal itself, which pulls the filtered one toward zero
 bool freqtrack_residual(struct freqtrack const *ft,float complex const *buffer,int count,float *residual){
   if(count <= 1)
     return false;
@@ -288,6 +365,12 @@ bool freqtrack_residual(struct freqtrack const *ft,float complex const *buffer,i
   *residual = (float)r;
   return true;
 }
+// The loop update. The block was rotated by 'applied', so applied + residual is the block's
+// offset itself. With its input held at x for n samples, y += a (x - y) moves y the fraction
+// 1 - (1 - a)^n of the way to x; the estimate moves that far toward this block's measurement,
+// so block by block the loop is the per-sample lowpass with the chosen corner, whatever the
+// block size. The step is scaled by the coherence weight (0 for a block like white noise) when
+// measure_freqtrack() saw the block. The new estimate is the correction for the next block
 void update_freqtrack(struct freqtrack *ft,bool valid,float residual,int count){
   if(count <= 0)
     return;
@@ -357,6 +440,16 @@ static double dsinc(double x){
 // of a sample before window[4], for a signal band-limited to a quarter of the sample rate.
 // Minimizing the integral over |f| < B of |sum h[i] e^(-j 2 pi f i) - e^(-j 2 pi f p)|^2 gives
 // R h = r with R[i][j] = sinc(2B(i-j)) and r[i] = sinc(2B(i-p))
+// window[0] is the oldest of the eight samples and window[7] the newest, so p = 4 - k/nphases
+// lies between window[3] and window[4], in the middle of the span, where an interpolator of
+// this length errs least; every output is therefore 3 + k/nphases samples behind the newest
+// sample in. Arm 0 is window[4] itself: r is then column 4 of R, and h the unit vector.
+// B = 1/4 suits a signal at four or more samples per symbol after the receive lowpass; energy
+// beyond a quarter of the sample rate is interpolated less accurately. The error of a flat
+// band-limited signal is what is minimized, with no weighting by the signal's own spectrum.
+// Computed for 128 steps these taps agree with GNU Radio's MMSE interpolator table (129 x 8
+// values) to its printed precision, worst difference 5e-7; they are computed here from the
+// definition, not copied. The arms are the same design at whatever step nphases gives
 static int design_interpolator(float *taps,int nphases){
   double const b2 = 2 * 0.25;
   for(int k=0; k < nphases; k++){
@@ -379,6 +472,24 @@ static int design_interpolator(float *taps,int nphases){
 // second-order digital loop. The loop's output is the resampling ratio r, held for the next
 // 2/r input samples, so a ratio step moves the next symbol by 2 dr / r^2 samples; scaling by
 // r^2 / 2 makes 'bw' the bandwidth of the timing itself
+// The loop updates once per symbol. Let tau be the timing in input samples and K = error_gain
+// the detector's slope, error per input sample of timing offset. A late sample gives e > 0,
+// which raises the ratio and brings the next outputs earlier. kp e lasts one symbol, so it moves
+// the timing once; ki e stays in the integral, a rate. With P = K kp 2 / r^2 and I = K ki 2 / r^2
+// the closed loop's characteristic polynomial is
+//   z^2 - (2 - P - I) z + (1 - P)
+// Matching its roots to z = e^(sT) at the poles of the continuous second-order loop, natural
+// frequency wn and damping zeta, with theta = wn T = bw:
+//   1 - P = e^(-2 zeta theta)
+//     so P = 2 e^(-zeta theta) sinh(zeta theta)
+//   2 - P - I = 2 e^(-zeta theta) cos(wd T)
+//     so I = 2 (1 - e^(-zeta theta) (sinh(zeta theta) + cos(wd T)))
+// where wd T = theta sqrt(1 - zeta^2), cos becoming cosh of theta sqrt(zeta^2 - 1) above zeta = 1
+// and 1 at it. kp and ki below are these divided by K 2 / r^2. r is the nominal ratio, not the
+// current one; the integral stays within the rate limit of it. Since K is per input sample, the
+// same signal gives a K that falls as the sample rate rises (it is the slope per symbol over the
+// samples per symbol), and an error_gain right at one sample rate is not right at another.
+// With zeta = 1 the timing settles with a time constant of about 1 / bw symbols
 static void set_gains(struct symsync *s,float bw){
   float const zeta = s->damping;
   float const k0 = 2.0f / s->error_gain;
@@ -406,6 +517,7 @@ int init_symsync(struct symsync *s,double samprate,double symrate,int nphases,
   s->base_ratio = (float)(2 * symrate / samprate);
   s->ratio = s->base_ratio;
   s->integral = s->base_ratio;
+  // The ratio itself, proportional term included, stays within 10% of nominal
   s->out_min = 0.9f * s->base_ratio;
   s->out_max = 1.1f * s->base_ratio;
   // The integral is the loop's estimate of the symbol rate error; without signal it random
@@ -438,6 +550,12 @@ void reset_symsync_rate(struct symsync *s){
   s->ratio = s->base_ratio;
   s->integral = s->base_ratio;
 }
+// The accumulator counts outputs: each input sample adds the ratio (outputs per input sample),
+// and each time it reaches 1 an output instant has passed since the previous sample. Outputs
+// alternate midpoint and symbol; only their order says which is which (slip_symsync() swaps
+// them). The loop runs at each symbol, from the error of that symbol, the midpoint before it
+// and the symbol before that. Each output's newest input sample and arm are logged for
+// symsync_near(), and the input itself is kept in 'history'
 void run_symsync(struct symsync *s,float complex const *buffer,int count,symsync_output out,void *arg){
   assert(s != NULL && s->taps != NULL);
   for(int k=0; k < count; k++){
@@ -474,6 +592,7 @@ void run_symsync(struct symsync *s,float complex const *buffer,int count,symsync
       } else {
 	// Gardner: the midpoint times the difference of the symbols either side of it
 	float e = crealf(s->mid) * (crealf(y) - crealf(s->prev)) + cimagf(s->mid) * (cimagf(y) - cimagf(s->prev));
+	// Telemetry only: |e| over the energy, averaged over about 100 symbols
 	float const energy = cnrmf(s->mid) + cnrmf(y);
 	if(energy > 1e-20f)
 	  s->error_ema += 0.01f * (fabsf(e) / energy - s->error_ema);
@@ -484,6 +603,8 @@ void run_symsync(struct symsync *s,float complex const *buffer,int count,symsync
 	if(s->ignore_next_error)
 	  e = 0;
 	s->ignore_next_error = false;
+	// Clipped, so one burst of noise or a symbol far off moves the timing only so far; far from
+	// lock the loop then moves at a bounded rate rather than in proportion to the error
 	e = e > 0.15f ? 0.15f : e < -0.15f ? -0.15f : e;
 	s->integral += s->ki * e;
 	s->integral = s->integral > s->int_max ? s->int_max : s->integral < s->int_min ? s->int_min : s->integral;
@@ -500,6 +621,9 @@ void run_symsync(struct symsync *s,float complex const *buffer,int count,symsync
     }
   }
 }
+// A past output at other timing, from the stored input: the same interpolator, moved by whole
+// arms, carrying into the next or previous input sample as the arm wraps. Fails when the
+// output or the samples it needs have left the history, or are not in yet
 bool symsync_near(struct symsync const *s,uint64_t output,int arms,float complex *result){
   if(output >= s->outputs_out || s->outputs_out - output > SYMSYNC_OUTPUTS)
     return false;
@@ -528,6 +652,8 @@ bool symsync_near(struct symsync const *s,uint64_t output,int arms,float complex
 }
 // Move the sampling instant through the resampler's phase only: the loop's ratio and integral
 // are untouched. The resampler can only move an output within the current input sample
+// The accumulator counts outputs, two per symbol; taking from it delays the next output, so a
+// positive 'symbols' samples later
 void nudge_symsync(struct symsync *s,float symbols){
   symbols = symbols > 0.49f ? 0.49f : symbols < -0.49f ? -0.49f : symbols;
   s->accumulator += -symbols * 2;
@@ -550,6 +676,12 @@ void slip_symsync(struct symsync *s){
 
 // ---------------- soft symbols ----------------
 
+// z is the phase change over one symbol (see the theory above). The dibit is its quadrant: the
+// msb is 1 when the imaginary part is negative, the lsb 1 when the real part is negative. That
+// is a Gray mapping: a step to a neighbouring point is one bit wrong. The confidence,
+// sqrt(2) min(|cos|,|sin|) of the phase, is 1 at the four ideal points and 0 on an axis; it
+// ignores |z|, so a weak symbol with the right phase is as confident as a strong one. It is
+// the margin of the less certain of the two bits: near +-90 degrees the lsb, near 0 or 180 the msb
 struct softdibit make_softdibit(float complex z){
   struct softdibit sd;
   float const re = crealf(z);

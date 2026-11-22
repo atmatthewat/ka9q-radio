@@ -9,6 +9,47 @@
 #include "rs63.h"
 #include "p25p1unit.h"
 
+// Theory of operation
+//
+// What arrives. One data unit's payload from p25p1.c: the bits after the NID with the status
+// symbols taken out, in the order received, and for each bit the confidence of its dibit, and
+// for each dibit its phase change. Everything here works on that, one data unit at a time.
+//
+// Hexbit words. The header, link control and encryption sync words are strings of 6-bit
+// symbols (hexbits) under a Reed-Solomon code over GF(64), each hexbit (or pair) sent inside a
+// short binary codeword:
+//   HDU     RS(36,20,17), each hexbit the data of a Golay(18,6,8) word
+//   TDULC   RS(24,12,13), each pair of hexbits the data of a Golay(24,12,8) word
+//   LDU1    RS(24,12,13) link control, each hexbit in a Hamming(10,6,3) word
+//   LDU2    RS(24,16,9) encryption sync, the same way
+// The inner code corrects what it can, and a word it cannot correct marks its hexbits as
+// erasures for the outer code; Reed-Solomon corrects e errors and f erasures when 2e + f does
+// not exceed the parity count, so an erasure costs half an error. The word is good only if the
+// Reed-Solomon decode succeeds; p25_word counts what each stage did.
+//
+// LDUs. A voice data unit is nine IMBE frames with the 24 Hamming words spread between them and
+// 32 bits of low speed data before the last frame (layout below). The LDU has a soft stage: a
+// Hamming correction of a bit whose confidence is high is refused and the word erased, since one
+// error in a confident bit is less likely than two errors elsewhere; if that erases anything,
+// Reed-Solomon runs on the result and writes its corrected hexbits back into the payload. The
+// word is then decoded again from hard bits.
+//
+// IMBE frames (TIA-102.BABA). 144 bits: c0-c3 Golay(23,12), c4-c6 Hamming(15,11), c7 seven bits
+// unprotected, 88 information bits u0-u7 in all. They are interleaved over the frame, and c1-c6
+// are masked by a pseudo-random sequence seeded from u0, the twelve data bits of c0. A wrong c0
+// thus unmasks the rest with the wrong sequence, which shows as many corrections in c1-c6: the
+// total count, which the vocoder's repeat rule reads with c0's own count, rises with it. The
+// counts per codeword are delivered with the bits; deciding what to do with a bad frame is the
+// vocoder's job (p25audio.c).
+//
+// Trunking blocks and packet data (TIA-102.BAAA). 196 bits, 98 dibits, 49 four-bit trellis
+// symbols, interleaved so that symbols sent one after another are four apart in the trellis
+// (see p25_data_deinterleave), which spreads a burst of errors along the decoder's path. Rate
+// 1/2 gives 96 bits (a trunking block or packet header: 80 bits and their CRC-CCITT; or an
+// unconfirmed packet's data block), rate 3/4 144 (a confirmed packet's data block). With
+// phases supplied the Viterbi decoder is soft
+// (dfec.c).
+
 // ---------------------------------------------------------------------------
 // Hexbit words (TIA-102.BAAA)
 
@@ -108,8 +149,8 @@ bool p25_tdulc_decode(struct p25_word *w,uint8_t const bits[P25_TDULC_BITS]){
 // LDU1 and LDU2
 
 // The LDU payload: IMBE frames 1 and 2, then six groups of four Hamming(10,6,3) words
-// (40 bits) each followed by an IMBE frame, except that the sixth group is followed by
-// the 32 low speed data bits before frame 9
+// (40 bits) each followed by an IMBE frame (frames 3 to 8), then the 32 low speed data bits
+// and frame 9
 static int const Imbe_offset[P25_IMBE_FRAMES] = {0, 144, 328, 512, 696, 880, 1064, 1248, 1424};
 enum { LSD_OFFSET = 1392 };
 
@@ -128,7 +169,8 @@ bool p25_ldu_decode(struct p25_ldu *ldu,int duid,uint8_t bits[P25_LDU_BITS],floa
   bool erased[24];
 
   if(conf != NULL){
-    // Soft stage, in place
+    // Soft stage, in place. The threshold is on the confidence of the bit's dibit, which is
+    // the margin of that dibit's less certain bit (dsync.c), so it is conservative for the other
     ldu->soft = true;
     for(int i = 0; i < 24; i++){
       int const s = ldu_word(i);
@@ -220,6 +262,9 @@ void p25_imbe_decode(struct p25_imbe *f,uint8_t const raw[P25_IMBE_BITS]){
   // Deinterleave: the codeword bits, c0 msb first through c7 lsb, read as six rows of 24
   // are sent column by column, six bits (three dibits) per column; in the odd columns the
   // two bits of each dibit are exchanged
+  // The six bits of a column, three dibits received one after another, land in six different
+  // rows, 24 bits apart in the codeword vector, so a burst that short puts at most one error
+  // in each
   uint8_t v[144];
   for(int j = 0; j < 144; j++){
     int const col = j / 6;
@@ -254,6 +299,9 @@ void p25_imbe_decode(struct p25_imbe *f,uint8_t const raw[P25_IMBE_BITS]){
 // ---------------------------------------------------------------------------
 // P25 Phase 1 data deinterleave
 
+// Received bit i goes to position p25_data_deinterleave[i]. The table moves whole 4-bit trellis
+// symbols: received symbols 0-12 are trellis symbols 0, 4, .. 48, then 13-24 are 1, 5, .. 45,
+// 25-36 are 2, 6, .. 46 and 37-48 are 3, 7, .. 47
 uint8_t const p25_data_deinterleave[196] = {
   0, 1, 2, 3, 16, 17, 18, 19, 32, 33, 34, 35, 48, 49, 50, 51,
   64, 65, 66, 67, 80, 81, 82, 83, 96, 97, 98, 99, 112, 113, 114, 115,

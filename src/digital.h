@@ -83,6 +83,7 @@ struct freqtrack {
   struct lagone unfiltered;
   uint64_t phase;         // rotation oscillator
 };
+// corner: the loop's bandwidth, Hz (the -3 dB point of its one-pole response)
 void init_freqtrack(struct freqtrack *ft,double samprate,double corner);
 void set_freqtrack_corner(struct freqtrack *ft,double corner);
 void seed_freqtrack(struct freqtrack *ft,float offset);
@@ -133,6 +134,11 @@ struct symsync {
     uint16_t arm;
   } outputs[SYMSYNC_OUTPUTS];
 };
+// nphases: interpolator arms per input sample. acquire_bw, track_bw: the loop's natural
+// frequency, radians per symbol (time constant about 1 / bw symbols at damping 1). damping: zeta.
+// error_gain: the timing detector's slope, error per input sample of timing offset (see
+// set_gains() in dsync.c). rate_limit: the fraction by which the symbol rate estimate may
+// depart from nominal
 int init_symsync(struct symsync *s,double samprate,double symrate,int nphases,
 		 float acquire_bw,float track_bw,float damping,float error_gain,float rate_limit);
 void free_symsync(struct symsync *s);

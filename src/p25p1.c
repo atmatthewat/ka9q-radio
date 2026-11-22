@@ -14,6 +14,82 @@
 #include "rs63.h"
 #include "p25p1.h"
 
+// Theory of operation
+//
+// The chain. p25p1_samples() takes each block of IQ through, in order: level control to unity
+// RMS; the envelope ripple measure, which picks the receive response; rotation by the frequency
+// correction decided after the previous block; the lag-one sum of the corrected block (wide, for
+// the frequency loop's coherence test); the receive lowpass; the lag-one residual of the filtered
+// block; and the timing loop, which calls back for every symbol and every midpoint. Each symbol's
+// phase change over one symbol, z = y[k] conj(y[k-1]), becomes a soft dibit (dsync.c) that goes
+// to the framer, one dibit at a time. After the block the frequency loop is closed with that
+// block's residual, and changes of loop bandwidth asked for by the framer are applied. The
+// pieces themselves are in dsync.c, which explains their methods; this file sets them up for
+// P25 and drives them from what frame sync says.
+//
+// The modulations. C4FM is 4-level FM at 4800 symbols/s, deviations +-600 and +-1800 Hz, so
+// each symbol advances the phase by +-45 or +-135 degrees: the phase change over a symbol is
+// the integrate-and-dump detector of the FM. The linear simulcast modulations (CQPSK, LSM) are
+// pi/4 DQPSK with those same four phase changes, for which it is the differential detector.
+// So one chain decodes both. They differ in their envelope, constant for C4FM and dipping
+// between symbols for the linear ones, and that is what chooses the receive filter.
+//
+// The receive filter. Two responses on one delay line, sharp and gentle (see the constants
+// below for what each does better); both are windowed raised cosine lowpass responses -6 dB at
+// 3300 Hz, shaping the band rather than acting as a Nyquist filter for 4800 symbols/s. The
+// envelope ripple (digital.h) is near 0 for C4FM and noise, and well above for simulcast:
+// gentle above Ripple_gentle (and above a threshold that starts high and falls as the average
+// fills), sharp below Ripple_sharp, between them no change. Sharp is chosen only while a
+// signal is known to be there, since noise alone also has no ripple.
+//
+// Frame sync. Every data unit starts with 24 dibits of frame sync, all +3 or -3 symbols (+-135
+// degree phase changes), and a 64-bit NID (network identifier). The framer keeps a window of the
+// last 57 dibits (sync, NID and the status symbol inside it) and correlates the phases of its
+// first 24 with the pattern's: the sum of cos(received - ideal), 24 for a perfect match, and
+// independent of amplitude. A window is accepted only when its NID also decodes:
+// a strong correlation (above 17) sets the channel's NAC, a weak one (above 10) is taken only
+// for that NAC. The correlator keeps running while a data unit is assembled, and a sync whose
+// NID decodes there ends the unit in progress.
+//
+// The NID. 12 bits NAC, 4 bits DUID, protected by BCH(63,16,23), plus a parity bit outside the
+// code. It is decoded errors-only, then with the less certain bit of each weak dibit erased
+// (rs63.c), and on a channel carrying trunking blocks once more with the known NAC in place of
+// the received one; that is allowed only where a CRC will check the result (decode_nid()).
+//
+// Framing. A status symbol (one dibit) follows every 35 dibits, counted from the start of the
+// frame sync; the one inside the NID is skipped by the window, and the framer skips the rest as
+// it assembles the data unit, whose size is fixed by its DUID (unit_size()). Data units with a
+// trailing status symbol skip it too. A trunking data unit holds one to three 196-bit blocks;
+// the first bit of a block that passes its CRC says whether it is the last.
+//
+// Acquisition and tracking. Searching, the timing loop is wide (Acquire_bw) and the frequency
+// loop uses the lag-one estimate with a 10 Hz corner. On the third accepted sync since the last
+// loss the decoder is tracking: frequency (by default) from the decisions with a 1 Hz corner,
+// the timing loop at Track_bw, and after Settle_time of held sync at Settled_bw. LOSS_DIBITS of
+// searching with no sync (0.42 s) is a loss: wide loops again, and the symbol rate estimate is
+// forgotten.
+//
+// Frequency. The lag-one estimate needs no decisions and so works from cold, but it reads the
+// mean frequency, which a 4-level signal's data moves. Once frame sync is held the phase error
+// of each symbol against its decision is used instead: it has no data bias, but is good only to
+// +-600 Hz and aliases every 1200 Hz, which held frame sync makes safe. A known offset (the
+// control channel's, when a voice channel is granted) can seed the estimate.
+//
+// Timing search. A sync that nearly passed may have been sampled at poor timing. Its window is
+// computed again at nearby timings from the timing loop's history, hill-climbing the correlation,
+// and the best is offered to the framer; if it starts a data unit the resampler is moved there.
+// Also, until frame sync is held, the midpoints between symbols are correlated too, since the
+// Gardner loop can settle half a symbol off; a sync only they show moves the timing onto them.
+// A re-timed or midpoint window must be at least a weak sync with the channel's NAC, because a
+// search over many timings passes the strong threshold on noise far more often than one window.
+//
+// What is soft. The sync correlation uses phases. The NID uses dibit confidences to choose
+// erasures. Trunking blocks and packet data blocks are Viterbi decoded on the received phases.
+// LDUs pass per-bit confidences to a soft Hamming stage before their Reed-Solomon code. The
+// header (HDU), the terminator's link control (TDULC) and the IMBE voice codewords are decoded
+// from hard bits, with failed inner codewords as Reed-Solomon erasures where there is an outer
+// code.
+
 // Timing loop bandwidths (normalized, per symbol): wide to acquire, narrower once frame sync is
 // held, and narrower again once it has been held a while. Going straight to the narrowest on the
 // first lock costs data units at the start of a transmission: the timing has not finished
@@ -22,12 +98,17 @@ static float const Acquire_bw = 0.08f;
 static float const Track_bw = 0.016f;
 static float const Settled_bw = 0.004f;
 static float const Settle_time = 0.5f; // seconds of held frame sync before the last step
+// The bandwidths are the loop's natural frequency in radians per symbol; at damping 1 (critical:
+// no overshoot) the time constants are about 1 / bw symbols: 12.5, 62.5 and 250 symbols, or 2.6,
+// 13 and 52 ms
 static float const Loop_damping = 1.0f;
+// The timing detector's slope as set_gains() in dsync.c takes it, error per input sample
 static float const Error_gain = 0.42f;
 // Symbol rate error the timing loop may integrate: transmitter plus receiver clock errors are tens of ppm
-static float const Rate_limit = 0.0003f;
+static float const Rate_limit = 0.0003f; // 300 ppm
+// Interpolator arms per input sample: steps of 1/32 sample, 1/128 symbol at 19,200 Hz
 static int const Interp_phases = 32;
-// Frequency tracking corners
+// Frequency tracking corners: time constants 1 / (2 pi corner), 16 ms and 160 ms
 static double const Afc_acquire_corner = 10.0; // Hz
 static double const Afc_track_corner = 1.0;
 // Receive lowpass between the frequency correction and the timing loop, in two responses, both
@@ -56,6 +137,8 @@ static double const Envelope_time = 0.2; // seconds
 // radiod's channel filter leaves no more independent noise samples than that
 static double const Ripple_start = 3.0;
 static double const Floor_rate = 19200.0; // Hz
+// Level averaging: 104 ms, 500 symbols, long against a symbol so the gain does not follow
+// the modulation
 static double const Level_time = 1.0 / 9.6;   // seconds
 
 // Framing
@@ -65,7 +148,7 @@ enum {
   STATUS_INTERVAL = 35,   // a status symbol follows every 35 dibits
   AFTER_NID = 21,         // dibits since the last status symbol when the NID ends
   MAX_BITS = 1680,        // longest data unit payload
-  LOSS_DIBITS = 2000,     // this long searching without a sync is a loss of signal
+  LOSS_DIBITS = 2000,     // this long searching without a sync is a loss of signal (0.42 s)
   SECOND_CHANCE_DIBITS = 4800, // 1 s
 };
 // Internal continuations of a data unit, beyond the 16 DUIDs
@@ -88,6 +171,8 @@ static float const Offer_sync = 9.9f;
 static float const Midpoint_sync = 10.0f;
 static float const Max_retime = 0.45f; // symbols
 
+// The frame sync as dibits: 1 (01) is the +3 symbol, a +135 degree phase change, 3 (11) the -3
+// symbol, -135 degrees. The ideal phase change of each dibit, indexed by dibit
 static uint8_t const Sync_pattern[SYNC] = { 1,1,1,1,1,3,1,1,3,3,1,1,3,3,3,3,1,3,1,3,3,3,3,3 };
 static float const Nominal_phase[4] = { M_PI_4, 3 * M_PI_4, -M_PI_4, -3 * M_PI_4 };
 
@@ -210,6 +295,9 @@ static int unit_size(int unit){
 static bool unit_trailing_status(int unit){
   return unit == P25_DUID_HDU || unit == P25_DUID_TDU || unit == P25_DUID_LDU1 || unit == P25_DUID_LDU2 || unit == P25_DUID_TDULC;
 }
+// The framer is in one of three states: assembling a data unit, skipping the status symbol
+// that trails one ('trailing'), or searching for the next frame sync. A sync accepted while
+// searching starts a unit with the next dibit; assembling, it replaces the unit in progress
 static inline bool searching(struct p25p1 const *p){
   return !p->assembling && p->trailing == 0;
 }
@@ -323,6 +411,7 @@ static bool decode_nid(struct p25p1 *p,struct wdibit const *w,bool allow_known,i
   *duid = bits[12] << 3 | bits[13] << 2 | bits[14] << 1 | bits[15];
   return true;
 }
+// Sum over the sync dibits of cos(phase - ideal phase), from the stored cos and sin of each
 static float window_correlation(struct p25p1 const *p,struct wdibit const *w){
   float corr = 0;
   for(int i=0; i < SYNC; i++)
@@ -562,6 +651,7 @@ static void frame_dibit(struct p25p1 *p,struct softdibit const *sd){
     p->trailing--; // absorbing the status symbol after a data unit
     return;
   }
+  // status_counter is the dibits since the last status symbol, AFTER_NID at the end of the NID
   if(++p->status_counter == STATUS_INTERVAL + 1){
     p->status_counter = 0; // a status symbol: skip it
     return;

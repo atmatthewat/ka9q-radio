@@ -47,9 +47,10 @@ float trellis_34_decode_soft(uint8_t *out,float const *phase,int nsyms);
 uint16_t crc_ccitt(uint8_t const *bits,int n);
 // 80 data bits followed by their 16-bit CRC. Returns 0 if the CRC checks (also when
 // correct_one is set and the single bit error was in the CRC itself), 1 if a single data bit
-// error was found and fixed (only with correct_one), -1 otherwise
+// error was found and fixed (only with correct_one), -1 otherwise. With correct_one a random
+// block passes about once in 676 tries instead of once in 65,536 (see dfec.c)
 int crc_ccitt80_check(uint8_t bits[96],bool correct_one);
-// Phase 2 MAC CRC-12: x^12+x^11+x^3+x^2+x+1, zero preset, msb first, inverted
+// Phase 2 MAC CRC-12: x^12+x^11+x^7+x^4+x^2+x+1 (0x897), zero preset, msb first, inverted
 uint16_t crc12(uint8_t const *bits,int n);
 // n data bits (144 FACCH, 168 SACCH) followed by their 12-bit CRC
 bool crc12_check(uint8_t const *bits,int n);

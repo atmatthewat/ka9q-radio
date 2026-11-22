@@ -29,6 +29,79 @@
 #include "p25p2mac.h"
 #include "p25audio.h"
 
+// Theory of operation
+//
+// What comes in. Phase 1 data units (p25_audio_unit()) and Phase 2 bursts of one timeslot
+// (p25_audio_burst()), each with the time it ended on the IQ sender's clock and, where the
+// channel has trunking logic, that logic's label for a voice unit. A voice unit is an LDU (nine
+// IMBE frames, 180 ms) or a 4V or 2V burst (four or two AMBE+2 frames). What goes out, per
+// channel: speech, 8 kHz PCM decoded here, and the vocoder frames as received, on two RTP
+// streams with the same SSRC, timestamps and marker bits for the same frames.
+//
+// The rule. Nothing from an encrypted voice unit, or from one not yet known to be clear, is
+// decoded to speech or sent as a clear frame (p25audio.h states it for callers). It is kept as
+// a small state per channel, reset by every end of transmission:
+//  - 'clear': a word that passed error correction said ALGID 0x80 in this transmission: a
+//    header, an encryption sync, a MAC PTT or an ESS (got_crypto()). Only 0x80 counts; 0x00
+//    is encrypted. p25_decode_es() reports an all-zero LDU2 encryption sync as 0x80.
+//  - 'encrypted': a word said otherwise: such a word with another ALGID, link control marked
+//    protected, or a voice channel user word (link control or MAC) with the service options'
+//    encryption bit. It stays set for the rest of the transmission, whatever comes after.
+//  - the held queue: voice units that may not go yet, in order of arrival, each with its own
+//    time, position and encryption parameters, and whether the trunking logic has passed it
+//    ('trunk_clear': labelled clear, or the channel has no such logic).
+// A unit arriving goes out at once only when clear, not encrypted, passed by the trunking logic
+// and nothing older is waiting; otherwise it is held. The queue is sent, front first, as long
+// as its front unit is passed and the state is clear and not encrypted (flush_held()). Units
+// sent late keep their original timestamps: the speech is the same, only later. The queue is
+// bounded (P25_AUDIO_MAX_HELD units, P25_AUDIO_MAX_HELD_FRAMES frames); when full, the oldest
+// is dropped.
+//
+// What un-confirms. Becoming encrypted: at the next voice unit what is held goes out as
+// encrypted frames on a frame stream that asked for them, and is otherwise dropped, and no
+// speech follows. A gap in the voice long enough to hide the end of one transmission and the
+// start of the next (voice_gap()): clear is withdrawn until a new word says so, and if the state
+// was not clear everything held is dropped, because the word that would release it might
+// belong to the next transmission (units held while clear, waiting only for the trunking
+// logic, stay). The gaps:
+//  - Phase 1: more than one and a half voice units between two LDUs, that is, one or more
+//    LDUs lost (an LDU follows every 864 dibits);
+//  - Phase 2: two or more places of the timeslot in a row (voice bursts, FACCH, SACCH) where
+//    nothing decoded, since a lost END PTT and a lost PTT each take at least one; on Phase 2
+//    the encryption parameters received so far are forgotten too.
+// Link control or a MAC voice channel user word naming another talkgroup, unit or talker than
+// the transmission's means one ended and another began unseen: the transmission is ended there.
+//
+// What ends a transmission (end_transmission(): held units dropped, streams closed): Phase 1
+// a header (it starts a new one), TDU or TDULC; Phase 2 a MAC PTT (likewise), END PTT, IDLE or
+// HANGTIME; a new talker as above; a voice unit overdue by more than Hang (p25_audio_poll());
+// and the trunking logic ending the call.
+//
+// The trunking logic's labels act on the unit alone: NONE drops it, ENCRYPTED treats it and
+// what is held as encrypted without setting 'encrypted' (the logic may change its mind), HOLD
+// holds it until p25_audio_release() says which.
+//
+// Encryption parameters for the frame stream. ALGID, KID and MI received in one superframe
+// (Phase 1: an LDU1 and LDU2 pair; Phase 2: a voice cycle of 18 frames) are the ones for the
+// next, so each frame carries the parameters last received before its superframe began,
+// flagged fresh if they came just before it (Phase 1: one voice unit before; Phase 2: in the
+// previous cycle, or a PTT).
+//
+// The vocoder. IMBE frames are decoded with mbelib's parameter decoding and synthesis, but
+// with the frame repeat and mute rules of TIA-102.BABA applied here from the error counts of
+// the channel decoder (c0's, and the total over c0-c6), in place of mbelib's own. AMBE+2 frames
+// go through mbelib's own rules. A lost frame is repeated, and after Max_repeats repeats in a
+// row the output is muted.
+//
+// RTP. A transmission's first timestamp is the sender's clock, at 8 kHz, at the first frame's
+// start, so a recording lines up with the IQ; then 160 per frame, one packet per frame. The
+// first packet carries the marker bit, and a status packet goes out before it and after every
+// Status_interval data packets, as radiod sends them. Frames lost within a transmission are
+// filled (repeated then muted in speech, flagged lost in frames) so the timestamps stay
+// continuous; a gap longer than Hang, in frames or in sender time, starts a new transmission
+// instead. Sequence numbers are kept per SSRC in the shared group, so a talkgroup's stream stays
+// continuous when its calls move between channels.
+
 // One vocoder frame is 20 ms; the RTP clock is the sender's clock at 8 kHz
 #define NS_PER_SAMPLE (BILLION / P25_AUDIO_SAMPRATE)          // 125,000
 #define FRAME_NS ((int64_t)P25_AUDIO_FRAME * NS_PER_SAMPLE)   // 20 ms
@@ -42,7 +115,9 @@
 #define P2_SUPERFRAME_DIBITS (P25P2_SUPERFRAME_SLOTS * P2_SLOT_DIBITS) // 2160, 360 ms
 #define P2_CYCLE_FRAMES 18
 
-static int64_t const Hang = BILLION / 2;  // A gap in voice longer than this ends the transmission
+// A gap in voice longer than this ends the transmission. Within it lost frames are filled: on
+// Phase 1 up to two lost voice units (360 ms); a third makes 540 ms and starts a new transmission
+static int64_t const Hang = BILLION / 2;
 static int const Status_interval = 25;    // Data packets between status packets: radiod's default 'update' (defaults.h)
 #ifdef HAVE_MBELIB
 static int const Max_repeats = 3;         // Consecutive frame repeats before muting, as mbelib and jmbe do
@@ -132,6 +207,10 @@ static enum p25_voice ambe_decode(struct p25_vocoder *v,int16_t pcm[P25_AUDIO_FR
 // IMBE, TIA-102.BABA: eR = 0.95 eR + 0.000365 eT; repeat the previous frame when e0 >= 2 and
 // eT >= 10 + 40 eR (or when the fundamental frequency is invalid); mute while eR > 0.0875,
 // and after more than three repeats in a row
+// 0.000365 is 0.05 / 137, 137 being the bits under c0-c6's codes, so eR is a one-pole average
+// over about 20 frames of the fraction of protected bits corrected: an estimate of the channel's
+// bit error rate, muting above 8.75%. The repeat rule wants two or more errors in c0 (whose
+// data also seeds the mask of c1-c6) and a total above a threshold that rises with the rate
 enum p25_voice p25_vocoder_decode(struct p25_vocoder *v,int16_t pcm[P25_AUDIO_FRAME],uint8_t const *bits,int e0,int total){
   assert(v != NULL && pcm != NULL);
 #ifdef HAVE_MBELIB

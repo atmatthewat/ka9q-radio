@@ -102,7 +102,8 @@ void p25p1_set_decision_directed(struct p25p1 *p,bool enable); // frequency from
 void p25p1_set_crc_correction(struct p25p1 *p,bool enable);    // single-bit correction of trunking blocks
 void p25p1_set_sync_search(struct p25p1 *p,bool retime,bool midpoint); // timing search around near-miss syncs
 // Timing loop bandwidths once frame sync is held: 'track' at once, 'settled' after 'settle_time'
-// seconds of held sync. A negative value keeps the default
+// seconds of held sync. A negative value keeps the default. Bandwidths are the timing loop's
+// natural frequency in radians per symbol (defaults 0.016 and 0.004, after 0.5 s)
 void p25p1_set_track_bandwidth(struct p25p1 *p,float track,float settled,float settle_time);
 void p25p1_set_rxfilter(struct p25p1 *p,enum p25_rxfilter mode); // P25_FILTER_AUTO is the default
 float p25p1_frequency_offset(struct p25p1 const *p); // Hz, estimated carrier offset

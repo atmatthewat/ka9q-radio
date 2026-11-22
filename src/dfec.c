@@ -12,6 +12,47 @@
 
 #include "dfec.h"
 
+// Theory of operation
+//
+// The block code decoders are bounded-distance decoders: they correct every error pattern within
+// the radius the code guarantees, and beyond it either return -1 or reach some other codeword
+// (a perfect code never returns -1). The Viterbi decoders return the most likely path whatever
+// was received and leave the judgment to a CRC.
+//
+// Golay. The binary Golay(23,12,7) code, generator g(x) = x^11 + x^10 + x^6 + x^5 + x^4 + x^2 + 1,
+// is perfect: the spheres of radius 3 around its 4096 codewords fill all 2^23 words, so each of
+// the 2048 syndromes is exactly one error pattern of weight 0 to 3. A table from syndrome to
+// pattern, built once, is then a complete maximum likelihood decoder for a binary symmetric
+// channel. Adding an overall parity bit gives Golay(24,12,8), which also detects a fourth error;
+// shortening that by six data bits held at zero gives the HDU's Golay(18,6,8).
+//
+// Hamming. Hamming(15,11,3) has every nonzero 4-bit value as some bit's syndrome, so it corrects
+// any single error and nothing else (it is perfect; p25p1unit.c decodes it). Hamming(10,6,3) is
+// it shortened to six data bits: ten of the fifteen syndromes point at a bit, and the other five
+// can only come from two or more errors and are reported uncorrectable. The soft variant also
+// refuses a correction of a bit its caller is confident of.
+//
+// Trellis codes. The P25 trellis codes are finite state machines whose state is the previous
+// input (a dibit for rate 1/2, a tribit for rate 3/4) and whose output, from a table indexed by
+// previous and current input, is a 4-bit symbol: two dibits on the air. A block starts in state
+// 0 and ends with a zero input. From the tables, the closest two paths that part and meet again
+// differ in 5 bits at rate 1/2 and in 3 bits at rate 3/4; in the soft metric below the same
+// figures are 9 and 3 times the squared distance between neighbouring dibit phases (pi/2)^2.
+// The Viterbi decoder finds the path through the trellis closest to what was received: with 4 or
+// 8 states and 49 steps it keeps every survivor decision and traces back once at the end. The
+// hard decoder measures distance in bits (maximum likelihood for independent bit errors); the
+// soft one in squared phase error, which for a phase disturbed by Gaussian noise of the same
+// variance on every dibit is minus the log likelihood up to a constant, so its least-total path is
+// the most likely one.
+//
+// CRCs. The register form computes the remainder of M(x) x^width modulo the generator, msb first,
+// with a zero preset, and P25 sends it inverted. The code is linear apart from that constant, so
+// the CRC of a received block XORed with the received CRC (the residual) depends only on the
+// error pattern; a single bit error gives a known residual, which is what the one-bit repair
+// looks for. That repair costs detection: of the 65,536 residuals, 97 are then accepted (0, the
+// 80 single data bit errors and the 16 single CRC bit errors), so a random block passes about
+// once in 676 tries rather than once in 65,536.
+
 // ---------------------------------------------------------------------------
 // Golay(24,12,8) and Golay(18,6,8)
 // Golay(23,12) is perfect: each of its 2048 syndromes is exactly one error pattern of at
@@ -26,7 +67,8 @@ static inline void init(void){
   pthread_once(&Once,golay_init);
 }
 
-// Syndrome contribution of each of bits 0-22 (data 0-11, parity 12-22)
+// Syndrome contribution of each of bits 0-22 (data 0-11, parity 12-22). Data bit i, the
+// coefficient of x^(22-i), contributes x^(22-i) mod g(x); parity bit 12+j contributes x^(10-j)
 static int const Golay_checksums[23] = {
   0x63A, 0x31D, 0x7B4, 0x3DA, 0x1ED, 0x6CC, 0x366, 0x1B3,
   0x6E3, 0x54B, 0x49F, 0x475, 0x400, 0x200, 0x100, 0x080,
@@ -55,6 +97,9 @@ static void golay_init(void){
   }
 }
 // word: bit 23 = codeword bit 0. Returns -1 for four errors, else the corrected word
+// After the 23-bit correction the overall parity must be even. If it is odd and the pattern
+// found had three bits, there were at least four errors; if it had fewer, the parity bit itself
+// was one of at most three errors
 static int64_t golay_correct(uint32_t word){
   uint32_t const w23 = word >> 1;
   uint32_t const pattern = Golay_pattern[golay_syndrome(w23)];
@@ -157,8 +202,9 @@ int hamming10_decode_soft(uint8_t bits[10],float const confidence[10],float thre
 
 // ---------------------------------------------------------------------------
 // P25 trellis codes: output symbol = table[previous input][current input], the state being
-// the previous input. Survivors are kept as a traceback table. A state takes the first
-// predecessor (lowest state number) with the strictly smallest metric, and the flush the
+// the previous input. Survivors are kept as a traceback table (pred[t][s]: the state before s
+// on the best path into s at step t), and the path is read back from the flush. A state takes
+// the first predecessor (lowest state number) with the strictly smallest metric, and the flush the
 // first final state with the strictly smallest metric
 
 static uint8_t const Trellis_12[4][4] = {
@@ -343,6 +389,7 @@ float trellis_34_decode_soft(uint8_t *out,float const *phase,int nsyms){
 
 // ---------------------------------------------------------------------------
 // CRCs: msb first, zero preset, the remainder of M(x) x^width inverted
+// (the feedback is the register's top bit XOR the next message bit, so no zeros need be appended)
 
 static unsigned crc_bits(uint8_t const *bits,int n,unsigned poly,int width){
   unsigned const mask = (1u << width) - 1;
