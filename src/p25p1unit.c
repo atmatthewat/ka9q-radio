@@ -5,10 +5,7 @@
 #include <stddef.h>
 #include <string.h>
 
-#include "crc.h"
-#include "golay.h"
-#include "hamming.h"
-#include "p25p1trellis.h"
+#include "dfec.h"
 #include "rs63.h"
 #include "p25p1unit.h"
 
@@ -252,6 +249,42 @@ void p25_imbe_decode(struct p25_imbe *f,uint8_t const raw[P25_IMBE_BITS]){
   f->e4 = f->errors[4];
   for(int c = 0; c < 7; c++)
     f->total += f->errors[c];
+}
+
+// ---------------------------------------------------------------------------
+// P25 Phase 1 data deinterleave
+
+uint8_t const p25_data_deinterleave[196] = {
+  0, 1, 2, 3, 16, 17, 18, 19, 32, 33, 34, 35, 48, 49, 50, 51,
+  64, 65, 66, 67, 80, 81, 82, 83, 96, 97, 98, 99, 112, 113, 114, 115,
+  128, 129, 130, 131, 144, 145, 146, 147, 160, 161, 162, 163, 176, 177, 178, 179,
+  192, 193, 194, 195, 4, 5, 6, 7, 20, 21, 22, 23, 36, 37, 38, 39,
+  52, 53, 54, 55, 68, 69, 70, 71, 84, 85, 86, 87, 100, 101, 102, 103,
+  116, 117, 118, 119, 132, 133, 134, 135, 148, 149, 150, 151, 164, 165, 166, 167,
+  180, 181, 182, 183, 8, 9, 10, 11, 24, 25, 26, 27, 40, 41, 42, 43,
+  56, 57, 58, 59, 72, 73, 74, 75, 88, 89, 90, 91, 104, 105, 106, 107,
+  120, 121, 122, 123, 136, 137, 138, 139, 152, 153, 154, 155, 168, 169, 170, 171,
+  184, 185, 186, 187, 12, 13, 14, 15, 28, 29, 30, 31, 44, 45, 46, 47,
+  60, 61, 62, 63, 76, 77, 78, 79, 92, 93, 94, 95, 108, 109, 110, 111,
+  124, 125, 126, 127, 140, 141, 142, 143, 156, 157, 158, 159, 172, 173, 174, 175,
+  188, 189, 190, 191
+};
+
+void p25_deinterleave_bits(uint8_t out[196],uint8_t const in[196]){
+  assert(out != NULL && in != NULL && out != in);
+  for(int i = 0; i < 196; i++)
+    out[p25_data_deinterleave[i]] = in[i];
+}
+void p25_deinterleave_bit_floats(float out[196],float const in[196]){
+  assert(out != NULL && in != NULL && out != in);
+  for(int i = 0; i < 196; i++)
+    out[p25_data_deinterleave[i]] = in[i];
+}
+// The table moves dibits whole (entries 2i and 2i+1 are an aligned pair)
+void p25_deinterleave_dibit_floats(float out[98],float const in[98]){
+  assert(out != NULL && in != NULL && out != in);
+  for(int i = 0; i < 98; i++)
+    out[p25_data_deinterleave[2*i] / 2] = in[i];
 }
 
 // ---------------------------------------------------------------------------

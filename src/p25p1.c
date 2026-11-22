@@ -10,8 +10,7 @@
 #include <string.h>
 
 #include "digital.h"
-#include "crc.h"
-#include "p25p1trellis.h"
+#include "dfec.h"
 #include "rs63.h"
 #include "p25p1.h"
 

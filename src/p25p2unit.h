@@ -13,7 +13,8 @@
 // Conventions:
 // A burst is the 320 bits (160 dibits) of one timeslot, in transmitted order, descrambled,
 // one bit per uint8_t. conf[] has one confidence (0-1) per dibit and may be NULL (hard).
-// Every field is msb first. Nothing allocates and nothing is global.
+// Every field is msb first. Nothing allocates; the only global is the ISCH code table, built
+// once and then only read.
 
 enum {
   P25P2_BURST_BITS = 320,
@@ -49,6 +50,14 @@ bool p25p2_duid_scrambled(int duid);    // voice and the scrambled signalling an
 bool p25p2_duid_voice(int duid);
 int p25p2_duid_mac_chan(int duid);      // enum p25_mac_chan of a signalling burst, else -1
 char const *p25p2_duid_name(int duid);
+
+// Phase 2 ISCH (I-ISCH): (40,9) code, minimum distance 8, nearest codeword up to 7 errors
+// Only codewords whose channel field is this timeslot (0 or 1) and whose ISCH location is
+// not the reserved value 3 are candidates; a tie goes to the lowest info value.
+// *info gets the 9 info bits, msb first: LCH type (2), channel (2), ISCH location (2),
+// LCH flag (1), superframe sequence (2). Returns bits corrected (0-7) or -1
+int isch_decode(uint8_t const bits[40],int timeslot,int *info);
+int isch_decode_word(uint64_t word,int timeslot,int *info); // word bit 39 = first bit sent
 
 // One AMBE+2 (half rate, 3600 x 2450) frame (TIA-102.BABA-1): four vectors read from the 72
 // bits as sent, column by column (bit 4k + c is entry 18c + k of the list, the list split

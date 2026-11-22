@@ -133,6 +133,13 @@ int p25_pdu_header(struct p25_pdu *p,struct p25_block *b,uint8_t const bits[P25_
 int p25_pdu_block(struct p25_pdu *p,struct p25_block *b,uint8_t const bits[P25_BLOCK_BITS],
                   float const phase[P25_BLOCK_BITS/2]);
 
+// P25 Phase 1 data deinterleave (196 bits = 98 dibits of a TSBK, PDU header or data block)
+// out[p25_data_deinterleave[i]] = in[i]
+extern uint8_t const p25_data_deinterleave[196];
+void p25_deinterleave_bits(uint8_t out[196],uint8_t const in[196]);
+void p25_deinterleave_bit_floats(float out[196],float const in[196]); // per-bit confidences
+void p25_deinterleave_dibit_floats(float out[98],float const in[98]); // per-dibit phases or confidences
+
 // Pack bits msb first into octets (the last one zero-filled), e.g. for p25msg.h
 void p25_pack_bits(uint8_t *octets,uint8_t const *bits,int nbits);
 
