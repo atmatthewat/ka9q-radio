@@ -785,7 +785,7 @@ static int viterbi_hard(uint8_t *out,uint8_t const *in,int nsyms,int k,uint8_t c
       traceback(out,pred,steps,k,best_state);
       return (int)best;
     }
-    unsigned next[8];
+    unsigned next[8] = {0};
     bool next_valid[8] = {false};
     for(int p = 0; p < nstates; p++){
       if(!valid[p])
@@ -862,7 +862,7 @@ static float viterbi_soft(uint8_t *out,float const *phase,int nsyms,int k,uint8_
   for(int t = 0; t < steps; t++){
     for(int o = 0; o < 16; o++)
       bm[o] = branch_metric(phase[2*t],phase[2*t+1],o);
-    float next[8];
+    float next[8] = {0};
     bool next_valid[8] = {false};
     for(int p = 0; p < nstates; p++){
       if(!valid[p])

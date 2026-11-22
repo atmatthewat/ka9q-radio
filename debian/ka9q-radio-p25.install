@@ -1,0 +1,2 @@
+usr/sbin/p25d
+usr/lib/systemd/system/p25d@.service
