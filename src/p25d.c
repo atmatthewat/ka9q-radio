@@ -2024,8 +2024,12 @@ static void voice_unit(struct decoder *dp,uint64_t sample,struct p25_frame const
     }
   }
   nwork = take_events(dp,site,nwork); // a call this unit started is in the table now
+  bool followed = false;
   if(unit){
     struct fcall * const fc = label.call_id != 0 ? find_call(site,label.call_id) : find_call_freq(site,dp->trunk_freq,-1);
+    // Only a call p25d follows is heard: the trunking logic labels any call's voice, and a call
+    // found on the channel by its voice alone (late entry) is followed or not as any other
+    followed = fc != NULL && fc->requested;
     if(fc != NULL){
       // Held units released since the last unit, by this thread's call into the logic just now or
       // another thread's: they are all units this thread has already handed to the voice output
@@ -2052,6 +2056,8 @@ static void voice_unit(struct decoder *dp,uint64_t sample,struct p25_frame const
 
   if(new_alias)
     decoder_event(dp,sample,"NAC %03x talker alias src %u \"%s\"",frame->nac,label.source,alias.text);
+  if(!followed)
+    label.decision = P25_TRUNK_VOICE_NONE;
   if((ldu || (duid == P25_DUID_HDU && label.call_id != 0)) && label.call_id != dp->call_id){
     // Another call (or none) on this channel: what was held for the last one is never decoded.
     // Not when the first call is learned (none before): the transmission is the same, and what its
@@ -2421,6 +2427,8 @@ static void p2_burst(void *arg,struct p25p2_burst const *b){
   struct fcall * const fc = label.call_id != 0 ? find_call(site,label.call_id) : find_call_freq(site,freq,ts);
   if(!dp->voice && (fc == NULL || !fc->local))
     label.decision = P25_TRUNK_VOICE_NONE; // the control carrier's traffic slot: only a call followed there is heard
+  if(dp->voice && (fc == NULL || !fc->requested))
+    label.decision = P25_TRUNK_VOICE_NONE; // likewise on a voice channel: the other timeslot's call may not be followed
   if(fc != NULL){
     if(new_alias)
       strlcpy(fc->alias,alias.text,sizeof fc->alias);

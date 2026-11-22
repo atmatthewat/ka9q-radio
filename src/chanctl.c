@@ -69,6 +69,11 @@ struct seen {
   bool have_format;
   double lifetime;         // s remaining, 0 = none
   int64_t when;
+  // One of ours that we released. Its last status packets as it goes show a lifetime of 0, which
+  // is also what a permanent channel shows; without this it would pass for someone else's
+  // permanent channel for Seen_valid, and a request for its frequency then would be refused
+  // (EEXIST) or take it for a static channel. Cleared by a status with a lifetime running
+  bool gone;
 };
 
 struct chanctl {
@@ -229,13 +234,19 @@ void chanctl_observe(struct chanctl *ctl,struct frontend const *frontend,chan_t 
       ctl->nseen++;
     }
   }
+  struct entry * const e = find_entry(ctl,ssrc);
+  if(s->ssrc != ssrc)
+    s->gone = false; // a new record (or a recycled one)
   s->ssrc = ssrc;
   s->frequency = chan->tune.freq;
   s->have_format = (chanctl_format(&s->format,frontend,chan) == 0);
   s->lifetime = chan->lifetime * ctl->blocktime;
   s->when = now;
+  if(e != NULL && e->kind == OWN && e->state == CHANCTL_RELEASING)
+    s->gone = true;
+  else if(chan->lifetime > 1)
+    s->gone = false; // running: ours again, or someone else's
 
-  struct entry * const e = find_entry(ctl,ssrc);
   if(e == NULL)
     return;
   bool const same = s->have_format && same_form(e->frequency,&e->format,s->frequency,&s->format);
@@ -394,6 +405,9 @@ int chanctl_release(struct chanctl *ctl,uint32_t ssrc){
   }
   if(e->state == CHANCTL_RELEASING)
     return 0;
+  struct seen * const s = find_seen(ctl,ssrc,0);
+  if(s != NULL)
+    s->gone = true;
   e->state = CHANCTL_RELEASING;
   e->released = now;
   e->release_tries = 1;
@@ -470,6 +484,8 @@ static struct seen *find_seen(struct chanctl *ctl,uint32_t ssrc,int64_t now){
 
 // Seen recently enough, as a fraction of the lifetime it showed, to be still there
 static bool alive(struct seen const *s,int64_t now,double fraction){
+  if(s->gone)
+    return false;
   if(s->lifetime <= 0)
     return now - s->when < Seen_valid;
   return now - s->when < (int64_t)(fraction * s->lifetime * 1e9);
