@@ -216,5 +216,8 @@ Package: ka9q-radio-p25
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}, systemd, ka9q-radio-common
 Description: P25 decoder for ka9q-radio
- Decodes APCO Project 25 Phase 1 control and voice channels from radiod
- I/Q multicast streams and logs trunking messages and data units
+ Decodes APCO Project 25 Phase 1 and Phase 2 control, voice and
+ conventional channels from radiod I/Q multicast streams, logs trunking
+ messages and data units, and follows trunked calls by asking radiod for
+ their voice channels. When built with mbelib it also sends the speech of
+ unencrypted calls as an RTP stream that monitor plays and pcmrecord records.
