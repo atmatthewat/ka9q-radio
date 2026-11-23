@@ -20,11 +20,13 @@
 // can no longer be completed. The assembled bits are the talker's WACN (20 bits), system (12)
 // and unit (24), then the text, then a CRC-16 (x^16+x^12+x^5+1, zero preset, inverted) over all
 // that went before it. Blocks are padded with zeros at the end, so the length is found from the
-// last nonzero octet. The text is obfuscated: each octet goes through a substitution table, then
-// has a running value taken off and is multiplied by the inverse of another (odd) running value
-// mod 256; both come from a multiplier that starts from the text's length and moves on with each
-// encoded octet. What comes out is UTF-16, two octets a character, written out as UTF-8. An
-// alias whose CRC fails (or that has no text) is dropped and counted.
+// last 16 bits that are not zero, in 16-bit steps from the unit (the text is 16-bit characters
+// and so is the CRC; going by the last nonzero octet instead loses every alias whose CRC ends
+// in a zero octet, one in 256). The text is obfuscated: each octet goes through a substitution
+// table, then has a running value taken off and is multiplied by the inverse of another (odd)
+// running value mod 256; both come from a multiplier that starts from the text's length and
+// moves on with each encoded octet. What comes out is UTF-16, two octets a character, written
+// out as UTF-8. An alias whose CRC fails (or that has no text) is dropped and counted.
 //
 // L3Harris. In Phase 1, link control blocks 1 to 4 each carry seven octets of text (octets 2-8
 // of the word), with no check of their own beyond the link control's and nothing that says which
@@ -146,31 +148,32 @@ bool p25_alias_motorola(uint8_t const *bits, int nbits, struct p25_alias_result 
   out->mfid = P25_MFID_MOTOROLA;
   if(nbits < 72)
     return false;
-  // Zero padding off the end, in whole octets after the first 72 bits
-  int size = 72;
-  for(int i = nbits; i > 72; i--){
-    if(get_bit(bits, i - 1)){
-      size = 72 + ((i - 72 + 7) / 8) * 8;
+  // Zero padding off the end. The text is whole 16-bit characters and the CRC is 16 bits, so
+  // what follows the first 56 bits is whole 16-bit chunks, at most 16 of them (15 characters and
+  // the CRC), and the alias ends with the last chunk that is not zero. Counting in chunks keeps
+  // a CRC whose second octet is zero whole. A CRC that is zero altogether (one alias in 65536)
+  // looks like padding: when the check fails, one chunk more is tried
+  int const most = nbits - 56 < 16 * 16 ? (nbits - 56) / 16 : 16;
+  int chunks = 1;
+  for(int x = most; x > 1; x--){
+    if(get_field(bits, 56 + (x - 1) * 16, 16) != 0){
+      chunks = x;
       break;
     }
   }
-  if(size > nbits)
-    size = nbits;
-  bool const crc_ok = crc16_gsm(bits, size - 16) == get_field(bits, size - 16, 16);
+  int size = 56 + chunks * 16;
+  bool crc_ok = crc16_gsm(bits, size - 16) == get_field(bits, size - 16, 16);
+  if(!crc_ok && chunks < most && crc16_gsm(bits, size) == get_field(bits, size, 16)){
+    crc_ok = true;
+    chunks++;
+    size += 16;
+  }
   out->has_suid = true;
   out->wacn = get_field(bits, 0, 20);
   out->sysid = get_field(bits, 20, 12);
   out->unit = get_field(bits, 32, 24);
 
-  // Up to 16 chunks of 16 bits from bit 56, through the last nonzero one; its last
-  // two octets are the CRC
-  int chunks = 1;
-  for(int x = 16; x > 1; x--){
-    if(size >= 56 + x * 16 - 1 && 56 + x * 16 <= nbits && get_field(bits, 56 + (x - 1) * 16, 16) != 0){
-      chunks = x;
-      break;
-    }
-  }
+  // The chunks from bit 56: the text, then the CRC in the last two octets
   uint8_t enc[32];
   int n = 0;
   for(int i = 0; i < chunks * 2 && 56 + i * 8 + 8 <= nbits; i++)
