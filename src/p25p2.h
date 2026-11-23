@@ -33,6 +33,10 @@ struct p25p2_burst {
   int isch;                // bursts A and B: the I-ISCH before them, 9 info bits (LCH type 2, channel 2,
                            // location 2, flag 1, superframe count 2), or -1 (C, D, or not decoded)
   int isch_errors;         // bits it corrected
+  int ultraframe;          // the superframe's place in the ultraframe, 0-3 (3 the last), from an I-ISCH
+                           // of the superframe or carried on from one before; -1 unknown
+  int color_code;          // the NAC the scrambling parameters were set with, -1 if none: a
+                           // MAC_END_PTT with another color code is another system's (see p25p2.c)
   int sync_errors;         // bit errors in the fragment's two S-ISCH syncs
   bool descrambled;        // a scrambled burst: false until the scrambling parameters are set
   bool reparsed;           // delivered again, descrambled, after parameters set during this fragment
@@ -112,6 +116,11 @@ void p25p2_set_decision_directed(struct p25p2 *p,enum p25p2_dd mode);
 // A negative value keeps the current one
 void p25p2_set_loop_bandwidths(struct p25p2 *p,float acquire,float track,float settled,float settle_time);
 void p25p2_set_matched_filter(struct p25p2 *p,bool enable); // false: no receive filter at all
+
+// The voice framing a MAC PDU's offset field (bits 3-5) gives, as the voice position
+// (superframe_slot / 2, 0-4) of the timeslot's 2V burst, for a PDU in the burst at
+// 'superframe_slot'; -1 if the field gives none (%110, %111)
+int p25p2_offset_2v(int superframe_slot,int offset);
 
 // The 12 scrambling segments of a superframe (320 bits each, DUID bits left clear) for these
 // parameters (TIA-102.BBAC 7.2.5): a 44-bit LFSR seeded with WACN << 24 | SYSID << 12 | NAC

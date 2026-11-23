@@ -61,7 +61,14 @@
 // encrypted frames on a frame stream that asked for them, and is otherwise dropped, and no
 // speech follows. Link control or a MAC voice channel user word naming another talkgroup, unit
 // or talker than the transmission's means one ended and another began unseen: the transmission
-// is ended there.
+// is ended there. Two exceptions on Phase 2. A MAC PTT for an individual call (unit to unit or
+// telephone) carries the reserved group 0 and the talker as its source (TIA-102.BBAC 7.3.1;
+// TIA-102.BBAD-A 2.3.3.1): it names no talkgroup, so it gives the source and the encryption only
+// and the call's identity comes from the voice channel user that follows, which then names no
+// other call. And the outbound SACCH of the last superframe of an ultraframe names the inbound
+// talker, who may not be the source of the audio sent (TIA-102.BBAC-A 3.4): a voice channel user
+// there, or in a SACCH whose place in the ultraframe is not known, gives no identity and no new
+// talker; its encryption bit still counts.
 //
 // What is let through. A fade shorter than Hang does not end the transmission and does not
 // withdraw 'clear'. If it hid the end of a clear transmission and the start of an encrypted one
@@ -74,8 +81,11 @@
 //
 // What ends a transmission (end_transmission(): held units dropped, streams closed): Phase 1
 // a header (it starts a new one), TDU or TDULC; Phase 2 a MAC PTT (likewise), END PTT, IDLE or
-// HANGTIME; a new talker as above; a voice unit overdue by more than Hang (p25_audio_poll());
-// and the trunking logic ending the call.
+// HANGTIME, or a change of audio source (below); a new talker as above; a voice unit overdue by
+// more than Hang (p25_audio_poll()); and the trunking logic ending the call. An END PTT whose
+// color code is not the NAC the receiver descrambles with (struct p25p2_burst color_code) is
+// another system's, sent unscrambled so that it can be told apart (TIA-102.BBAD-A 4.10;
+// TIA-102.BBAC 7.3.3), and ends nothing; with no NAC known yet every END PTT counts.
 //
 // The trunking logic's labels act on the unit alone: NONE drops it, ENCRYPTED treats it and
 // what is held as encrypted without setting 'encrypted' (the logic may change its mind), HOLD
@@ -92,6 +102,23 @@
 // the channel decoder (c0's, and the total over c0-c6), in place of mbelib's own. AMBE+2 frames
 // go through mbelib's own rules. A lost frame is repeated, and after Max_repeats repeats in a
 // row the output is muted.
+//
+// Phase 2 voice framing. A timeslot's voice bursts go 4V 4V 4V 4V 2V from the start of the talk
+// spurt to its end, without regard to the SACCH (TIA-102.BBAC-A 6.1); where the 2V falls among
+// the five voice positions places every frame in time and in its voice cycle, whose ESS gives
+// the next cycle's encryption parameters. It is learned, in order of trust, from the offset
+// field of a MAC PDU that passed its CRC (TIA-102.BBAD-A 4.2, p25p2_offset_2v(): every SACCH
+// and FACCH PDU carries it, a PTT included), from the first voice burst after a PTT that gave
+// none, or from the first 2V (a receiver may take the offset field or a 2V, whichever comes
+// first: TIA-102.BBAC 7.2.4.2.2). Once known it stays for the transmission. A 2V seen elsewhere
+// does not move it: it is a misread DUID or a change of source not seen, and moving would
+// misplace every frame after a misread, while a change of source is signalled by a MAC PDU with
+// the new offset at the change (TIA-102.BBAD-A 4.2) and repeated in every SACCH, so it is put
+// right within a superframe; the encryption rule does not depend on the placing (a 2V's ESS
+// counts at once). An offset field giving another framing than one an offset field gave is
+// that change of source (a console interrupting, another unit repeated): the audio is another's
+// and its encryption is not known, so the transmission is ended there as at a PTT. Against a
+// framing learned from a burst it corrects the guess and places again what is held.
 //
 // RTP. A transmission's first timestamp is the sender's clock, at 8 kHz, at the first frame's
 // start, so a recording lines up with the IQ; then 160 per frame, one packet per frame. The
@@ -498,12 +525,14 @@ struct p25_audio {
   int held_frames;
 
   // Phase 2 framing: where superframes start, and which of a timeslot's five voice bursts is the
-  // 2V. The transmitter's voice cycle (four 4V, then the 2V) is not tied to the superframe: it
-  // begins with the first voice burst after a PTT, and a 2V shows where it is
+  // 2V. The transmitter's voice cycle (four 4V, then the 2V) is not tied to the superframe (see
+  // the top of the file)
   bool p2_ref_set;
   uint64_t p2_ref;
   int p2_k2;
-  bool p2_after_ptt;
+  bool p2_k2_known;        // p2_k2 is this transmission's: fixed until it ends
+  bool p2_k2_signalled;    // ... and an offset field gave it
+  bool p2_after_ptt;       // a PTT with no framing: the next voice burst begins a cycle
 
   void (*tap)(void *,int64_t,uint64_t);
   void *tap_arg;
@@ -898,6 +927,8 @@ static void end_transmission(struct p25_audio *a){
   a->in_superframe = false;
   a->cycle = INT64_MIN;
   a->p2_after_ptt = false;
+  a->p2_k2_known = false; // p2_k2 stays as a guess for the next
+  a->p2_k2_signalled = false;
   a->last_unit = 0;
 }
 
@@ -1156,23 +1187,50 @@ static bool new_mac_talker(struct p25_audio const *a,struct p25_msg const *msg){
   return unit_call != a->unit_call || target != a->target || (a->source != 0 && msg->src != 0 && msg->src != a->source);
 }
 
+static void p2_place(struct p25_audio const *a,struct held_unit *h);
+
+// Where the 2V falls (see the top of the file): what is held is placed again if it moves
+static void p2_framing(struct p25_audio *a,int k2,bool signalled){
+  bool const moved = k2 != a->p2_k2;
+  a->p2_k2 = k2;
+  a->p2_k2_known = true;
+  a->p2_k2_signalled |= signalled;
+  a->p2_after_ptt = false;
+  for(int i=0; moved && i < a->nheld; i++)
+    if(a->held[i].codec == P25_CODEC_AMBE2)
+      p2_place(a,&a->held[i]);
+}
+
 // Phase 2 call details and encryption from a signalling burst's MAC PDU (its CRC passed)
 static void mac_info(struct p25_audio *a,struct p25p2_burst const *b){
   struct p25p2_mac const * const m = b->mac;
   struct p25_mac_pdu pdu;
   if(p25_mac_decode(&pdu,(enum p25_mac_chan)m->chan,m->octets,m->nbits) < 0)
     return;
+  int const k2 = p25p2_offset_2v(b->superframe_slot,pdu.offset_4v); // -1: no framing given
   switch(pdu.type){
   case P25_MAC_PTT:
     end_transmission(a); // a PTT starts a new transmission
     got_crypto(a,pdu.algid,pdu.kid,pdu.mi,INT64_MIN); // for the first voice cycle, whichever it is
-    a->p2_after_ptt = true;
-    a->have_call = true;
-    a->unit_call = false;
-    a->target = pdu.group;
+    if(k2 >= 0)
+      p2_framing(a,k2,true);
+    else
+      a->p2_after_ptt = true;
     a->source = pdu.src;
+    if(pdu.group != 0){
+      a->have_call = true;
+      a->unit_call = false;
+      a->target = pdu.group;
+    }
+    // else an individual call's PTT (TIA-102.BBAC 7.3.1): group 0 is reserved and names no
+    // talkgroup. The call stays unnamed until its unit to unit voice channel user, which then
+    // is not a new talker (new_mac_talker() needs a call named)
     break;
   case P25_MAC_END_PTT:
+    if(b->color_code >= 0 && pdu.nac != b->color_code)
+      break; // another system's (TIA-102.BBAD-A 4.10): ends nothing here
+    end_transmission(a);
+    break;
   case P25_MAC_IDLE:
   case P25_MAC_HANGTIME:
     // No voice on this timeslot now: whatever comes next is another transmission. The voice
@@ -1180,12 +1238,27 @@ static void mac_info(struct p25_audio *a,struct p25p2_burst const *b){
     end_transmission(a);
     break;
   default:
-    for(int i=0; i < pdu.nstruct; i++){
-      if(pdu.s[i].mac_kind != P25_MAC_MSG)
-	continue;
-      if(new_mac_talker(a,&pdu.s[i].msg))
-	end_transmission(a);
-      voice_user(a,&pdu.s[i].msg);
+    if(k2 >= 0 && k2 != a->p2_k2 && a->p2_k2_signalled)
+      end_transmission(a); // a change of audio source (TIA-102.BBAD-A 4.2): as at a PTT
+    if(k2 >= 0)
+      p2_framing(a,k2,true);
+    {
+      // The SACCH of an ultraframe's last superframe names the inbound talker, not the audio's
+      // source (TIA-102.BBAC-A 3.4); one whose place is not known may be that one
+      bool const identity = m->chan != P25_MAC_SACCH || (b->ultraframe >= 0 && b->ultraframe < 3);
+      for(int i=0; i < pdu.nstruct; i++){
+	struct p25_msg const * const msg = &pdu.s[i].msg;
+	if(pdu.s[i].mac_kind != P25_MAC_MSG)
+	  continue;
+	if(!identity){
+	  if(msg->kind == P25_LC_GRP_V_CH_USR || msg->kind == P25_LC_MOT_GRG_V_CH_USR || msg->kind == P25_LC_UU_V_CH_USR)
+	    a->encrypted |= (msg->svc & P25_SVC_ENCRYPTED) != 0;
+	  continue;
+	}
+	if(new_mac_talker(a,msg))
+	  end_transmission(a);
+	voice_user(a,msg);
+      }
     }
     break;
   }
@@ -1229,17 +1302,11 @@ void p25_audio_burst(struct p25_audio *a,struct p25p2_burst const *b,int64_t whe
     return;
   }
   a->last_unit = t;
-  if(a->p2_after_ptt){
-    a->p2_k2 = (k + 4) % 5; // this burst begins a voice cycle
-    a->p2_after_ptt = false;
-  }
-  if(b->duid == P25P2_DUID_2V && k != a->p2_k2){
-    // Placed wrongly so far (late entry): place again what is still held
-    a->p2_k2 = k;
-    for(int i=0; i < a->nheld; i++)
-      if(a->held[i].codec == P25_CODEC_AMBE2)
-	p2_place(a,&a->held[i]);
-  }
+  if(a->p2_after_ptt)
+    p2_framing(a,(k + 4) % 5,false); // this burst begins a voice cycle
+  else if(b->duid == P25P2_DUID_2V && !a->p2_k2_known)
+    p2_framing(a,k,false); // late entry: placed by a guess so far
+  // (a 2V elsewhere once the framing is known moves nothing: see the top of the file)
   int64_t cycle;
   int c;
   p2_cycle(a,sf,k,&cycle,&c);

@@ -98,6 +98,19 @@
 // carries on from the last fragment; until one decodes after acquisition it is a guess (0), and
 // bursts say so (position_known).
 //
+// Ultraframe. Four superframes make an ultraframe (TIA-102.BBAC-A 3.1.2), and every I-ISCH of a
+// voice channel carries the place of its superframe in it, the Ultraframe Count in its bits 1-0,
+// %11 the last (5.5.1.4). It matters for the SACCH: while a subscriber transmits, the outbound
+// SACCH of the first three superframes names the source of the outbound audio and that of the
+// last superframe the inbound talker, who may be another unit, so a listener takes the talker
+// only from the first three (3.4). A SACCH never has an I-ISCH of its own: it is in the inverted
+// timeslot, whose ISCH is always an S-ISCH (3.2), slot 10 or 11, bursts C and D of the
+// superframe's last fragment. So the count is the superframe's, from whichever of its six
+// I-ISCHs decoded (the best of the fragment's two, as for the position), carried on from the
+// fragment before when none did, and advanced by one when a new superframe begins (position 0).
+// The count means something only where the LCH Type (bits 8-7) says voice channel, %00 (on an
+// LCCH bit 2 and the count are other fields, 5.5.1.1); a decode of another type gives none.
+//
 // Scrambling (TIA-102.BBAC 7.2.5). Its purpose is that a receiver does not take the voice or
 // messages of another P25 TDMA system on the same frequency for its own. Voice bursts are always
 // scrambled; signalling bursts are too, except those carrying a network status broadcast (which
@@ -118,8 +131,19 @@
 // its place, DUID, sync and ISCH quality, the (descrambled) bits and confidences, and what was
 // decoded from them: a signalling burst's MAC PDU, a voice burst's AMBE+2 frames, and with a 2V
 // the ESS assembled from the timeslot's 4Vs before it. Each timeslot's ESS collector is emptied
-// at a MAC PTT, END PTT, IDLE or HANGTIME and when sync is lost, so that no ESS is assembled from
-// two transmissions. A burst whose DUID did not decode is delivered with nothing decoded.
+// at a MAC PTT, END PTT, IDLE or HANGTIME, at a change of audio source and when sync is lost, so
+// that no ESS is assembled from two transmissions or two sources. A change of source within a
+// transmission (a console interrupting, or another unit repeated) is signalled by a MAC PDU whose
+// offset field gives a voice framing other than the one in force (TIA-102.BBAD-A 4.2): the
+// offset field of every SACCH and FACCH PDU names the 4V that starts the next voice sequence,
+// so where the 2V falls (p25p2_offset_2v()). An END PTT is the exception to that list when its
+// color code (bits 12-23) is not the NAC the scrambling was set with: it is sent unscrambled so
+// that a receiver can tell another system's (TIA-102.BBAD-A 4.10; TIA-102.BBAC 7.2.5, 7.3.3),
+// and another system's END PTT ends nothing here. Before the scrambling parameters are set no
+// color code is known and an END PTT is taken as this system's, as before; voice is scrambled,
+// so until then no voice is decoded and no ESS assembled anyway. Each burst carries that color
+// code (color_code) for the handler's own check, and its superframe's ultraframe count. A burst
+// whose DUID did not decode is delivered with nothing decoded.
 
 // Timing loop bandwidths (normalized, per symbol). Acquisition is wide so that the first
 // timeslot of a carrier (dibits 20-179, before its first S-ISCH) decodes whatever the initial
@@ -261,6 +285,8 @@ struct p25p2 {
   bool just_acquired;
   int misses;
   int isch_info[2],isch_errors[2];
+  int ultraframe;            // of the last fragment's superframe, -1 unknown
+  int framing[2];            // per timeslot: the 2V's voice position by the last offset field, -1 none
   uint64_t last_rotation_report,rotation_candidate;
   int rotation_q;
 
@@ -320,6 +346,22 @@ static void sequence_from_seed(uint8_t seq[P25P2_SUPERFRAME_SLOTS][P25P2_BURST_B
   for(int k=0; k < P25P2_SUPERFRAME_SLOTS; k++)
     for(int i=0; i < 8; i++)
       seq[k][duid_bits[i]] = 0;
+}
+// Offset n (TIA-102.BBAD-A 4.2, Table 10): the first 4V of the next voice sequence is the
+// (n+1)th non-SACCH burst on this timeslot after this one, %000 to %100 outbound and %101 too
+// (the 6th, outbound only); %110 is reserved outbound and %111 means no voice framing or none
+// known. The non-SACCH bursts of a timeslot are its five voice positions in each superframe,
+// superframe_slot / 2 = 0-4, and its SACCH is the sixth (slot 10 or 11, 5): counted in
+// non-SACCH bursts the one after position k is k + 1, the one after position 4 or the SACCH is
+// position 0 of the next superframe. The voice bursts go 4V 4V 4V 4V 2V without regard to the
+// SACCH (TIA-102.BBAC-A 6.1), so the 2V is the non-SACCH burst before the first 4V. On the
+// real recording this agrees with the 2Vs seen, after every PTT
+int p25p2_offset_2v(int superframe_slot,int offset){
+  if(offset < 0 || offset > 5 || superframe_slot < 0 || superframe_slot >= P25P2_SUPERFRAME_SLOTS)
+    return -1;
+  int const k = superframe_slot / 2;
+  int const next = k < 5 ? k + 1 : 0;
+  return (next + offset + 4) % 5;
 }
 void p25p2_scrambling_sequence(uint8_t seq[P25P2_SUPERFRAME_SLOTS][P25P2_BURST_BITS],uint32_t wacn,
 			       uint16_t sysid,uint16_t nac){
@@ -427,10 +469,13 @@ static void lose_sync(struct p25p2 *p){
   p->misses = 0;
   p->last_position = -1;
   p->position_known = false;
+  p->ultraframe = -1;
   p->pending_first = NONE;
   p->stats.sync_losses++;
-  for(int ts=0; ts < 2; ts++)
+  for(int ts=0; ts < 2; ts++){
     p25p2_ess_reset(&p->ess[ts]);
+    p->framing[ts] = -1;
+  }
   frame_sync(p,false);
   trim_search(p);
 }
@@ -439,9 +484,12 @@ static void lose_sync(struct p25p2 *p){
 // (channel 1), whichever needed fewer corrections; if neither, one on from the last; until one
 // decodes after acquisition, a guess (0). A heavily corrected I-ISCH that contradicts the
 // position carried on is more likely a mis-decode
+// The ultraframe count goes with it (see the top of the file): from the best decoded I-ISCH of
+// a voice channel, if the position was taken from an I-ISCH; else carried on
 static int fragment_position(struct p25p2 *p,uint64_t fs){
   int const predicted = p->last_position >= 0 ? (p->last_position + 1) % 3 : -1;
   int position = -1,corrected = 99;
+  int ultraframe = -1,uf_corrected = 99;
   for(int ch=0; ch < 2; ch++){
     uint64_t word = 0;
     uint64_t const base = fs + (ch == 0 ? ISCH1 : ISCH2);
@@ -459,9 +507,18 @@ static int fragment_position(struct p25p2 *p,uint64_t fs){
       position = seq;
       corrected = e;
     }
+    if(seq < 3 && ((info >> 7) & 3) == 0 && e < uf_corrected){ // LCH Type %00: a voice channel
+      ultraframe = info & 3;
+      uf_corrected = e;
+    }
   }
   if(position >= 0 && predicted >= 0 && position != predicted && corrected > ISCH_TRUST)
     position = -1;
+  int const carried = p->ultraframe < 0 ? -1 : (position >= 0 ? position : predicted) == 0 ? (p->ultraframe + 1) % 4
+    : p->ultraframe;
+  if(position < 0 || (carried >= 0 && ultraframe != carried && uf_corrected > ISCH_TRUST))
+    ultraframe = -1; // no I-ISCH taken, or a heavily corrected one contradicting the count carried on
+  p->ultraframe = ultraframe >= 0 ? ultraframe : carried;
   p->position_from_isch = position >= 0;
   if(position >= 0){
     p->position_known = true;
@@ -518,10 +575,24 @@ static void deliver(struct p25p2 *p,struct slot *s){
     b->mac = &p->mac;
     if(p->mac.crc_ok){
       p->stats.mac_ok[ts]++;
-      // A new transmission (or none): its ESS must not be assembled from the last one's
+      // A new transmission (or none), or a new audio source: its ESS must not be assembled from
+      // the last one's (see the top of the file)
       int const type = p->mac.bits[0] << 2 | p->mac.bits[1] << 1 | p->mac.bits[2];
-      if(type == P25_MAC_PTT || type == P25_MAC_END_PTT || type == P25_MAC_IDLE || type == P25_MAC_HANGTIME)
+      int const offset = p->mac.bits[3] << 2 | p->mac.bits[4] << 1 | p->mac.bits[5];
+      int const framing = b->position_known ? p25p2_offset_2v(b->superframe_slot,offset) : -1;
+      int cc = 0;
+      for(int i=12; i < 24; i++)
+	cc = cc << 1 | p->mac.bits[i];
+      // Another system's END PTT ends nothing of ours
+      bool const foreign = type == P25_MAC_END_PTT && b->color_code >= 0 && cc != b->color_code;
+      if(!foreign && (type == P25_MAC_PTT || type == P25_MAC_END_PTT || type == P25_MAC_IDLE || type == P25_MAC_HANGTIME)){
 	p25p2_ess_reset(&p->ess[ts]);
+	p->framing[ts] = type == P25_MAC_PTT ? framing : -1;
+      } else if(!foreign && framing >= 0){
+	if(p->framing[ts] >= 0 && framing != p->framing[ts])
+	  p25p2_ess_reset(&p->ess[ts]); // the audio source changed
+	p->framing[ts] = framing;
+      }
     } else
       p->stats.mac_bad[ts]++;
   } else if(readable && p25p2_duid_voice(b->duid)){
@@ -600,6 +671,8 @@ static void process_fragment(struct p25p2 *p){
     else {
       if(p->last_position >= 0)
 	p->last_position = (p->last_position + 1) % 3; // it still occupies a position
+      if(p->last_position == 0 && p->ultraframe >= 0)
+	p->ultraframe = (p->ultraframe + 1) % 4;       // and may begin a superframe
       trim_synced(p);
     }
     return;
@@ -622,6 +695,8 @@ static void process_fragment(struct p25p2 *p){
     b->position_known = p->position_known;
     b->isch = i < 2 ? p->isch_info[i] : -1;
     b->isch_errors = i < 2 ? p->isch_errors[i] : -1;
+    b->ultraframe = p->ultraframe;
+    b->color_code = p->scr_valid ? (int)(p->scr_seed & 0xfff) : -1;
     b->sync_errors = sync_errors;
     b->dibit = fs + Burst_offset[i];
     for(int d=0; d < P25P2_BURST_DIBITS; d++){
@@ -876,6 +951,8 @@ struct p25p2 *create_p25p2(double samprate){
   p->dd_mode = P25P2_DD_FOURTH_POWER;
   p->pending_first = NONE;
   p->last_position = -1;
+  p->ultraframe = -1;
+  p->framing[0] = p->framing[1] = -1;
   p->last_rotation_report = NONE;
   p->rotation_candidate = NONE;
   p->hold_dibits = (uint64_t)(Afc_hold_time * P25P2_SYMRATE);

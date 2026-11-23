@@ -106,7 +106,9 @@
 // followed from its grant (-g, -x, -e, -m). A unit labelled hold waits in the voice output until
 // the logic releases it, as clear or not (p25_audio_release()), or the call ends. A conventional
 // channel's units are unlabelled: the first gate alone. Before either, a data unit on a Phase 1
-// voice channel whose NAC is not the site's is dropped (voice_unit()).
+// voice channel whose NAC is not the site's is dropped (voice_unit()), and on Phase 2 a MAC END
+// PTT whose color code is not the site's (p2_burst()), and an LCCH PDU whose color code is not
+// the one the control channel has established (p2_control()).
 //
 // SSRCs. A channel radiod makes on request has its frequency in kHz as its SSRC (chanctl_ssrc():
 // rounded, and moved up past a number already taken), so p25d knows a voice channel by that
@@ -212,6 +214,8 @@ struct decoder {
   bool choosing;           // rx not known yet: both receivers run, the first to decode stays
   bool lcch[2];            // Phase 2 control channel: timeslots its LCCH has been heard on
   struct p25_mac_frag lcch_frag; // and a multi-fragment message being put together from it
+  uint16_t lcch_cc;        // and the color code of its last LCCH PDUs, lcch_cc_count in a row
+  int lcch_cc_count;       // (Cc_established or more: the site's, established)
   bool scrambling;         // Phase 2: scrambling parameters set
   bool scrambling_said;    // and said once that they are not known yet
   double samprate;
@@ -2506,7 +2510,17 @@ static void voice_unit(struct decoder *dp,uint64_t sample,struct p25_frame const
 // and each 4V and 2V as a voice unit. Grants and updates in MAC structures go to the logic as
 // the trunking messages they abbreviate. IDLE and HANGTIME end nothing there: the call goes on
 // while grants name it, and times out as a Phase 1 call does. Then each burst goes to that
-// timeslot's voice output under the label the logic gave
+// timeslot's voice output under the label the logic gave.
+// Three things are not taken. A MAC END PTT whose color code (bits 12-23) is not the site's NAC
+// is another system's: END PTTs are sent unscrambled so that a receiver can tell (TIA-102.BBAD-A
+// 4.10; TIA-102.BBAC 7.3.3); it is logged with -v and goes nowhere. The site's NAC is the one the
+// receiver descrambles with, else the one the voice channel was given; with neither known every
+// END PTT counts, as before. A voice channel user in the SACCH of an ultraframe's last superframe
+// (or one whose place is not known) names the inbound talker, not the source of the audio sent
+// (TIA-102.BBAC-A 3.4): it does not become the timeslot's talker. And a MAC PTT for an individual
+// call carries the reserved group 0 (TIA-102.BBAC 7.3.1): as a header it then names no talkgroup,
+// so the trunking logic starts no call from it (voice_hdu() needs a group), and it confirms the
+// encryption of the call the grant started on the channel
 
 // Once per block: the scrambling parameters, from the control channel's network status (WACN,
 // system ID) and NAC. Until the site has heard its network status the receiver has none: voice
@@ -2594,10 +2608,28 @@ static void mac_to_trunk(struct p25_trunk *t,struct p25_mac_struct const *ms,uin
 // An LCCH PDU that passed its check: this channel is a Phase 2 control channel. Each structure is
 // logged, as a Phase 1 control channel's TSBKs are, and goes to the site's trunking logic. The
 // NAC is the PDU's color code (bits 152-163 of a MAC_SIGNAL, as OP25 and sdrtrunk read it); the
-// WACN and system ID come from its network status broadcast, as on a Phase 1 control channel
+// WACN and system ID come from its network status broadcast, as on a Phase 1 control channel.
+// The color code is also the only defence against another system's control channel on the same
+// frequency: an outbound LCCH is never scrambled (TIA-102.BBAC-A 5.4, Table 13), and on TDMA
+// co-channel interference is rejected by an invalid color code in unscrambled PDUs
+// (TIA-102.BBAD-A 4.10). So the site's is established once Cc_established PDUs in a row carry the
+// same one, and from then a PDU carrying another is logged with -v and not acted on. Until then
+// each PDU's color code is taken, as before
+static int const Cc_established = 3;
 static void p2_control(struct decoder *dp,int ts,uint64_t sample,struct p25_mac_pdu const *pdu){
-  if(pdu->type == P25_MAC_SIGNAL && pdu->lcch_nac != 0)
-    dp->site_nac = pdu->lcch_nac;
+  if(pdu->type == P25_MAC_SIGNAL){
+    if(dp->lcch_cc_count >= Cc_established){
+      if(pdu->lcch_nac != dp->site_nac){
+	if(Verbose)
+	  decoder_event(dp,sample,"NAC %03x slot %d LCCH PDU with color code %03x: another system's, ignored",dp->site_nac,ts,pdu->lcch_nac);
+	return;
+      }
+    } else if(pdu->lcch_nac != 0){
+      dp->lcch_cc_count = pdu->lcch_nac == dp->lcch_cc ? dp->lcch_cc_count + 1 : 1;
+      dp->lcch_cc = pdu->lcch_nac;
+      dp->site_nac = pdu->lcch_nac;
+    }
+  }
   bool const new_slot = !dp->lcch[ts];
   dp->lcch[ts] = true;
   char text[512];
@@ -2737,6 +2769,14 @@ static void p2_burst(void *arg,struct p25p2_burst const *b){
   struct p25_mac_pdu pdu;
   bool const have_pdu = b->mac != NULL && b->mac->crc_ok
     && p25_mac_decode(&pdu,(enum p25_mac_chan)b->mac->chan,b->mac->octets,b->mac->nbits) >= 0;
+  if(have_pdu && pdu.type == P25_MAC_END_PTT){
+    int const cc = b->color_code >= 0 ? b->color_code : dp->voice ? dp->voice_nac : dp->site_nac; // 0: none known
+    if(cc != 0 && pdu.nac != cc){
+      if(Verbose)
+	decoder_event(dp,sample,"slot %d END PTT with color code %03x, not the site's %03x: another system's, ignored",ts,pdu.nac,cc);
+      return;
+    }
+  }
   // A multi-fragment message (extended unit-to-unit grants and the like) is put together from
   // consecutive LCCH bursts, the only ones that carry them (TIA-102.BBAD-A 3); once complete it is
   // handled as one more PDU with that one structure. An LCCH burst lost drops what was pending
@@ -2792,7 +2832,7 @@ static void p2_burst(void *arg,struct p25p2_burst const *b){
 	m.family = P25_FAMILY_HDU; // what a Phase 1 header says: talkgroup and encryption
 	m.kind = P25_HDU;
 	m.mfid = P25_MFID_STD;
-	m.group = pdu.group;
+	m.group = pdu.group; // 0 for an individual call: no talkgroup named, no call started
 	m.algid = pdu.algid;
 	m.kid = pdu.kid;
 	memcpy(m.mi,pdu.mi,sizeof m.mi);
@@ -2809,8 +2849,10 @@ static void p2_burst(void *arg,struct p25p2_burst const *b){
 	  struct p25_mac_struct const * const ms = &pdu.s[i];
 	  if(ms->mac_kind == P25_MAC_MSG && voice_user_kind(ms->msg.kind)){
 	    // Who holds the timeslot, for the next voice burst. Only while voice is under way:
-	    // an idle or hang time PDU names the call, not a transmission
-	    if(pdu.type == P25_MAC_ACTIVE || pdu.type == P25_MAC_SIGNAL){
+	    // an idle or hang time PDU names the call, not a transmission; and not from the SACCH
+	    // of an ultraframe's last superframe, which names the inbound talker (see above)
+	    bool const identity = b->mac->chan != P25_MAC_SACCH || (b->ultraframe >= 0 && b->ultraframe < 3);
+	    if((pdu.type == P25_MAC_ACTIVE || pdu.type == P25_MAC_SIGNAL) && identity){
 	      s->user = ms->msg;
 	      s->user.family = P25_FAMILY_LC;
 	      s->have_user = true;
