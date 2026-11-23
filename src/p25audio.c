@@ -506,6 +506,7 @@ struct p25_audio {
   uint16_t nac;
   bool have_call;
   bool unit_call;          // unit to unit: 'target' is a unit, else a talkgroup
+  bool telephone;          // a unit call by telephone interconnect: 'target' is the radio in it
   uint32_t target;
   uint32_t source;
   char stream_description[128]; // from p25_audio_set_stream(), "" if none
@@ -609,7 +610,7 @@ static void make_description(struct p25_audio *a){
   int n = 0;
   if(a->have_call){
     if(a->unit_call)
-      n = snprintf(cp,room,"P25 unit %u",a->target);
+      n = snprintf(cp,room,"P25 %s %u",a->telephone ? "telephone" : "unit",a->target);
     else
       n = snprintf(cp,room,"P25 TG %u",a->target);
     if(n > 0 && (size_t)n < room && a->source != 0)
@@ -992,13 +993,15 @@ static bool next_unit(uint64_t later,int64_t earlier){
 
 // A voice channel user word (Phase 1 link control, Phase 2 MAC structure). The telephone
 // interconnect form names one address, the radio in the call: it is taken as a unit call to that
-// radio with no source (the decoders leave src zero)
+// radio with no source (the decoders leave src zero), described as "P25 telephone", as a trunked
+// telephone call's stream is (p25d.c)
 static void voice_user(struct p25_audio *a,struct p25_msg const *msg){
   switch(msg->kind){
   case P25_LC_GRP_V_CH_USR:
   case P25_LC_MOT_GRG_V_CH_USR:
     a->have_call = true;
     a->unit_call = false;
+    a->telephone = false;
     a->target = msg->group;
     a->source = msg->src;
     a->encrypted |= (msg->svc & P25_SVC_ENCRYPTED) != 0;
@@ -1007,6 +1010,7 @@ static void voice_user(struct p25_audio *a,struct p25_msg const *msg){
   case P25_LC_TEL_INT_V_CH_USR:
     a->have_call = true;
     a->unit_call = true;
+    a->telephone = msg->kind == P25_LC_TEL_INT_V_CH_USR;
     a->target = msg->tgt;
     a->source = msg->src;
     a->encrypted |= (msg->svc & P25_SVC_ENCRYPTED) != 0;
@@ -1030,6 +1034,7 @@ static void call_info(struct p25_audio *a,struct p25_frame const *frame){
     got_crypto(a,msg.algid,msg.kid,msg.mi,(int64_t)frame->dibit); // for the first superframe
     a->have_call = true;
     a->unit_call = false;
+    a->telephone = false;
     a->target = msg.group;
     a->source = 0;
     break;
@@ -1244,6 +1249,7 @@ static void mac_info(struct p25_audio *a,struct p25p2_burst const *b){
     if(pdu.group != 0){
       a->have_call = true;
       a->unit_call = false;
+      a->telephone = false;
       a->target = pdu.group;
     }
     // else an individual call's PTT (TIA-102.BBAC 7.3.1): group 0 is reserved and names no
