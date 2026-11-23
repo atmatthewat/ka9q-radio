@@ -211,6 +211,7 @@ struct decoder {
   struct p2slot slot[2];
   bool choosing;           // rx not known yet: both receivers run, the first to decode stays
   bool lcch[2];            // Phase 2 control channel: timeslots its LCCH has been heard on
+  struct p25_mac_frag lcch_frag; // and a multi-fragment message being put together from it
   bool scrambling;         // Phase 2: scrambling parameters set
   bool scrambling_said;    // and said once that they are not known yet
   double samprate;
@@ -2736,12 +2737,25 @@ static void p2_burst(void *arg,struct p25p2_burst const *b){
   struct p25_mac_pdu pdu;
   bool const have_pdu = b->mac != NULL && b->mac->crc_ok
     && p25_mac_decode(&pdu,(enum p25_mac_chan)b->mac->chan,b->mac->octets,b->mac->nbits) >= 0;
+  // A multi-fragment message (extended unit-to-unit grants and the like) is put together from
+  // consecutive LCCH bursts, the only ones that carry them (TIA-102.BBAD-A 3); once complete it is
+  // handled as one more PDU with that one structure. An LCCH burst lost drops what was pending
+  struct p25_mac_pdu whole;
+  bool have_whole = false;
+  if(b->duid == P25P2_DUID_LCCH && have_pdu){
+    whole = pdu;
+    whole.nstruct = 1;
+    have_whole = p25_mac_frag_add(&dp->lcch_frag,&pdu,&whole.s[0]);
+  } else if(dp->lcch[ts] && !have_pdu)
+    p25_mac_frag_reset(&dp->lcch_frag);
   if(b->duid == P25P2_DUID_LCCH && !dp->voice){
     // The control channel itself
     if(have_pdu)
       p2_control(dp,ts,sample,&pdu);
     else
       p2_log(dp,s,ts,sample,b,NULL);
+    if(have_whole)
+      p2_control(dp,ts,sample,&whole);
     return;
   }
   p2_log(dp,s,ts,sample,b,have_pdu ? &pdu : NULL);

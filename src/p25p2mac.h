@@ -1,5 +1,5 @@
-// P25 Phase 2 MAC PDU parsing (TIA-102.BBAC): PTT and END PTT, and the up to three MAC
-// structures of a SIGNAL, IDLE, ACTIVE or HANGTIME PDU, decoded into struct p25_msg
+// P25 Phase 2 MAC PDU parsing (TIA-102.BBAC, BBAD-A): PTT and END PTT, and the MAC structures
+// of a SIGNAL, IDLE, ACTIVE or HANGTIME PDU, decoded into struct p25_msg
 // Copyright 2026, Matthew Kaufman, KA6SQG
 
 #ifndef _P25P2MAC_H
@@ -58,6 +58,9 @@ struct p25_mac_grant {
 };
 
 #define P25_MAC_MAX_RAW 24
+// Messages a PDU can hold: 20 octets of a SACCH PDU after its header, and no message shorter
+// than 2 octets (opcode and length octet)
+#define P25_MAC_MAX_STRUCT 10
 
 // One MAC structure. msg holds what the Phase 1 messages also have, so the trunking logic and
 // p25_format() take it as they take a TSBK; the fields after it are those only Phase 2 has, for
@@ -99,6 +102,7 @@ struct p25_mac_pdu {
   enum p25_mac_chan chan;
   uint8_t type;                // P25_MAC_PTT ...
   uint8_t offset_4v;           // offset to the next 4V burst, bits 3-5 (TIA-102.BBAD-A 4.2)
+  bool protect;                // bit 7, protected: p25_mac_decode() then returns -1 (BBAD-A 4.3)
   uint16_t lcch_nac;           // LCCH: color code, bits 152-163 (TIA-102.BBAD-A 2.1)
 
   // PTT: MI 8-79, ALGID 80-87, KID 88-103, source 104-127, group 128-143
@@ -111,10 +115,11 @@ struct p25_mac_pdu {
   uint16_t nac;                // END PTT color code
 
   int nstruct;
-  struct p25_mac_struct s[3];
+  struct p25_mac_struct s[P25_MAC_MAX_STRUCT];
 };
 
-// Parse a PDU. Returns the number of structures, or -1 if pdu is NULL or nbits < 8.
+// Parse a PDU. Returns the number of structures, or -1 if pdu is NULL, nbits < 8, or the PDU
+// is protected (TIA-102.BBAD-A 4.3: discarded by a receiver without the protection).
 int p25_mac_decode(struct p25_mac_pdu *pdu, enum p25_mac_chan chan, uint8_t const *octets, int nbits);
 
 // Structure length rule alone: octets of the structure at bit offset, opcode included, as
@@ -127,6 +132,28 @@ int p25_mac_struct_len(uint8_t const *octets, int nbits, enum p25_mac_chan chan,
 // P25_GRP_V_CH_GRANT_UPDT_EXP), each with its own service options; anything else none.
 // Returns how many (0-3) were written to out[]
 int p25_mac_trunk_msgs(struct p25_mac_struct const *s, struct p25_msg out[3]);
+
+// Multi-fragment messages (TIA-102.BBAD-A 3: 0x71, 0xc7, 0xcb, 0xcd, 0xce, 0xcf, 0xd9, 0xdb,
+// 0xde, 0xe0): a first fragment and continuations (0x10) in the LCCH bursts that follow (both
+// timeslots' on a dual LCCH). One struct p25_mac_frag per LCCH, zeroed (or p25_mac_frag_reset())
+// to begin. Feed it every LCCH PDU that passed its CRC, in order, and reset it at an LCCH burst
+// that did not (a continuation may have been lost); a PDU without a fragment, another message, a
+// new first fragment, a length that cannot be right or a Multi-Fragment CRC-16 that fails also
+// drops what is pending, so a half message never lingers. True when this PDU completed one: *out
+// is it, parsed into the same kinds as the single-PDU forms (offset 0, len its octets), ready for
+// p25_mac_trunk_msgs() and p25_mac_format()
+#define P25_MAC_FRAG_MAX 64          // octets of a reassembled message
+struct p25_mac_frag {
+  bool active;
+  uint8_t opcode;
+  int need;                          // data octets the first fragment announced
+  int have;                          // data octets received
+  int len;                           // octets in buf: the message as one structure
+  uint8_t buf[P25_MAC_FRAG_MAX];
+};
+bool p25_mac_multi_frag(uint8_t opcode);
+void p25_mac_frag_reset(struct p25_mac_frag *f);
+bool p25_mac_frag_add(struct p25_mac_frag *f, struct p25_mac_pdu const *pdu, struct p25_mac_struct *out);
 
 // One log line, no newline. index -1 (or a PTT / END PTT PDU) is the PDU itself; 0..nstruct-1
 // a structure: "MAC <kind> chan=<sacch|facch|lcch> pdu=<type>" then key=value fields as

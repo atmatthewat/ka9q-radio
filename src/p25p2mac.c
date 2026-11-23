@@ -14,7 +14,8 @@
 // corrected it and checked its CRC: 180 bits (22.5 octets) from a SACCH or an LCCH, 156 (19.5
 // octets) from a FACCH. Every PDU starts with an 8-bit MAC PDU header: a 3-bit opcode (the PDU
 // type; elsewhere in this file "opcode" means a structure's), a 3-bit offset, a reserved bit
-// and the protected bit P (TIA-102.BBAD-A 2.1); P is not read here. A SACCH or FACCH PDU ends
+// and the protected bit P (TIA-102.BBAD-A 2.1); a PDU with P set is discarded (p25_mac_decode()
+// returns -1), as 4.3 has a receiver that cannot undo the protection do. A SACCH or FACCH PDU ends
 // in a CRC-12, g(x) = x^12 + x^11 + x^7 + x^4 + x^2 + x + 1, sent inverted, over everything
 // before it from the header on (TIA-102.BBAC 8.4.5): from bit 168 or bit 144. An outbound
 // LCCH PDU ends instead in a 28-bit trailer, the site's 12-bit color code (its NAC, bits
@@ -40,16 +41,20 @@
 // does not know. A length counts every octet of the structure in this PDU, the opcode and the
 // length octet included (4.11). A manufacturer's structure has its MFID in octet 1 and its
 // length in the low six bits of octet 2 (3.36). struct_len() follows that with the tables
-// below for the fixed lengths and for the vendors, LEN for paging, the length octet for null
-// avoid zero bias and multi-fragment continuation, and for the manufacturer partition the
-// length in octet 2 when that is plausible (not every one sets it). An opcode no table knows
-// is taken to fill the rest of the PDU: a wrong guess at its length would misread every
-// structure after it, while taking the rest loses only those. TIA-102.BBAD-A 3 puts a
+// below for the fixed lengths and for the vendors, LEN for paging (LEN + 1 IDs, Tables 6 and 7),
+// the length octet for null avoid zero bias and multi-fragment first fragments and
+// continuations, and for the manufacturer partition the length in octet 2 when that is
+// plausible (3 or more and inside the PDU: not every one sets it), else the vendor table's. An
+// opcode no table knows is stepped over by its length octet when that is plausible (2 or more,
+// inside the PDU), and the walk goes on; otherwise it is taken to fill the rest of the PDU: a
+// wrong guess at its length would misread every structure after it, while taking the rest
+// loses only those. TIA-102.BBAD-A 3 puts a
 // manufacturer's structures after the standard ones and Null Information (or Null Avoid Zero
 // Bias Information) last, filling what is left, so a receiver that cannot size a structure
 // loses nothing standard after it; on the LCCH more than one octet of fill is Null
 // Information if the burst is scrambled and Null Avoid Zero Bias if not (2.2.3). The standard
-// puts as many structures in a PDU as fit (2.2.3, 2.3.3.3); this walk keeps up to three. A
+// puts as many structures in a PDU as fit (2.2.3, 2.3.3.3), and so does this walk (up to
+// P25_MAC_MAX_STRUCT: a SACCH PDU's 20 octets, no structure shorter than 2). A
 // NULL INFORMATION opcode (0x00) after the first, or a length of 0, ends it, and a PDU whose
 // first opcode is 0x00 has that one null structure.
 //
@@ -78,6 +83,11 @@
 // uplink channel in ch_b), and the multiple group grant updates 0x05 and 0x25, which no TSBK
 // has, as one single update per call. So the call tracking has no Phase 2 cases of its own.
 // The other P25_MAC_ kinds (paging, power control, release, aliases ...) are for the log.
+//
+// Multi-fragment messages. A message too long for one LCCH PDU comes as a first fragment and
+// continuations in the LCCH bursts that follow, its data ending in a Multi-Fragment CRC-16
+// (TIA-102.BBAD-A 3, 4.7, 4.11, 4.12); p25_mac_frag_add() puts it together and parses it as one
+// structure, which then goes the same way as the others.
 
 // The PDU: octets MSB first, nbits of them valid. Bits past nbits read as zero.
 struct pdu_bits {
@@ -99,7 +109,8 @@ static uint32_t get_field(struct pdu_bits const *b, int off, int len){
   return v;
 }
 
-// Structure lengths in octets, opcode included. 0: not listed (standard: the rest of the PDU;
+// Structure lengths in octets, opcode included. 0: not listed (standard: its length octet when
+// plausible, else the rest of the PDU;
 // vendor: the vendor length field). VAR: variable, from the structure's own length field.
 // REST: the rest of the PDU.
 //
@@ -108,10 +119,13 @@ static uint32_t get_field(struct pdu_bits const *b, int off, int len){
 // against OP25 (gr-op25_repeater/lib/p25p2_tdma.cc mac_msg_len), Max H. Parke KA1RBI and
 // Graham J. Norbury, GPL-3. Where they differ the length that the structure's fields need
 // is taken: 0x45, 0x4a and 0xc5 are OP25's, as sdrtrunk's own field layouts for them end at
-// 8, 9 and 12 octets. 0xe3, 0xed, 0xf6 and 0xf8 are OP25's alone. The Motorola regroup
-// extended function command is 0x84, as OP25 has it and sdrtrunk names it (its value, 0x85,
-// disagrees with its name). Multi-fragment base structures (0x71, 0xc7 ...) are 18 octets,
-// the fragment an LCCH PDU holds; OP25 lists the whole message's length there instead.
+// 8, 9 and 12 octets, as TIA-102.BBAD-A Table 4 has them. 0xe3, 0xed, 0xf6 and 0xf8 are OP25's
+// alone (inbound messages in Table 4). The MFID90 extended function command is 0x84, 11 octets
+// (BBAD-A 3.88, Table 4; sdrtrunk's value 0x85 disagrees with the standard and its own name).
+// Real Motorola traffic carries a 0x85 the standard does not list: its length comes from its
+// length octet, its contents are not decoded. Multi-fragment first fragments (0x71,
+// 0xc7 ...) are at most 18 octets, what an LCCH PDU holds, and their own length octet says;
+// OP25 lists the whole message's length there instead (see p25_mac_frag_add()).
 // The standard's list of lengths is TIA-102.BBAD-A 3, Table 4. An outbound LCCH PDU holds
 // octets 1-18 of structures (TIA-102.BBAD-A 2.2.1), the 18 above.
 #define VAR 0xff
@@ -144,6 +158,8 @@ static const uint8_t Harris_len[64] = {
   [0x20] = 9, [0x28] = REST, [0x2a] = 17, [0x2c] = 12,
 };
 
+bool p25_mac_multi_frag(uint8_t opcode);
+
 static bool vendor_partition(uint8_t op){
   return op >= 0x80 && op <= 0xbf && op != 0x88 && op != 0x90;
 }
@@ -167,23 +183,35 @@ static int struct_len(struct pdu_bits const *b, int maxidx, int offset, uint8_t 
     int fixed = 0;
     if(tbl != NULL && tbl[op - 0x80] != 0 && tbl[op - 0x80] != VAR)
       fixed = tbl[op - 0x80] == REST ? -1 : tbl[op - 0x80];
+    // Its length octet counts the opcode, MFID and length octets (BBAD-A 3.36): fewer than 3, or
+    // more than the PDU holds, cannot be right; then the table's length, else the rest of the PDU
     if(lf >= 3 && lf <= remaining)
       len = lf;
     else
-      len = fixed != 0 ? fixed : lf;
+      len = fixed != 0 ? fixed : -1;
   } else {
     uint8_t const t = Std_len[op];
-    if(t == 0 || t == REST)
+    if(t == REST)
       len = -1;
-    else if(t == VAR){
-      int const count = get_field(b, offset + 14, 2);
-      // paging: 2-octet groups or 3-octet units; a count of 0 is four of them
-      static const uint8_t group_paging[4] = { 10, 4, 6, 8 };
-      static const uint8_t unit_paging[4] = { 14, 5, 8, 11 };
+    else if(t == 0){
+      // Not in the table. Every message added since the standard's first publication carries its
+      // length in the low 6 bits of its second octet, so that older units can skip it (BBAD-A
+      // 3): taken when plausible, and the walk goes on; otherwise the rest of the PDU
+      int const lf = get_field(b, offset + 10, 6);
+      len = lf >= 2 && lf <= remaining ? lf : -1;
+    } else if(p25_mac_multi_frag(op)){
+      // The first fragment of a multi-fragment message: its own length octet (BBAD-A 4.11); the
+      // table's 18 is the most an outbound LCCH PDU holds
+      int const lf = get_field(b, offset + 10, 6);
+      len = lf >= 3 && lf <= remaining ? lf : t;
+    } else if(t == VAR){
+      // Paging: LEN (bits 14-15) + 1 IDs, 2-octet groups or 3-octet units (BBAD-A 3.37 and 3.38,
+      // Tables 6 and 7); the others carry their length in bits 10-15
+      int const count = get_field(b, offset + 14, 2) + 1;
       if(op == 0x11)
-        len = group_paging[count];
+        len = 2 + 2 * count;
       else if(op == 0x12)
-        len = unit_paging[count];
+        len = 2 + 3 * count;
       else
         len = get_field(b, offset + 10, 6);
     } else
@@ -244,10 +272,10 @@ static void as_tsbk(struct ctx const *c, int at, uint8_t tsbk_opcode, uint8_t mf
 
 // Partition 1 (0x40-0x7f): where TSBK bit 16 lies in the structure; 0 means decoded here
 static const int8_t P1_at[64] = {
-  [0x00] = 8, [0x02] = 8, [0x04] = 8, [0x06] = 8, [0x0c] = 16, [0x14] = 8, [0x18] = 16,
+  [0x00] = 8, [0x02] = 8, [0x04] = 8, [0x06] = 8, [0x14] = 8, [0x18] = 16,
   [0x1a] = -8, [0x1c] = 16, [0x1f] = -8, [0x20] = 8, [0x21] = 8, [0x24] = 8, [0x27] = 8,
   [0x28] = 16, [0x2a] = -8, [0x2b] = 16, [0x2c] = 16, [0x2d] = 8, [0x2f] = 8, [0x30] = 8,
-  [0x31] = 8, [0x32] = 8, [0x33] = 8, [0x34] = 8, [0x37] = 8, [0x38] = 8, [0x39] = 8,
+  [0x32] = 8, [0x33] = 8, [0x34] = 8, [0x37] = 8, [0x38] = 8, [0x39] = 8,
   [0x3a] = 8, [0x3b] = 8, [0x3c] = 8, [0x3d] = 8,
 };
 
@@ -376,11 +404,11 @@ static void decode_standard(struct ctx const *c){
     s->mac_kind = P25_MAC_MULTI_FRAG;
     break;
   case 0x11:
-  case 0x12: // count 14-15, then 16-bit groups or 24-bit units
+  case 0x12: // LEN 14-15 (that many IDs less one), then 16-bit groups or 24-bit units
     {
       s->mac_kind = op == 0x11 ? P25_MAC_GRP_PAGING : P25_MAC_IND_PAGING;
       int const w = op == 0x11 ? 16 : 24;
-      for(int i = 0; i < 4 && 16 + w * (i + 1) <= s->len * 8; i++)
+      for(int i = 0; i <= (int)F(c, 14, 2) && 16 + w * (i + 1) <= s->len * 8; i++)
         s->paged[s->npaged++] = F(c, 16 + w * i, w);
     }
     break;
@@ -408,7 +436,7 @@ static void decode_standard(struct ctx const *c){
   case 0x48:
   case 0x49:
     m->kind = op == 0x48 ? P25_TELE_INT_CH_GRANT : P25_TELE_INT_CH_GRANT_UPDT;
-    m->svc = F(c, 8, 8);
+    m->svc = F(c, 16, 8); // octet 2 is the length (TIA-102.BBAD-A 3.44, 3.45)
     m->ch = CH(c, 24);
     m->timer = F(c, 40, 16);
     m->tgt = F(c, 56, 24);
@@ -418,6 +446,14 @@ static void decode_standard(struct ctx const *c){
     for(int i = 0; i < 10; i++)
       s->digits[i] = "0123456789abcdef"[F(c, 8 + 4 * i, 4)];
     m->tgt = F(c, 48, 24);
+    break;
+  case 0x4c: // radio unit monitor command (BBAD-A 3.43, Figure 99): length, TX time 16, SM 24,
+             // TX multiplier 30, target 32, source 56; not the TSBK 0x0c layout (the old TSBK
+             // form, 0x1d, is 0x5d, "obsolete")
+    m->kind = P25_RAD_MON_CMD;
+    m->tx_mult = F(c, 30, 2);
+    m->tgt = F(c, 32, 24);
+    m->src = F(c, 56, 24);
     break;
   case 0x55:
     m->kind = P25_SN_DATA_PAGE_REQ;
@@ -482,7 +518,7 @@ static void decode_standard(struct ctx const *c){
   case 0xc8:
   case 0xc9:
     m->kind = op == 0xc8 ? P25_TELE_INT_CH_GRANT : P25_TELE_INT_CH_GRANT_UPDT;
-    m->svc = F(c, 8, 8);
+    m->svc = F(c, 16, 8); // octet 2 is the length (BBAD-A 3.44, 3.45)
     m->ch = CH(c, 24);
     m->ch_b = CH(c, 40);
     m->has_b = true;
@@ -557,6 +593,22 @@ static void decode_standard(struct ctx const *c){
   case 0xfb:
   case 0xfc:
   case 0xfe:
+    if(op == 0xfe){
+      // Adjacent status, extended explicit (BBAD-A 3.18, Figure 55): a length octet, so every
+      // field is one octet later than in 0xfc, then the WACN
+      m->kind = P25_ADJ_STS_BCST_EXP;
+      m->lra = F(c, 16, 8);
+      m->site_flags = F(c, 24, 4);
+      m->sysid = F(c, 28, 12);
+      m->rfss = F(c, 40, 8);
+      m->site = F(c, 48, 8);
+      m->ch = CH(c, 56);
+      m->ch_b = CH(c, 72);
+      m->has_b = true;
+      m->svc_class = F(c, 88, 8);
+      m->wacn = F(c, 96, 20);
+      break;
+    }
     m->lra = F(c, 8, 8);
     m->ch = CH(c, 48);
     m->ch_b = CH(c, 64);
@@ -575,8 +627,6 @@ static void decode_standard(struct ctx const *c){
     m->sysid = F(c, 20, 12);
     m->rfss = F(c, 32, 8);
     m->site = F(c, 40, 8);
-    if(op == 0xfe)
-      m->wacn = F(c, 96, 20);
     break;
   case 0x71: case 0xc5: case 0xc7: case 0xcb: case 0xcc: case 0xcd: case 0xce: case 0xcf:
   case 0xd9: case 0xdb: case 0xde: case 0xe0: case 0xe3: case 0xe4: case 0xe5: case 0xed:
@@ -604,8 +654,10 @@ static void decode_motorola(struct ctx const *c){
   struct p25_mac_struct *s = c->s;
   struct p25_msg *m = &s->msg;
   switch(s->opcode){
-  case 0x80: // octet 2 is the vendor length: no service options
+  case 0x80: // MFID 8, then octet 3: reserved, P (protected: an encrypted call), reserved
+             // (BBAD-A 3.86, Figure 178): the encryption as service options would give it
     m->kind = P25_LC_MOT_GRG_V_CH_USR;
+    m->svc = B(c, 17) ? P25_SVC_ENCRYPTED : 0;
     m->group = F(c, 24, 16);
     m->src = F(c, 40, 24);
     break;
@@ -626,7 +678,7 @@ static void decode_motorola(struct ctx const *c){
       for(int i = 0; i < n; i++)
         s->members[i] = F(c, 40 + 16 * i, 16);
       s->nmembers = n;
-      m->nmembers = n < 3 ? n : 3;
+      m->nmembers = n; // all of them to the trunking logic (BBAD-A 3.92: up to six)
       memcpy(m->members, s->members, m->nmembers * sizeof m->members[0]);
     }
     break;
@@ -635,7 +687,7 @@ static void decode_motorola(struct ctx const *c){
     m->group = F(c, 24, 16);
     m->ch = CH(c, 40);
     break;
-  case 0x84:
+  case 0x84: // the extended function command TSBK after the vendor octets (BBAD-A 3.88)
     as_tsbk(c, 24, 0x04, P25_MFID_MOTOROLA);
     break;
   case 0x91: // talkgroup, blocks, format, sequence; the 64-bit fragment from 72 starts with the SUID
@@ -718,11 +770,79 @@ static void decode_harris(struct ctx const *c){
   }
 }
 
-static void decode_struct(struct pdu_bits const *b, struct p25_mac_struct *s){
+// A multi-fragment message, reassembled (p25_mac_frag_add()): its first fragment's 18 octets,
+// then each continuation's octets after its opcode and length octets, so a field the sources
+// place at bit X of the continuation is at X + 128 here. Field positions after sdrtrunk's
+// structure classes (module/decode/p25/phase2/message/mac/structure, Dennis Sheirer, GPL-3).
+// Every one carries a source SUID; only the fields p25msg has room for are kept
+static void decode_multi(struct ctx const *c){
+  struct p25_mac_struct *s = c->s;
+  struct p25_msg *m = &s->msg;
+  switch(s->opcode){
+  case 0xc7: // unit-to-unit voice channel grant update, extended (LCCH)
+  case 0xcf: // unit-to-unit voice service channel grant, extended (LCCH)
+    // Service options 24, source 32, source SUID 56, transmit channel 112, receive channel 128;
+    // continuation: target 16 (here 144), target SUID 40 (168), multi-fragment CRC 96 (224).
+    // sdrtrunk's 0xc7 class puts the continuation's target SUID at 56 and the receive channel
+    // number at 128; the 0xcf layout is taken for both (OP25's length table gives both 32 octets,
+    // which is where the 0xcf layout ends)
+    m->kind = s->opcode == 0xcf ? P25_UU_V_CH_GRANT : P25_UU_V_CH_GRANT_UPDT;
+    m->svc = F(c, 24, 8);
+    m->src = F(c, 32, 24);
+    suid(c, 56);
+    m->ch = CH(c, 112);
+    m->ch_b = CH(c, 128);
+    m->has_b = true;
+    m->tgt = F(c, 144, 24);
+    break;
+  case 0xcb: // call alert: source 24, source SUID 48, target 104
+  case 0xdb: // status query: the same
+    m->kind = s->opcode == 0xcb ? P25_CALL_ALRT : P25_STS_Q;
+    m->src = F(c, s->opcode == 0xcb ? 24 : 104, 24);
+    m->tgt = F(c, s->opcode == 0xcb ? 104 : 24, 24);
+    suid(c, 48);
+    break;
+  case 0xcd: // radio unit monitor command: multiplier 38, target 40, source SUID 64, source 120
+  case 0xce: // message update: message 24, target 40, source SUID 64, source 120
+  case 0xd9: // status update: unit status 24, user status 32, target 40, source SUID 64, source 120
+    m->kind = s->opcode == 0xcd ? P25_RAD_MON_CMD : s->opcode == 0xce ? P25_MSG_UPDT : P25_STS_UPDT;
+    m->tx_mult = F(c, 38, 2);
+    m->message = F(c, 24, 16);
+    m->unit_status = F(c, 24, 8);
+    m->user_status = F(c, 32, 8);
+    m->tgt = F(c, 40, 24);
+    suid(c, 64);
+    m->src = F(c, 120, 24);
+    break;
+  case 0xde: // radio unit monitor enhanced command: target 24, source SUID 48; continuation: source 16 (144)
+    m->kind = P25_RAD_MON_CMD;
+    m->tgt = F(c, 24, 24);
+    suid(c, 48);
+    m->src = F(c, 144, 24);
+    break;
+  case 0xe0: // acknowledge response (FNE): service type 26, source SUID 32; continuation: target 40 (168)
+    m->kind = P25_ACK_RSP_FNE;
+    m->svc_type = F(c, 26, 6);
+    suid(c, 32);
+    m->tgt = F(c, 168, 24);
+    break;
+  case 0x71: // authentication demand: target 24, target SUID 48, then the challenge
+    m->kind = P25_AUTH_DMAND;
+    m->tgt = F(c, 24, 24);
+    break;
+  default:
+    s->mac_kind = P25_MAC_OTHER;
+    break;
+  }
+}
+
+static void decode_struct(struct pdu_bits const *b, struct p25_mac_struct *s, bool multi){
   struct ctx c = { b, s };
   struct p25_msg *m = &s->msg;
   memset(m, 0, sizeof *m);
-  if(s->vendor == P25_MFID_MOTOROLA)
+  if(multi)
+    decode_multi(&c);
+  else if(s->vendor == P25_MFID_MOTOROLA)
     decode_motorola(&c);
   else if(s->vendor == P25_MFID_HARRIS)
     decode_harris(&c);
@@ -751,6 +871,11 @@ int p25_mac_decode(struct p25_mac_pdu *pdu, enum p25_mac_chan chan, uint8_t cons
   struct pdu_bits b = { octets, nbits };
   pdu->type = get_field(&b, 0, 3);
   pdu->offset_4v = get_field(&b, 3, 3);
+  // The protected bit (header bit 0, BBAD-A 2.1 and 4.3): a receiver that cannot undo the
+  // protection discards the PDU, so nothing in it (a PTT's encryption, a grant) is ever believed
+  pdu->protect = get_field(&b, 7, 1);
+  if(pdu->protect)
+    return -1;
   if(chan == P25_MAC_LCCH)
     pdu->lcch_nac = get_field(&b, 152, 12);
 
@@ -777,10 +902,11 @@ int p25_mac_decode(struct p25_mac_pdu *pdu, enum p25_mac_chan chan, uint8_t cons
     return 0;
   }
 
-  // Up to three structures from bit 8; a NULL INFORMATION opcode ends the list
+  // Structures from bit 8 as long as they fit (BBAD-A 2.2.3 sets no count); a NULL INFORMATION
+  // opcode ends the list
   int const maxidx = max_index(chan);
   int offset = 8;
-  for(int n = 0; n < 3 && offset + 8 <= maxidx && offset + 8 <= nbits; n++){
+  for(int n = 0; n < P25_MAC_MAX_STRUCT && offset + 8 <= maxidx && offset + 8 <= nbits; n++){
     uint8_t const op = get_field(&b, offset, 8);
     if(n > 0 && op == 0x00)
       break;
@@ -794,12 +920,114 @@ int p25_mac_decode(struct p25_mac_pdu *pdu, enum p25_mac_chan chan, uint8_t cons
     for(int i = 0; i < k; i++)
       s->raw[i] = get_field(&b, offset + 8 * i, 8);
     s->raw_len = k;
-    decode_struct(&b, s);
+    decode_struct(&b, s, false);
     if(op == 0x00 || s->len <= 0)
       break;
     offset += s->len * 8;
   }
   return pdu->nstruct;
+}
+
+// ---- Multi-fragment messages (TIA-102.BBAD-A 3, 4.7, 4.11, 4.12) ----
+// A message too long for one PDU (the extended-address LCCH forms, and the authentication demand)
+// is sent as a first fragment, one of the opcodes below, filling an LCCH PDU (18 octets), then
+// continuation fragments (opcode 0x10) in the following LCCH bursts, in order: there is no
+// sequence number. Only the LCCH carries them. Every fragment has its length (its octets in this
+// PDU) in the low 6 bits of its second octet; the first fragment's third octet is the data length,
+// the message's octets less the first two of each fragment. The data ends with a Multi-Fragment
+// CRC-16 over the rest of it. The opcodes and lengths are Table 4's; sdrtrunk
+// (MacStructureMultiFragment.java; Dennis Sheirer, GPL-3) and the reference decoder read them the
+// same way, neither checks the CRC.
+
+bool p25_mac_multi_frag(uint8_t opcode){
+  switch(opcode){
+  case 0x71: case 0xc7: case 0xcb: case 0xcd: case 0xce: case 0xcf: case 0xd9: case 0xdb: case 0xde: case 0xe0:
+    return true;
+  default:
+    return false;
+  }
+}
+
+// The Multi-Fragment CRC-16 (BBAD-A 4.7): the FDMA header block's CRC, generator
+// x^16 + x^12 + x^5 + 1, result inverted, over n octets
+static uint16_t frag_crc(uint8_t const *p, int n){
+  uint16_t crc = 0;
+  for(int i = 0; i < 8 * n; i++){
+    int const bit = (p[i >> 3] >> (7 - (i & 7))) & 1;
+    bool const top = (crc & 0x8000) != 0;
+    crc <<= 1;
+    if(top != (bit != 0))
+      crc ^= 0x1021;
+  }
+  return crc ^ 0xffff;
+}
+
+void p25_mac_frag_reset(struct p25_mac_frag *f){
+  if(f != NULL)
+    memset(f, 0, sizeof *f);
+}
+
+bool p25_mac_frag_add(struct p25_mac_frag *f, struct p25_mac_pdu const *pdu, struct p25_mac_struct *out){
+  if(f == NULL || pdu == NULL || out == NULL)
+    return false;
+  bool done = false, fragment = false;
+  for(int i = 0; i < pdu->nstruct; i++){
+    struct p25_mac_struct const *s = &pdu->s[i];
+    int const n = s->len < s->raw_len ? s->len : s->raw_len; // octets of it the PDU holds
+    if(s->vendor == 0 && p25_mac_multi_frag(s->opcode)){
+      // A first fragment: whatever was pending is dropped
+      p25_mac_frag_reset(f);
+      fragment = true;
+      if(n < 3 || s->raw[2] < 3 || s->raw[2] + 2 > P25_MAC_FRAG_MAX)
+        continue; // too short for a CRC, or a length no buffer here could hold: garbage
+      f->active = true;
+      f->opcode = s->opcode;
+      f->need = s->raw[2];
+      memcpy(f->buf, s->raw, n);
+      f->len = n;
+      f->have = n - 2;
+    } else if(s->vendor == 0 && s->opcode == 0x10){
+      if(!f->active)
+        continue; // a continuation of nothing we have: ignored
+      fragment = true;
+      if(n < 3 || n != s->len || f->len + n - 2 > P25_MAC_FRAG_MAX){
+        p25_mac_frag_reset(f); // a length that cannot be right
+        continue;
+      }
+      memcpy(f->buf + f->len, s->raw + 2, n - 2);
+      f->len += n - 2;
+      f->have += n - 2;
+    } else {
+      if(s->mac_kind != P25_MAC_NULL && s->mac_kind != P25_MAC_NULL_AZB)
+        p25_mac_frag_reset(f); // any other message ends an assembly
+      continue;
+    }
+    if(f->active && f->have >= f->need){
+      // Complete. Its data (from the first fragment's third octet) ends with the CRC: a message
+      // put together from the wrong parts, or in the wrong order, fails it
+      uint8_t const *d = f->buf + 2;
+      int const n = f->need - 2;
+      if(frag_crc(d, n) != (d[n] << 8 | d[n + 1])){
+        p25_mac_frag_reset(f);
+        continue;
+      }
+      // Parse it as one structure of f->len octets
+      memset(out, 0, sizeof *out);
+      out->opcode = f->opcode;
+      out->len = f->len;
+      out->raw_len = f->len < P25_MAC_MAX_RAW ? f->len : P25_MAC_MAX_RAW;
+      memcpy(out->raw, f->buf, out->raw_len);
+      struct pdu_bits b = { f->buf, f->len * 8 };
+      decode_struct(&b, out, true);
+      p25_mac_frag_reset(f);
+      done = true;
+    }
+  }
+  // The continuations come in the PDUs right after the first fragment: a PDU without one means
+  // one was lost (or never sent), and what is pending would join the wrong parts
+  if(!fragment && f->active)
+    p25_mac_frag_reset(f);
+  return done;
 }
 
 // A structure with a p25msg kind goes as it is, whatever the kind (P25_UNKNOWN included: the

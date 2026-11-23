@@ -172,7 +172,7 @@ struct p25_msg {
   struct p25_chan ch_b;    // uplink of an explicit message; second of two
   bool has_b;              // the second call/channel of an update or broadcast is present
   uint16_t timer;          // call timer, 100 ms units (telephone interconnect)
-  uint16_t members[3];     // Motorola regroup member talkgroups
+  uint16_t members[6];     // Motorola regroup member talkgroups (up to six, TIA-102.BBAD-A 3.92)
   int nmembers;
 
   // Responses and commands
