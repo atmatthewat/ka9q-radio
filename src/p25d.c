@@ -175,6 +175,7 @@ struct conv {
   uint64_t last;
   bool known;              // talkgroup (or unit) known, from the header or link control
   bool unit_call;
+  bool telephone;          // a unit call by telephone interconnect: 'target' is the radio, no source
   uint32_t target;
   uint32_t source;
   char alias[P25_ALIAS_MAX];
@@ -3011,7 +3012,7 @@ static void conv_start_line(struct decoder *dp){
   char id[256];
   int n;
   if(c->known)
-    n = snprintf(id,sizeof id,"%s %u src %u",c->unit_call ? "unit tgt" : "group tg",c->target,c->source);
+    n = snprintf(id,sizeof id,"%s %u src %u",c->telephone ? "telephone tgt" : c->unit_call ? "unit tgt" : "group tg",c->target,c->source);
   else
     n = snprintf(id,sizeof id,"talkgroup unknown src %u",c->source);
   if(strlen(c->alias) > 0 && n > 0 && (size_t)n < sizeof id)
@@ -3034,7 +3035,7 @@ static void conv_end(struct decoder *dp,uint64_t sample,char const *how){
     char id[256];
     int n;
     if(c->known)
-      n = snprintf(id,sizeof id,"%s %u src %u",c->unit_call ? "unit tgt" : "group tg",c->target,c->source);
+      n = snprintf(id,sizeof id,"%s %u src %u",c->telephone ? "telephone tgt" : c->unit_call ? "unit tgt" : "group tg",c->target,c->source);
     else
       n = snprintf(id,sizeof id,"talkgroup unknown src %u",c->source);
     if(strlen(c->alias) > 0 && n > 0 && (size_t)n < sizeof id)
@@ -3067,6 +3068,7 @@ static void conv_unit(struct decoder *dp,uint64_t sample,struct p25_frame const 
       if(p25_decode_hdu(&msg,octets) == 0){
 	c->known = true;
 	c->unit_call = false;
+	c->telephone = false;
 	c->target = msg.group;
 	c->encrypted |= msg.algid != 0x80;
       }
@@ -3080,9 +3082,10 @@ static void conv_unit(struct decoder *dp,uint64_t sample,struct p25_frame const 
 	break;
       if(frame->duid == P25_DUID_LDU1 && ldu->word.ok){
 	p25_pack_bits(octets,ldu->word.bits,72);
-	if(p25_decode_lc(&msg,octets,false) == 0 && !msg.protect
-	   && (msg.kind == P25_LC_GRP_V_CH_USR || msg.kind == P25_LC_MOT_GRG_V_CH_USR || msg.kind == P25_LC_UU_V_CH_USR)){
-	  bool const unit_call = msg.kind == P25_LC_UU_V_CH_USR;
+	if(p25_decode_lc(&msg,octets,false) == 0 && !msg.protect && voice_user_kind(msg.kind)){
+	  // Telephone interconnect names one address, the radio in the call: a unit call with no source
+	  bool const telephone = msg.kind == P25_LC_TEL_INT_V_CH_USR;
+	  bool const unit_call = telephone || msg.kind == P25_LC_UU_V_CH_USR;
 	  uint32_t const target = unit_call ? msg.tgt : msg.group;
 	  // Another talkgroup or talker with no terminator and header between: another transmission
 	  if(c->active && c->known && (c->unit_call != unit_call || c->target != target
@@ -3092,6 +3095,7 @@ static void conv_unit(struct decoder *dp,uint64_t sample,struct p25_frame const 
 	    conv_begin(dp,sample,frame->nac);
 	  c->known = true;
 	  c->unit_call = unit_call;
+	  c->telephone = telephone;
 	  c->target = target;
 	  if(msg.src != 0)
 	    c->source = msg.src;

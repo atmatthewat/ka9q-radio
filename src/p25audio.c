@@ -971,7 +971,9 @@ static bool next_unit(uint64_t later,int64_t earlier){
   return d >= -LDU_DIBITS / 2 && d <= LDU_DIBITS / 2;
 }
 
-// A voice channel user word (Phase 1 link control, Phase 2 MAC structure)
+// A voice channel user word (Phase 1 link control, Phase 2 MAC structure). The telephone
+// interconnect form names one address, the radio in the call: it is taken as a unit call to that
+// radio with no source (the decoders leave src zero)
 static void voice_user(struct p25_audio *a,struct p25_msg const *msg){
   switch(msg->kind){
   case P25_LC_GRP_V_CH_USR:
@@ -983,6 +985,7 @@ static void voice_user(struct p25_audio *a,struct p25_msg const *msg){
     a->encrypted |= (msg->svc & P25_SVC_ENCRYPTED) != 0;
     break;
   case P25_LC_UU_V_CH_USR:
+  case P25_LC_TEL_INT_V_CH_USR:
     a->have_call = true;
     a->unit_call = true;
     a->target = msg->tgt;
@@ -1056,6 +1059,7 @@ static bool new_talker(struct p25_audio const *a,struct p25_frame const *frame){
     target = msg.group;
     break;
   case P25_LC_UU_V_CH_USR:
+  case P25_LC_TEL_INT_V_CH_USR:
     unit_call = true;
     target = msg.tgt;
     break;
@@ -1178,6 +1182,7 @@ static bool new_mac_talker(struct p25_audio const *a,struct p25_msg const *msg){
     target = msg->group;
     break;
   case P25_LC_UU_V_CH_USR:
+  case P25_LC_TEL_INT_V_CH_USR:
     unit_call = true;
     target = msg->tgt;
     break;
@@ -1251,7 +1256,8 @@ static void mac_info(struct p25_audio *a,struct p25p2_burst const *b){
 	if(pdu.s[i].mac_kind != P25_MAC_MSG)
 	  continue;
 	if(!identity){
-	  if(msg->kind == P25_LC_GRP_V_CH_USR || msg->kind == P25_LC_MOT_GRG_V_CH_USR || msg->kind == P25_LC_UU_V_CH_USR)
+	  if(msg->kind == P25_LC_GRP_V_CH_USR || msg->kind == P25_LC_MOT_GRG_V_CH_USR || msg->kind == P25_LC_UU_V_CH_USR
+	     || msg->kind == P25_LC_TEL_INT_V_CH_USR)
 	    a->encrypted |= (msg->svc & P25_SVC_ENCRYPTED) != 0;
 	  continue;
 	}
