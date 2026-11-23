@@ -501,6 +501,8 @@ struct p25_audio {
 
   // What the status carries
   double frequency;
+  float bb_power,n0;       // radiod's figures for the channel (p25_audio_set_signal()); 0 until given
+  float low,high;          // its filter edges, Hz
   uint16_t nac;
   bool have_call;
   bool unit_call;          // unit to unit: 'target' is a unit, else a talkgroup
@@ -639,6 +641,14 @@ static void send_status(struct p25_audio *a,struct outstream *s,bool closing){
   encode_int64(&bp,GPS_TIME,now);
   encode_int32(&bp,RTP_TIMESNAP,s->timestamp);
   encode_double(&bp,RADIO_FREQUENCY,a->frequency);
+  // The I/Q channel's signal and noise, as radiod reported them: monitor works its SNR out from
+  // these four (signal power less the noise in the filter, over that noise)
+  if(isfinite(a->bb_power) && isfinite(a->n0) && a->bb_power > 0 && a->n0 > 0){
+    encode_float(&bp,BASEBAND_POWER,power2dB(a->bb_power));
+    encode_float(&bp,NOISE_DENSITY,power2dB(a->n0));
+    encode_float(&bp,LOW_EDGE,a->low);
+    encode_float(&bp,HIGH_EDGE,a->high);
+  }
   encode_int32(&bp,OUTPUT_SAMPRATE,P25_AUDIO_SAMPRATE);
   encode_int32(&bp,OUTPUT_CHANNELS,1);
   float level = -INFINITY;
@@ -930,6 +940,15 @@ static void end_transmission(struct p25_audio *a){
   a->p2_k2_known = false; // p2_k2 stays as a guess for the next
   a->p2_k2_signalled = false;
   a->last_unit = 0;
+}
+
+void p25_audio_set_signal(struct p25_audio *a,float bb_power,float n0,float low,float high){
+  if(a == NULL)
+    return;
+  a->bb_power = bb_power;
+  a->n0 = n0;
+  a->low = low;
+  a->high = high;
 }
 
 void p25_audio_poll(struct p25_audio *a,double frequency,int64_t when){

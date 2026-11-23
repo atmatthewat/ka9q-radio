@@ -129,6 +129,11 @@ void p25_audio_destroy(struct p25_audio *a); // ends a transmission in progress
 // Once per block of samples fed to the receiver: the channel frequency (for the status), and the
 // time at the block, to end a transmission that stopped without a terminator
 void p25_audio_poll(struct p25_audio *a,double frequency,int64_t when);
+// What radiod measured on the channel this speech came from: power in its filter and noise density
+// (power ratios, as radiod's status gives them once decoded) and the filter's edges, Hz. They go
+// out in the status as radiod sends them, so monitor shows the channel's signal to noise ratio
+// for the speech stream. Not sent until given, or when either power is not a positive number
+void p25_audio_set_signal(struct p25_audio *a,float bb_power,float n0,float low,float high);
 // Phase 1: every data unit from the receiver's frame callback, 'when' being the time at its end,
 // with the trunking logic's label for a voice unit (P25_AUDIO_UNLABELLED on a channel without it):
 // HDU and LDUs start a transmission (marker bit) and carry the talkgroup, source and encryption;

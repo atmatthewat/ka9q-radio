@@ -161,6 +161,8 @@ struct block {
   bool marker;             // RTP marker: don't fill the gap before this packet
   double samprate;         // Hz; a change restarts the decoder
   double frequency;        // Hz, channel frequency from the status stream
+  float bb_power,n0;       // radiod's signal power and noise density for the channel, power ratios
+  float low,high;          // and its filter edges, Hz: passed on in the speech stream's status
   int64_t time;            // Sender's time of the first sample, ns since GPS epoch; 0 if not yet known
   int count;               // complex samples
   float complex samples[]; // I in the real part, Q in the imaginary, as radiod sends them
@@ -1008,6 +1010,10 @@ static struct block *new_block(struct session const *sp,int count,uint32_t times
   bp->marker = false;
   bp->samprate = sp->samprate;
   bp->frequency = sp->chan.tune.freq;
+  bp->bb_power = sp->chan.sig.bb_power;
+  bp->n0 = sp->chan.sig.n0;
+  bp->low = sp->chan.filter.min_IF;
+  bp->high = sp->chan.filter.max_IF;
   bp->time = session_time(sp,timestamp);
   bp->count = count;
   return bp;
@@ -1286,6 +1292,10 @@ static void *decode_task(void *arg){
     dec.frequency = bp->frequency;
     dec.block_time = bp->time;
     dec.block_start = dec.samples;
+    // radiod's signal and noise for this channel go out with the speech, for monitor's SNR
+    p25_audio_set_signal(dec.audio,bp->bb_power,bp->n0,bp->low,bp->high);
+    for(int t=0; t < 2; t++)
+      p25_audio_set_signal(dec.slot[t].audio,bp->bb_power,bp->n0,bp->low,bp->high);
     // While both run, a receiver's callback can choose() the other's deletion; never its own
     if(dec.p25 != NULL)
       p25p1_samples(dec.p25,bp->samples,bp->count); // decoder_frame() runs in here
