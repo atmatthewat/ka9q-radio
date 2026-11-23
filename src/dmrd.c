@@ -819,16 +819,22 @@ static uint32_t frame_ssrc(struct decoder const *dp,struct dmr_chan_frame const 
   return dp->sp->ssrc * 10 + f->slot;
 }
 
+// The stream's description, for monitor's display: who, then the repeater it is being heard from,
+// e.g. DMR TG 97150 src 3107001 "W6XYZ Bob" 442.5375 MHz TS2 CC1
 static void describe(char *buf,size_t size,struct decoder const *dp,struct dmr_chan_frame const *f){
   int n;
   if(f->destination == 0)
-    n = snprintf(buf,size,"DMR %.4f MHz slot %d",dp->frequency * 1e-6,f->slot);
+    n = snprintf(buf,size,"DMR");
   else
     n = snprintf(buf,size,"DMR %s %u",f->group ? "TG" : "unit",f->destination);
   if(n > 0 && (size_t)n < size && f->source != 0)
     n += snprintf(buf + n,size - n," src %u",f->source);
   if(n > 0 && (size_t)n < size && f->alias[0] != '\0')
-    snprintf(buf + n,size - n," \"%s\"",f->alias);
+    n += snprintf(buf + n,size - n," \"%s\"",f->alias);
+  if(n > 0 && (size_t)n < size && f->emergency)
+    n += snprintf(buf + n,size - n," emergency");
+  if(n > 0 && (size_t)n < size)
+    snprintf(buf + n,size - n," %.4f MHz TS%d CC%d",dp->frequency * 1e-6,f->slot,f->color_code);
 }
 
 // A frame the call tracker released. Only clear frames are heard: they go to the voter

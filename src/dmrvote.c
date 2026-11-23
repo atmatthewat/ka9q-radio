@@ -100,6 +100,7 @@ struct source {
   int npending;
   struct pending pend[ALIGN_LIMIT];
   uint32_t moved_to;     // given up: its frames go to this stream instead
+  char description[256]; // its latest: the stream takes it on when a frame of it is played
   int offered;
   int chosen;
   int fec;
@@ -239,6 +240,11 @@ static void play(struct dmr_voter *v,struct stream *s,int64_t now){
     struct source * const src = &s->src[c->source];
     src->chosen++;
     s->last_source = c->source;
+    if(src->description[0] != '\0' && strcmp(src->description,s->description) != 0){
+      // The repeater it comes from now, or what is newly known of the call
+      strlcpy(s->description,src->description,sizeof s->description);
+      dmr_audio_set_stream(s->audio,s->ssrc,s->description);
+    }
     struct signal const * const g = find_signal(v,src->channel);
     if(g != NULL)
       dmr_audio_set_signal(s->audio,g->frequency,g->bb_power,g->n0,g->low,g->high);
@@ -399,6 +405,8 @@ static void frame(struct dmr_voter *v,uint32_t ssrc,uint32_t own_ssrc,char const
   if(si < 0)
     return;
   struct source * const src = &s->src[si];
+  if(description != NULL)
+    strlcpy(src->description,description,sizeof src->description);
   if(src->moved_to != 0 && depth == 0){
     frame(v,src->moved_to,src->moved_to,description,channel,slot,bits,when,1);
     return;
