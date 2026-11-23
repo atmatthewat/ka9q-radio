@@ -29,12 +29,17 @@
 // Search_back frames before to Search_ahead after where their time puts them. Silence and other
 // repeated frames match in many places and so align nothing; the next spoken frames do. From then on a
 // source's frame number follows from its time, 20 ms a frame, which is exact within a transmission. A
-// source not aligned within Align_limit frames is left out (another call on the same talkgroup, or a
-// copy too damaged to place) and its frames are counted, not played, unless it is all there is: when no
-// aligned source has offered a frame for Takeover (300 ms), the next unaligned one is aligned by its
-// time alone. On a system whose repeaters do not send identical frames the stream thus follows one
-// repeater and moves to another when that one fades, rather than going silent. The first source is
-// aligned by definition, and a stream's base is its first frame.
+// source that is all there is is not kept waiting: when no aligned source has offered a frame for
+// Takeover (300 ms), the next unaligned one is aligned by its time alone. On a system whose repeaters
+// do not send identical frames the stream thus follows one repeater and moves to another when that one
+// fades, rather than going silent. The first source is aligned by definition, and a stream's base is
+// its first frame.
+//
+// Not the same call. On some systems a talkgroup number is local to each repeater (amateur DMR's
+// TG 2 or TG 9, say), so two repeaters can carry different conversations under one number at once.
+// Their frames never line up: a source still unaligned after Align_limit frames (1 s) is moved, with
+// the frames it was holding, to a stream of its own (the caller names it: dmrd uses the channel's SSRC
+// times ten plus the slot) for the rest of its transmission. Its first second is then played late.
 //
 // Which copy. Each frame is played Delay after it is due, from the copy with the fewest Golay
 // corrections (c0 + c1, 0 for a clean frame; a c0 whose fourth error its parity caught counts 4); a tie
@@ -93,7 +98,8 @@ struct source {
   int64_t first_when;    // aligned: the time of frame number k0
   int64_t k0;
   int npending;
-  struct pending pend[ALIGN_RUN + 8];
+  struct pending pend[ALIGN_LIMIT];
+  uint32_t moved_to;     // given up: its frames go to this stream instead
   int offered;
   int chosen;
   int fec;
@@ -352,29 +358,37 @@ static int find_source(struct stream *s,uint32_t channel,int slot,bool create){
   return free_entry;
 }
 
-void dmr_voter_frame(struct dmr_voter *v,uint32_t ssrc,char const *description,uint32_t channel,int slot,
+static void frame(struct dmr_voter *v,uint32_t ssrc,uint32_t own_ssrc,char const *description,uint32_t channel,
+                  int slot,uint8_t const bits[DMR_VOICE_FRAME_BITS],int64_t when,int depth);
+
+void dmr_voter_frame(struct dmr_voter *v,uint32_t ssrc,uint32_t own_ssrc,char const *description,uint32_t channel,int slot,
                      uint8_t const bits[DMR_VOICE_FRAME_BITS],int64_t when){
   if(v == NULL || bits == NULL)
     return;
   if(when == 0)
     when = gps_time_ns();
+  pthread_mutex_lock(&v->lock);
+  frame(v,ssrc,own_ssrc,description,channel,slot,bits,when,0);
+  pthread_mutex_unlock(&v->lock);
+}
+
+// Under the lock
+static void frame(struct dmr_voter *v,uint32_t ssrc,uint32_t own_ssrc,char const *description,uint32_t channel,
+                  int slot,uint8_t const bits[DMR_VOICE_FRAME_BITS],int64_t when,int depth){
   struct p25p2_ambe a;
   p25p2_ambe_decode(&a,bits);
   int const fec = a.errors[0] + a.errors[1];
   bool const clean = a.errors[0] < 4;
   uint32_t const u01 = ((uint32_t)a.u[0] << 12) | a.u[1];
 
-  pthread_mutex_lock(&v->lock);
   struct stream *s = find_stream(v,ssrc,false);
   if(s != NULL && s->last_frame != 0 && when - s->last_frame > Idle_ns && when > s->last_frame){
     end_stream(v,s); // a new transmission on a stream long silent: start afresh
     s = NULL;
   }
   bool const fresh = s == NULL;
-  if(s == NULL && (s = find_stream(v,ssrc,true)) == NULL){
-    pthread_mutex_unlock(&v->lock);
+  if(s == NULL && (s = find_stream(v,ssrc,true)) == NULL)
     return;
-  }
   if(fresh){
     s->base = when;
     s->next_k = 0;
@@ -382,11 +396,13 @@ void dmr_voter_frame(struct dmr_voter *v,uint32_t ssrc,char const *description,u
     dmr_audio_set_stream(s->audio,ssrc,s->description);
   }
   int const si = find_source(s,channel,slot,true);
-  if(si < 0){
-    pthread_mutex_unlock(&v->lock);
+  if(si < 0)
+    return;
+  struct source * const src = &s->src[si];
+  if(src->moved_to != 0 && depth == 0){
+    frame(v,src->moved_to,src->moved_to,description,channel,slot,bits,when,1);
     return;
   }
-  struct source * const src = &s->src[si];
   src->ended = false;
   src->last_when = when;
   if(when > s->last_frame)
@@ -429,11 +445,19 @@ void dmr_voter_frame(struct dmr_voter *v,uint32_t ssrc,char const *description,u
     }
     else if(src->offered >= ALIGN_LIMIT){
       src->given_up = true;
-      src->npending = 0;
+      if(own_ssrc != 0 && own_ssrc != ssrc && depth == 0){
+        // Another conversation: its own stream, its held frames first
+        src->moved_to = own_ssrc;
+        int const n = src->npending;
+        src->npending = 0;
+        for(int i=0; i < n; i++)
+          frame(v,own_ssrc,own_ssrc,description,channel,slot,src->pend[i].bits,src->pend[i].when,1);
+        src->offered -= n;
+      } else
+        src->npending = 0;
     }
   } else
     src->offered++;
-  pthread_mutex_unlock(&v->lock);
 }
 
 void dmr_voter_source_end(struct dmr_voter *v,uint32_t ssrc,uint32_t channel,int slot){
@@ -443,8 +467,14 @@ void dmr_voter_source_end(struct dmr_voter *v,uint32_t ssrc,uint32_t channel,int
   struct stream * const s = find_stream(v,ssrc,false);
   if(s != NULL){
     int const si = find_source(s,channel,slot,false);
-    if(si >= 0)
+    if(si >= 0){
       s->src[si].ended = true;
+      uint32_t const moved = s->src[si].moved_to;
+      struct stream * const m = moved != 0 ? find_stream(v,moved,false) : NULL;
+      int const mi = m != NULL ? find_source(m,channel,slot,false) : -1;
+      if(mi >= 0)
+        m->src[mi].ended = true;
+    }
   }
   pthread_mutex_unlock(&v->lock);
 }

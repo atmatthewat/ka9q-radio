@@ -845,7 +845,7 @@ static void voice_frame(void *arg,struct dmr_chan_frame const *f){
   }
   char desc[256];
   describe(desc,sizeof desc,dp,f);
-  dmr_voter_frame(Voter,ssrc,desc,dp->sp->ssrc,f->slot,f->bits,f->when);
+  dmr_voter_frame(Voter,ssrc,dp->sp->ssrc * 10 + f->slot,desc,dp->sp->ssrc,f->slot,f->bits,f->when);
 }
 
 // A transmission started or ended on a slot

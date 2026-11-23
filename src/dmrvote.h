@@ -38,8 +38,9 @@ void dmr_voter_set_end_handler(struct dmr_voter *v,dmr_vote_end_fn fn,void *arg)
 
 // One clear AMBE+2 frame (72 bits as sent, one per byte) at sender time 'when' for stream 'ssrc' from
 // repeater 'channel' (its SSRC) and 'slot'. 'description' names the stream in its status (the first
-// frame's is used)
-void dmr_voter_frame(struct dmr_voter *v,uint32_t ssrc,char const *description,uint32_t channel,int slot,
+// frame's is used). own_ssrc: the stream this repeater slot's frames go to instead if they turn out
+// to be another conversation than the stream's (0: none, they are then dropped)
+void dmr_voter_frame(struct dmr_voter *v,uint32_t ssrc,uint32_t own_ssrc,char const *description,uint32_t channel,int slot,
                      uint8_t const bits[DMR_VOICE_FRAME_BITS],int64_t when);
 // That repeater slot's transmission ended (it offers no more frames to the stream)
 void dmr_voter_source_end(struct dmr_voter *v,uint32_t ssrc,uint32_t channel,int slot);
