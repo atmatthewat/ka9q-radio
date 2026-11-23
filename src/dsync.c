@@ -3,6 +3,7 @@
 // Copyright 2026, Matthew Kaufman, KA6SQG
 #include <assert.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -22,7 +23,11 @@
 // linear and its delay a constant (ntaps - 1) / 2 samples. Two responses of different lengths
 // share one delay line, the shorter centred on it, so they have the same delay and switching
 // between them moves nothing in time. init_rrcfilter() makes instead the root raised cosine
-// matched to a transmitter that shapes its symbols with one (P25 Phase 2).
+// matched to a transmitter that shapes its symbols with one (P25 Phase 2); init_rrc_realfilter()
+// puts the same taps on a real delay line, for a modulation that shapes its frequency rather than
+// its baseband (DMR's 4FSK, filtered after an FM discriminator). run_rxfilter_parts() is the
+// receive filter summed as two real dot products: the same in exact arithmetic, rounded
+// differently where products are fused into the sums.
 //
 // Envelope ripple. A linear modulation's envelope dips between symbols, so |x|^2 has a spectral
 // line at the symbol rate; a constant-envelope modulation has none. A one-pole average of
@@ -31,7 +36,8 @@
 //
 // Level control. Divides by the square root of a slow one-pole average of |x|^2. The Gardner
 // detector's output goes as the square of the amplitude, so the timing loop's gains, and its
-// error limit, mean what they say only at a known level: unity RMS.
+// error limit, mean what they say only at a known level: unity RMS. The average's update is a
+// fused multiply-add written out, so it rounds once whatever the compiler's contraction setting.
 //
 // Frequency. For a tone at f the lag-one product y[i] conj(y[i-1]) has angle 2 pi f / samprate,
 // so the angle of its sum over a block estimates the block's mean frequency, each pair of samples
@@ -42,7 +48,11 @@
 // is an absolute measurement of the offset, so no integrator is needed for zero steady-state
 // error: the estimate moves toward each measurement through a one-pole lowpass whose corner is
 // the loop's bandwidth (update_freqtrack()). A drift of R Hz/s is followed about R / (2 pi corner)
-// Hz behind.
+// Hz behind. update_freqtrack_block() is that update for a decoder whose only measurement is the
+// block's own, with the residual kept in double precision throughout. The correction is applied
+// by ka9q's nco (correct_freqtrack()), or by a rotator: a double precision phasor stepped by
+// multiplication and put back on the unit circle every 16384 samples if it has drifted by more
+// than 1e-6.
 //
 // Symbol timing. A fractional resampler makes two outputs per symbol, the symbol and the midpoint
 // between two symbols, each with an 8-tap interpolator chosen from a polyphase bank. The Gardner
@@ -53,7 +63,9 @@
 // searches and narrows it once frame sync is held. Every output's position is logged with the
 // input it came from, so a past output can be computed again at another timing (symsync_near()),
 // which lets the decoder try other timings on a frame sync that nearly passed without touching
-// the loop.
+// the loop. run_symsync_real() is the same loop on a real signal (a discriminator's output), each
+// sum written product by product. set_symsync_digits() rounds the interpolator's taps to so many
+// significant figures, which at six reproduces GNU Radio's published table for up to 32 arms.
 //
 // Soft dibits. The decoders take z = y[k] conj(y[k-1]), the phase change over one symbol. For
 // pi/4 DQPSK that is the differential detector. For C4FM, an FM signal whose four deviations
@@ -201,6 +213,69 @@ void run_rxfilter(struct rxfilter *f,float complex *buffer,int count){
     buffer[k] = acc;
   }
 }
+// The same filter with the real and the imaginary part each summed as a real dot product. In exact
+// arithmetic the two are equal. With fused multiply-adds they round differently: here each tap's
+// product is added into its own real sum (one multiply-add each, as a compiler contracts
+// re += h * x), there the complex product is formed and then added. dmrrx.c uses this form, and
+// its tests compare its output bit for bit with a receiver built that way
+void run_rxfilter_parts(struct rxfilter *f,float complex *buffer,int count){
+  assert(f != NULL && f->taps != NULL);
+  int const n = f->ntaps;
+  int const m = f->count;
+  float const * restrict const taps = f->taps + f->first;
+  for(int k=0; k < count; k++){
+    f->history[f->pos] = f->history[f->pos + n] = buffer[k];
+    if(++f->pos == n)
+      f->pos = 0;
+    float complex const * restrict const w = f->history + f->pos + f->first;
+    float re = 0,im = 0;
+    for(int i=0; i < m; i++){
+      re += taps[i] * crealf(w[i]);
+      im += taps[i] * cimagf(w[i]);
+    }
+    buffer[k] = CMPLXF(re,im);
+  }
+}
+
+// A real FIR: the taps of init_rrcfilter()'s design on a real delay line, stored twice like the
+// complex one so each output is one contiguous dot product
+int init_rrc_realfilter(struct realfilter *f,double samprate,double symrate,double alpha,double span){
+  assert(f != NULL);
+  memset(f,0,sizeof *f);
+  struct rxfilter design;
+  if(init_rrcfilter(&design,samprate,symrate,alpha,span) != 0)
+    return -1;
+  f->ntaps = design.ntaps;
+  f->taps = calloc((size_t)f->ntaps,sizeof *f->taps);
+  f->history = calloc(2 * (size_t)f->ntaps,sizeof *f->history);
+  if(f->taps == NULL || f->history == NULL){
+    free_rxfilter(&design);
+    free_realfilter(f);
+    return -1;
+  }
+  memcpy(f->taps,design.taps,(size_t)f->ntaps * sizeof *f->taps);
+  free_rxfilter(&design);
+  return 0;
+}
+void free_realfilter(struct realfilter *f){
+  if(f == NULL)
+    return;
+  free(f->taps);
+  free(f->history);
+  memset(f,0,sizeof *f);
+}
+float realfilter_sample(struct realfilter *f,float x){
+  int const n = f->ntaps;
+  f->history[f->pos] = f->history[f->pos + n] = x;
+  if(++f->pos == n)
+    f->pos = 0;
+  float const * restrict const w = f->history + f->pos; // oldest first; the taps are symmetric
+  float const * restrict const taps = f->taps;
+  float sum = 0;
+  for(int i=0; i < n; i++)
+    sum += taps[i] * w[i];
+  return sum;
+}
 
 // ---------------- envelope ripple ----------------
 
@@ -265,7 +340,8 @@ void run_level(struct level *l,float complex *buffer,int count){
   float power = l->power;
   float const alpha = l->alpha;
   for(int i=0; i < count; i++){
-    power += alpha * (cnrmf(buffer[i]) - power);
+    // power += alpha (|x|^2 - power), rounded once: the same with or without contraction
+    power = fmaf(alpha,cnrmf(buffer[i]) - power,power);
     buffer[i] *= 1.0f / sqrtf(power > 1e-10f ? power : 1e-10f);
   }
   l->power = power;
@@ -399,11 +475,74 @@ void update_freqtrack(struct freqtrack *ft,bool valid,float residual,int count){
   }
   ft->applied = ft->estimate;
 }
+// freqtrack_residual() and update_freqtrack() in one, for a decoder whose only frequency measurement
+// is the block's own: the residual stays in double precision from the lag-one sums to the loop
+// update. The coherence that weights the step is the unfiltered block's when measure_freqtrack() saw
+// it, else this block's
+void update_freqtrack_block(struct freqtrack *ft,float complex const *buffer,int count){
+  if(count <= 0)
+    return;
+  struct lagone const filtered = lag_one(buffer,count);
+  struct lagone const unfiltered = ft->unfiltered_pending ? ft->unfiltered : filtered;
+  ft->unfiltered_pending = false;
+  if(ft->seed_pending){
+    ft->seed_pending = false; // this block was corrected with the pre-seed value
+  } else if(lagone_valid(&filtered) && lagone_valid(&unfiltered)){
+    double residual = lagone_hz(&filtered,ft->samprate);
+    if(fabs(residual) > Wide_residual){
+      double const wide = lagone_hz(&unfiltered,ft->samprate);
+      if(wide * residual > 0 && fabs(wide) > fabs(residual))
+	residual = wide;
+    }
+    double const total = (double)ft->applied + residual;
+    ft->coherence = (float)(sqrt(unfiltered.re * unfiltered.re + unfiltered.im * unfiltered.im) / unfiltered.power);
+    double weight = (ft->coherence - Coherence_floor) / Coherence_span;
+    weight = weight < 0 ? 0 : weight > 1 ? 1 : weight;
+    double const a = weight * (1 - pow(1 - ft->sample_factor,(double)count));
+    double next = ft->estimate + a * (total - ft->estimate);
+    if(next > ft->max_offset)
+      next = ft->max_offset;
+    else if(next < -ft->max_offset)
+      next = -ft->max_offset;
+    ft->estimate = (float)next;
+  }
+  ft->applied = ft->estimate;
+}
+
+// A phasor oscillator: the phasor is multiplied by the step each sample, in double precision, and
+// every Rotator_renormalize samples it is put back on the unit circle if its magnitude has drifted
+// by more than Rotator_drift. Its phase carries across blocks and frequency changes
+static int const Rotator_renormalize = 16384;
+static double const Rotator_drift = 1e-6;
+void init_rotator(struct rotator *r){
+  assert(r != NULL);
+  r->phasor = 1;
+  r->step = 1;
+  r->count = 0;
+}
+void set_rotator(struct rotator *r,double samprate,double frequency){
+  double const step = frequency / samprate; // cycles per sample
+  double const theta = step * 2.0 * M_PI;
+  r->step = CMPLX(cos(theta),sin(theta));
+}
+void run_rotator(struct rotator *r,float complex *buffer,int count){
+  for(int i=0; i < count; i++){
+    if(++r->count > Rotator_renormalize){
+      double const magnitude = hypot(creal(r->phasor),cimag(r->phasor));
+      if(fabs(magnitude - 1.0) > Rotator_drift)
+	r->phasor = CMPLX(creal(r->phasor) / magnitude,cimag(r->phasor) / magnitude);
+      r->count = 0;
+    }
+    double complex const p = r->phasor;
+    r->phasor = p * r->step;
+    buffer[i] = buffer[i] * CMPLXF((float)creal(p),(float)cimag(p));
+  }
+}
 
 // ---------------- symbol timing ----------------
 
 // Solve the n x n system a x = b in place (Gaussian elimination, partial pivoting); n is small
-static int solve(int n,double a[n][n],double b[n]){
+static inline __attribute__((always_inline)) int solve(int n,double a[n][n],double b[n]){
   for(int col=0; col < n; col++){
     int pivot = col;
     for(int r=col+1; r < n; r++)
@@ -470,6 +609,32 @@ static int design_interpolator(float *taps,int nphases){
   }
   return 0;
 }
+// The same design with each tap rounded to 'digits' significant decimal digits, and arm 0 the unit
+// vector exactly (the solve leaves errors of about 1e-17 where it is exactly zero); see
+// set_symsync_digits()
+static double round_digits(double v,int digits){
+  char text[40];
+  snprintf(text,sizeof text,"%.*e",digits - 1,v);
+  return strtod(text,NULL);
+}
+static int design_rounded_interpolator(float *taps,int nphases,int digits){
+  double const b2 = 2 * 0.25;
+  for(int k=0; k < nphases; k++){
+    double const p = SYMSYNC_TAPS / 2 - (double)k / nphases;
+    double a[SYMSYNC_TAPS][SYMSYNC_TAPS];
+    double h[SYMSYNC_TAPS];
+    for(int i=0; i < SYMSYNC_TAPS; i++){
+      for(int j=0; j < SYMSYNC_TAPS; j++)
+	a[i][j] = dsinc(b2 * (i - j));
+      h[i] = dsinc(b2 * (i - p));
+    }
+    if(solve(SYMSYNC_TAPS,a,h) != 0)
+      return -1;
+    for(int i=0; i < SYMSYNC_TAPS; i++)
+      taps[k * SYMSYNC_TAPS + i] = (float)(k == 0 ? (i == SYMSYNC_TAPS / 2 ? 1.0 : 0.0) : round_digits(h[i],digits));
+  }
+  return 0;
+}
 // Loop gains for a natural frequency 'bw' (radians per update) and damping, the usual
 // second-order digital loop. The loop's output is the resampling ratio r, held for the next
 // 2/r input samples, so a ratio step moves the next symbol by 2 dr / r^2 samples; scaling by
@@ -533,6 +698,15 @@ int init_symsync(struct symsync *s,double samprate,double symrate,int nphases,
   s->error_gain = error_gain;
   set_gains(s,acquire_bw);
   return 0;
+}
+// GNU Radio publishes its MMSE interpolator table (128 steps) at six significant figures. Rounded
+// to six digits, the taps designed here equal that table at every step 4, 8, 16 or 32 arms use; at
+// 64 arms 2 of its values, and at 128 arms 6, differ from the rounded design in the last digit
+int set_symsync_digits(struct symsync *s,int digits){
+  assert(s != NULL && s->taps != NULL);
+  if(digits < 1 || digits > 17)
+    return -1;
+  return design_rounded_interpolator(s->taps,s->nphases,digits);
 }
 void free_symsync(struct symsync *s){
   if(s == NULL)
@@ -620,6 +794,75 @@ void run_symsync(struct symsync *s,float complex const *buffer,int count,symsync
       s->outputs[o].arm = (uint16_t)arm;
       s->outputs_out++;
       out(arg,y,is_symbol);
+      s->accumulator -= 1;
+    }
+  }
+}
+// run_symsync() for a real signal (an FM discriminator's output): the same resampler, Gardner
+// detector and loop on the real part only. The input is kept as complex samples with a zero
+// imaginary part, so symsync_near() re-samples it unchanged, and outputs are passed on the same way.
+// Each sum is written as separate statements, product by product: where the compiler contracts
+// only within an expression (C's default) every product is then rounded before it is added, and
+// the result is the same with or without a fused multiply-add
+void run_symsync_real(struct symsync *s,float const *buffer,int count,symsync_output out,void *arg){
+  assert(s != NULL && s->taps != NULL);
+  for(int k=0; k < count; k++){
+    float complex const x = CMPLXF(buffer[k],0);
+    size_t const at = (size_t)s->samples_in & (SYMSYNC_HISTORY - 1);
+    s->history[at] = s->history[at + SYMSYNC_HISTORY] = x;
+    s->samples_in++;
+    s->window[s->wpos] = s->window[s->wpos + SYMSYNC_TAPS] = x;
+    if(++s->wpos == SYMSYNC_TAPS)
+      s->wpos = 0;
+    float const ratio = s->ratio;
+    s->accumulator += ratio;
+    while(s->accumulator >= 1){
+      float const delay = (s->accumulator - 1) / ratio;
+      int arm = (int)(delay * (float)s->nphases);
+      if(arm > s->nphases - 1)
+	arm = s->nphases - 1;
+      if(arm < 0)
+	arm = 0;
+      float const * restrict const h = s->taps + arm * SYMSYNC_TAPS;
+      float complex const * restrict const w = s->window + s->wpos;
+      float y = 0;
+      for(int i=0; i < SYMSYNC_TAPS; i++){
+	float const p = h[i] * crealf(w[i]);
+	y += p;
+      }
+      bool is_symbol;
+      if(s->expect_midpoint){
+	s->mid = y;
+	s->expect_midpoint = false;
+	is_symbol = false;
+      } else {
+	float const mid = crealf(s->mid);
+	float e = mid * (y - crealf(s->prev));
+	float const mid2 = mid * mid;
+	float const y2 = y * y;
+	float const energy = mid2 + y2;
+	if(energy > 1e-20f)
+	  s->error_ema += 0.01f * (fabsf(e) / energy - s->error_ema);
+	s->prev = y;
+	s->expect_midpoint = true;
+	is_symbol = true;
+	if(s->ignore_next_error)
+	  e = 0;
+	s->ignore_next_error = false;
+	e = e > 0.15f ? 0.15f : e < -0.15f ? -0.15f : e;
+	float const proportional = s->kp * e;
+	float const step = s->ki * e;
+	s->integral += step;
+	s->integral = s->integral > s->int_max ? s->int_max : s->integral < s->int_min ? s->int_min : s->integral;
+	float r = proportional + s->integral;
+	r = r > s->out_max ? s->out_max : r < s->out_min ? s->out_min : r;
+	s->ratio = r;
+      }
+      size_t const o = (size_t)s->outputs_out & (SYMSYNC_OUTPUTS - 1);
+      s->outputs[o].newest = s->samples_in - 1;
+      s->outputs[o].arm = (uint16_t)arm;
+      s->outputs_out++;
+      out(arg,CMPLXF(y,0),is_symbol);
       s->accumulator -= 1;
     }
   }

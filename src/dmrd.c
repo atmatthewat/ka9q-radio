@@ -1,0 +1,1079 @@
+// DMR decoder daemon for ka9q-radio
+// Reads complex baseband (I/Q) RTP streams from radiod, runs one DMR receiver per SSRC (a repeater
+// output, both timeslots), logs each transmission, one timestamped line per event, on standard
+// output, and sends the clear voice it decodes as RTP audio streams
+// Copyright 2026, Matthew Kaufman, KA6SQG
+
+#include <assert.h>
+#include <errno.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdarg.h>
+#include <stdatomic.h>
+#include <math.h>
+#include <unistd.h>
+#include <string.h>
+#include <locale.h>
+#include <signal.h>
+#include <poll.h>
+#include <getopt.h>
+#include <sysexits.h>
+#include <sys/socket.h>
+
+#include "misc.h"
+#include "multicast.h"
+#include "rtp.h"
+#include "status.h"
+#include "radio.h"
+#include "import.h"
+#include "timing.h"
+#include "defaults.h"
+#include "p25audio.h"
+#include "dmr.h"
+#include "dmrchan.h"
+#include "dmraudio.h"
+
+// Theory of operation
+//
+// Threads, sessions and the queue are p25d's (p25d.c, "Theory of operation"): one input thread reads
+// every status and data packet of every input group; a session is one {SSRC, sender address and
+// port}, made by its first status, which says what the payload types mean and gives the stream's
+// clock reference; packets are resequenced in a window of RESEQ, gaps up to Max_fill seconds are
+// filled with zeroes so the receiver's symbol timing holds, and blocks go to the channel's own
+// decode thread through a queue bounded at Max_queue seconds. A session closes after Timeout seconds
+// without data.
+//
+// One carrier, both slots. Each channel's decode thread runs one struct dmr_chan (dmrchan.c): the
+// receiver, the burst sink, the message layer and the call tracker of one carrier. A DMR carrier has
+// two timeslots, each with its own transmissions; the tracker labels every voice frame clear,
+// encrypted or unconfirmed, and only frames labelled clear are decoded to speech (the hard rule:
+// audio of encrypted frames is never put out).
+//
+// Streams and SSRCs. A group call's speech has the talkgroup as its SSRC, whichever channel carries
+// it, as p25d's trunked group calls do, so a listener sees one stream per talkgroup. That matters
+// for DMR more than for P25: a wide-area call on a multi-site system (Capacity Plus, IP Site
+// Connect) is carried at the same moment by every repeater of the call's sites, and a listener
+// monitoring them all would otherwise hear it once per repeater. So a talkgroup's stream belongs to
+// the first channel and slot that sends it a frame (the Streams table) until that transmission
+// ends or falls silent for Stream_hold; the same call on the other repeaters meanwhile is decoded,
+// logged and not sent. A unit-to-unit call, and voice whose destination is not known yet, goes out
+// under the channel's SSRC times ten plus the slot (e.g. 4534251), which no talkgroup reaches only
+// for talkgroups below 1,342,177 (a DMR talkgroup has 24 bits; on a system using larger ones two
+// streams could meet: a later change maps them explicitly).
+//
+// Site-level state is deliberately not here: one radiod and a fixed list of repeater channels for
+// now. Which radiod and SSRC serves a frequency, the channel map and grant following belong in a
+// site layer kept apart from these per-channel decoders, for trunked systems spanning more than one
+// radiod.
+
+#define MAX_MCAST 20   // Maximum number of input groups
+#define RESEQ 32       // Resequencing queue, packets. radiod sends one to three packets per 20 ms block
+#define MAX_STREAMS 64 // Talkgroup streams sent at once, across all channels
+
+struct block {
+  struct block *next;
+  uint32_t timestamp;      // RTP timestamp of the first sample
+  bool marker;             // RTP marker: don't fill the gap before this packet
+  double samprate;         // Hz; a change restarts the decoder
+  double frequency;        // Hz, channel frequency from the status stream
+  float bb_power,n0;       // radiod's signal power and noise density for the channel, power ratios
+  float low,high;          // and its filter edges, Hz: passed on in the speech stream's status
+  int64_t time;            // Sender's time of the first sample, ns since GPS epoch; 0 if not yet known
+  int count;               // complex samples
+  float complex samples[]; // I in the real part, Q in the imaginary, as radiod sends them
+};
+
+// One timeslot's speech output and its transmission
+struct slot {
+  struct dmr_audio *audio; // NULL without --pcm-out or a vocoder
+  uint32_t ssrc;           // SSRC of the stream its frames go to, 0 = none yet
+  bool sending;            // owns that stream (see Streams)
+  bool refused;            // the stream belongs to another channel: this transmission is not sent
+  int64_t last;            // time of the last frame
+};
+
+// Decode thread view of a channel
+struct decoder {
+  struct session *sp;
+  struct dmr_chan *chan;
+  double samprate;
+  double frequency;        // of the block being decoded
+  int64_t block_time;      // sender's time of the block's first sample, 0 if unknown
+  uint64_t samples;        // since the decoder was created
+  uint64_t next_report;    // sample count for the next -v status line
+  float bb_power,n0,low,high;
+  struct slot slot[2];
+};
+
+// One for each channel (SSRC) being decoded
+struct session {
+  struct session *prev;
+  struct session *next;
+  struct sockaddr_storage sender; // radiod's address and port, the same for status and data
+  uint32_t ssrc;
+
+  // From the status stream. Written and read only by the input thread
+  chan_t chan;
+  struct frontend frontend;
+  struct pt_table pt_table[128];
+  int samprate;
+  bool warned;
+  int64_t last_status;
+  int64_t last_data;
+
+  // RTP reception, input thread only
+  struct rtp_state rtp;
+  struct block *reseq[RESEQ];
+  int pending;
+
+  // Queue to the decode thread
+  pthread_t thread;
+  bool running;
+  pthread_mutex_t qmutex;
+  pthread_cond_t qcond;
+  struct block *queue;
+  struct block *qtail;
+  int64_t qsamples;
+  atomic_bool terminate;
+
+  atomic_uint_fast64_t packets;
+  atomic_uint_fast64_t drops;
+  atomic_uint_fast64_t dupes;
+  atomic_uint_fast64_t filled;
+  atomic_uint_fast64_t resyncs;
+  atomic_uint_fast64_t overruns;
+  atomic_uint_fast64_t unusable;
+};
+
+// A talkgroup stream and the channel and slot sending it
+struct stream {
+  uint32_t ssrc;
+  uint32_t owner;          // channel SSRC
+  int slot;
+  int64_t last;            // time of its last frame
+};
+
+// Command line params
+const char *App_path;
+int Verbose;
+static char const *Locale;
+static char const *Input[MAX_MCAST];
+static int Ninputs;
+static char const *Source;
+static struct sockaddr_storage *Source_socket;
+static uint32_t Ssrc;
+static int64_t Timeout = 20;
+static int Update = 10;
+static char const *Output;            // speech output group (--pcm-out), NULL for none
+static char const *Name;              // service name the speech is advertised under; NULL: not advertised
+static int Mcast_ttl = DEFAULT_TTL;
+static int IP_tos = DEFAULT_IP_TOS;
+static int Color_code = -1;           // -c: pinned 0-15, -1 tracked, -2 any
+static bool Mobile;                   // -M: also MS and direct mode syncs (simplex, talkaround)
+
+// Tuning constants
+static double const Max_fill = 1.0;   // Fill gaps up to this many seconds with zeroes; resynchronize on longer ones
+static double const Max_queue = 5.0;  // Seconds of samples queued to a decoder before blocks are dropped
+static int64_t const Stream_hold = 2 * BILLION; // A talkgroup stream with no frame this long is free for another channel
+
+// Global variables
+static int Data_fd[MAX_MCAST];
+static int Status_fd[MAX_MCAST];
+static struct session *Sessions;
+static pthread_mutex_t Output_mutex = PTHREAD_MUTEX_INITIALIZER;
+static volatile sig_atomic_t Terminate;
+static volatile sig_atomic_t Signal;
+static struct p25_audio_group *Audio_group;
+static pthread_mutex_t Streams_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct stream Streams[MAX_STREAMS];
+
+static void closedown(int);
+static void verbosity(int);
+static void input_loop(void);
+static void process_status(int fd);
+static void process_data(int fd);
+static void scan_sessions(int64_t now);
+static void cleanup(void);
+static struct session *lookup_session(struct sockaddr_storage const *sender,uint32_t ssrc);
+static struct session *create_session(struct sockaddr_storage const *sender,uint32_t ssrc);
+static void close_session(struct session *sp,char const *reason);
+static int start_decoder(struct session *sp);
+static void receive_packet(struct session *sp,struct rtp_header const *rtp,uint8_t const *data,int frames,enum encoding encoding);
+static void send_queue(struct session *sp,bool flush);
+static struct block *new_block(struct session const *sp,int count,uint32_t timestamp);
+static void enqueue_block(struct session *sp,struct block *bp);
+static void *decode_task(void *arg);
+static int sample_size(enum encoding encoding);
+static int convert_iq(float complex *out,uint8_t const *in,int frames,enum encoding encoding);
+static int64_t session_time(struct session const *sp,uint32_t timestamp);
+static int calculate_deadline(struct timespec *deadline,int64_t timeout);
+static void log_event(uint32_t ssrc,double frequency,int64_t when,char const *fmt,va_list ap);
+static void session_event(struct session const *sp,int64_t when,char const *fmt,...) __attribute__((format(printf,3,4)));
+static void decoder_event(struct decoder const *dp,int64_t when,char const *fmt,...) __attribute__((format(printf,3,4)));
+static void voice_frame(void *arg,struct dmr_chan_frame const *f);
+static void voice_event(void *arg,struct dmr_chan_event const *e);
+static void voice_log(void *arg,int64_t when,char const *text);
+static void status_line(struct decoder const *dp);
+
+static struct option Options[] = {
+  {"iface", required_argument, NULL, 'A'},
+  {"color-code", required_argument, NULL, 'c'},
+  {"input", required_argument, NULL, 'I'},
+  {"locale", required_argument, NULL, 'l'},
+  {"mobile", no_argument, NULL, 'M'},
+  {"name", required_argument, NULL, 'N'},
+  {"source", required_argument, NULL, 'o'},
+  {"tos", required_argument, NULL, 'p'},
+  {"pcm-out", required_argument, NULL, 'R'},
+  {"ssrc", required_argument, NULL, 'S'},
+  {"timeout", required_argument, NULL, 't'},
+  {"ttl", required_argument, NULL, 'T'},
+  {"update", required_argument, NULL, 'u'},
+  {"verbose", no_argument, NULL, 'v'},
+  {"version", no_argument, NULL, 'V'},
+  {NULL, 0, NULL, 0},
+};
+static char const Optstring[] = "A:c:I:l:MN:o:p:R:S:t:T:u:vV";
+
+static void usage(void){
+  fprintf(stderr,"Usage: %s [-v|--verbose] [-V|--version] [-l|--locale locale] [-A|--iface interface] [-o|--source <source-name-or-address>] [-S|--ssrc ssrc] [-t|--timeout seconds] [-u|--update seconds] [-c|--color-code n|any|track] [-M|--mobile] [-R|--pcm-out audio_mcast_address] [-N|--name service_name] [-T|--ttl ttl] [-p|--tos tos] [-I|--input] iq_mcast_address [iq_mcast_address ...]\n",App_path);
+}
+
+int main(int argc,char *argv[]){
+  App_path = argv[0];
+  Locale = getenv("LANG");
+
+  int c;
+  while((c = getopt_long(argc,argv,Optstring,Options,NULL)) != EOF){
+    switch(c){
+    case 'A':
+      Default_mcast_iface = optarg;
+      break;
+    case 'c':
+      if(strcmp(optarg,"any") == 0)
+        Color_code = -2;
+      else if(strcmp(optarg,"track") == 0)
+        Color_code = -1;
+      else {
+        char *ptr = NULL;
+        long const x = strtol(optarg,&ptr,0);
+        if(ptr == optarg || *ptr != '\0' || x < 0 || x > 15){
+          fprintf(stderr,"Bad colour code \"%s\": 0-15, any or track\n",optarg);
+          exit(EX_USAGE);
+        }
+        Color_code = (int)x;
+      }
+      break;
+    case 'I':
+      if(Ninputs == MAX_MCAST){
+        fprintf(stderr,"Too many multicast addresses; max %d\n",MAX_MCAST);
+        break;
+      }
+      Input[Ninputs++] = optarg;
+      break;
+    case 'l':
+      Locale = optarg;
+      break;
+    case 'M':
+      Mobile = true;
+      break;
+    case 'N':
+      Name = optarg;
+      break;
+    case 'o':
+      Source = optarg;
+      break;
+    case 'p':
+      IP_tos = (int)strtol(optarg,NULL,0);
+      break;
+    case 'R':
+      Output = optarg;
+      break;
+    case 'S':
+      {
+        char *ptr = NULL;
+        long long const x = strtoll(optarg,&ptr,0);
+        if(ptr != optarg)
+          Ssrc = (uint32_t)x;
+      }
+      break;
+    case 't':
+      {
+        char *ptr = NULL;
+        long long const x = strtoll(optarg,&ptr,0);
+        if(ptr != optarg && x > 0)
+          Timeout = x;
+      }
+      break;
+    case 'T':
+      Mcast_ttl = (int)strtol(optarg,NULL,0);
+      break;
+    case 'u':
+      Update = atoi(optarg);
+      break;
+    case 'v':
+      Verbose++;
+      break;
+    case 'V':
+      VERSION();
+      exit(EX_OK);
+    default:
+      usage();
+      exit(EX_USAGE);
+    }
+  }
+  setlocale(LC_ALL,Locale);
+  setlinebuf(stdout);
+  setlinebuf(stderr);
+
+  for(int i=optind; i < argc; i++){
+    if(Ninputs == MAX_MCAST){
+      fprintf(stderr,"Too many multicast addresses; max %d\n",MAX_MCAST);
+      break;
+    }
+    Input[Ninputs++] = argv[i];
+  }
+  if(Ninputs == 0){
+    fprintf(stderr,"Specify at least one I/Q multicast group\n");
+    usage();
+    exit(EX_USAGE);
+  }
+  if(p25_vocoder_name(P25_CODEC_AMBE2) == NULL)
+    fprintf(stderr,"%s: built without a vocoder (mbelib): no voice output\n",App_path);
+  if(Source != NULL){
+    Source_socket = calloc(1,sizeof(struct sockaddr_storage));
+    assert(Source_socket != NULL);
+    resolve_mcast(Source,Source_socket,0,NULL,0,0);
+  }
+  for(int i=0; i < Ninputs; i++){
+    struct sockaddr_storage sock;
+    char iface[1024];
+    resolve_mcast(Input[i],&sock,DEFAULT_RTP_PORT,iface,sizeof(iface),0);
+    Data_fd[i] = listen_mcast(Source_socket,&sock,iface);
+    resolve_mcast(Input[i],&sock,DEFAULT_STAT_PORT,iface,sizeof(iface),0);
+    Status_fd[i] = listen_mcast(Source_socket,&sock,iface);
+    if(Data_fd[i] == -1 || Status_fd[i] == -1){
+      fprintf(stderr,"Can't set up input from %s, exiting\n",Input[i]);
+      exit(EX_TEMPFAIL);
+    }
+    int const n = 1 << 20;
+    if(setsockopt(Data_fd[i],SOL_SOCKET,SO_RCVBUF,&n,sizeof(n)) == -1)
+      perror("setsockopt");
+    if(Verbose)
+      fprintf(stderr,"%s: listening to %s\n",App_path,Input[i]);
+  }
+  if(Output != NULL && p25_vocoder_name(P25_CODEC_AMBE2) != NULL){
+    if((Audio_group = p25_audio_open(Output,Default_mcast_iface,Mcast_ttl,IP_tos,Name)) == NULL)
+      exit(EX_TEMPFAIL);
+    if(Verbose)
+      fprintf(stderr,"%s: voice to %s (%s)\n",App_path,Output,p25_vocoder_name(P25_CODEC_AMBE2));
+  }
+  signal(SIGINT,closedown);
+  signal(SIGQUIT,closedown);
+  signal(SIGTERM,closedown);
+  signal(SIGPIPE,SIG_IGN);
+  signal(SIGUSR1,verbosity);
+  signal(SIGUSR2,verbosity);
+
+  input_loop();
+  cleanup();
+  p25_audio_close(Audio_group);
+  if(Verbose)
+    fprintf(stderr,"%s: caught signal %d: %s\n",App_path,(int)Signal,strsignal(Signal));
+  exit((Signal == SIGTERM || Signal == SIGINT) ? EX_OK : EX_SOFTWARE);
+}
+
+static void closedown(int a){
+  Signal = a;
+  Terminate = 1;
+}
+
+static void verbosity(int a){
+  if(a == SIGUSR1)
+    Verbose++;
+  else if(a == SIGUSR2)
+    Verbose = (Verbose <= 0) ? 0 : Verbose - 1;
+}
+
+// ---------------------------------------------------------------------------
+// Input: as p25d's
+
+static void input_loop(void){
+  struct pollfd pfd[2*MAX_MCAST];
+  for(int i=0; i < Ninputs; i++){
+    pfd[2*i].fd = Data_fd[i];
+    pfd[2*i].events = POLLIN;
+    pfd[2*i+1].fd = Status_fd[i];
+    pfd[2*i+1].events = POLLIN;
+  }
+  int64_t last_scan = gps_time_ns();
+  while(!Terminate){
+    int const n = poll(pfd,2*Ninputs,1000);
+    if(n < 0){
+      if(errno == EINTR)
+        continue;
+      perror("poll");
+      break;
+    }
+    for(int i=0; i < Ninputs; i++){
+      if(pfd[2*i+1].revents & (POLLIN|POLLPRI))
+        process_status(Status_fd[i]);
+      if(pfd[2*i].revents & (POLLIN|POLLPRI))
+        process_data(Data_fd[i]);
+    }
+    int64_t const now = gps_time_ns();
+    if(now >= last_scan + BILLION){
+      scan_sessions(now);
+      last_scan = now;
+    }
+  }
+}
+
+static void process_status(int fd){
+  uint8_t buffer[PKTSIZE];
+  struct sockaddr_storage sender;
+  socklen_t socksize = sizeof(sender);
+  ssize_t const length = recvfrom(fd,buffer,sizeof(buffer),0,(struct sockaddr *)&sender,&socksize);
+  if(length < 0){
+    if(errno != EINTR)
+      perror("recvfrom status");
+    return;
+  }
+  if(length < 3 || buffer[0] != STATUS)
+    return;
+  uint32_t const ssrc = get_ssrc(buffer+1,length-1);
+  if(ssrc == 0)
+    return;
+  if(Ssrc != 0 && ssrc != Ssrc)
+    return;
+  struct session *sp = lookup_session(&sender,ssrc);
+  bool const new_session = (sp == NULL);
+  if(sp == NULL && (sp = create_session(&sender,ssrc)) == NULL)
+    return;
+  decode_radio_status(&sp->frontend,&sp->chan,buffer+1,length-1);
+  sp->frontend.description[sizeof sp->frontend.description - 1] = '\0';
+  sp->last_status = gps_time_ns();
+  int const type = sp->chan.output.rtp.type & 0x7f;
+  sp->pt_table[type].encoding = sp->chan.output.encoding;
+  sp->pt_table[type].samprate = sp->chan.output.samprate;
+  sp->pt_table[type].channels = sp->chan.output.channels;
+  if(new_session && Verbose)
+    session_event(sp,0,"new channel: %s, %'d Hz, %d channels, %s, %s demod, filter %+.0f to %+.0f Hz, agc %s, from %s",
+                  sp->frontend.description,sp->chan.output.samprate,sp->chan.output.channels,
+                  encoding_string(sp->chan.output.encoding),demod_name_from_type(sp->chan.demod_type),
+                  sp->chan.filter.min_IF,sp->chan.filter.max_IF,sp->chan.linear.agc ? "on" : "off",
+                  formatsock(&sender,false));
+  if(!sp->warned && (sp->chan.output.channels != 2 || sample_size(sp->chan.output.encoding) == 0)){
+    session_event(sp,0,"can't decode: need 2 channels (I/Q) of s16le, s16be, f32le or f32be; stream is %d channels %s",
+                  sp->chan.output.channels,encoding_string(sp->chan.output.encoding));
+    sp->warned = true;
+  }
+}
+
+static void process_data(int fd){
+  uint8_t buffer[PKTSIZE];
+  struct sockaddr_storage sender;
+  socklen_t socksize = sizeof(sender);
+  ssize_t size = recvfrom(fd,buffer,sizeof(buffer),0,(struct sockaddr *)&sender,&socksize);
+  if(size < 0){
+    if(errno != EINTR)
+      perror("recvfrom");
+    return;
+  }
+  if(size < RTP_MIN_SIZE)
+    return;
+  struct rtp_header rtp;
+  uint8_t const * const dp = ntoh_rtp(&rtp,buffer);
+  size -= dp - buffer;
+  if(size <= 0)
+    return;
+  if(rtp.pad){
+    size -= dp[size-1];
+    rtp.pad = 0;
+  }
+  if(size <= 0)
+    return;
+  if(Ssrc != 0 && rtp.ssrc != Ssrc)
+    return;
+  struct session * const sp = lookup_session(&sender,rtp.ssrc);
+  if(sp == NULL)
+    return;
+  sp->last_data = gps_time_ns();
+  atomic_fetch_add(&sp->packets,1);
+  struct pt_table const * const pt = &sp->pt_table[rtp.type & 0x7f];
+  int const sampsize = sample_size(pt->encoding);
+  if(pt->channels != 2 || pt->samprate <= 0 || sampsize == 0){
+    atomic_fetch_add(&sp->unusable,1);
+    return;
+  }
+  int const frames = (int)(size / (2 * sampsize));
+  if(frames <= 0)
+    return;
+  if(!sp->running && start_decoder(sp) != 0)
+    return;
+  if(pt->samprate != sp->samprate){
+    if(sp->samprate != 0){
+      send_queue(sp,true);
+      if(Verbose)
+        session_event(sp,0,"sample rate changed from %'d to %'d Hz",sp->samprate,pt->samprate);
+    }
+    sp->samprate = pt->samprate;
+    sp->rtp.init = false;
+  }
+  receive_packet(sp,&rtp,dp,frames,pt->encoding);
+}
+
+static void receive_packet(struct session *sp,struct rtp_header const *rtp,uint8_t const *data,int frames,enum encoding encoding){
+  if(sp->rtp.odd_seq_set){
+    if(rtp->seq == sp->rtp.odd_seq){
+      send_queue(sp,true);
+      sp->rtp.init = false;
+      atomic_fetch_add(&sp->resyncs,1);
+    } else
+      sp->rtp.odd_seq_set = false;
+  }
+  if(!sp->rtp.init){
+    sp->rtp.seq = rtp->seq;
+    sp->rtp.timestamp = rtp->timestamp;
+    sp->rtp.init = true;
+    sp->rtp.odd_seq_set = false;
+  }
+  int16_t const seqdiff = rtp->seq - sp->rtp.seq;
+  if(seqdiff < 0){
+    atomic_fetch_add(&sp->dupes,1);
+    sp->rtp.odd_seq = rtp->seq + 1;
+    sp->rtp.odd_seq_set = true;
+    return;
+  } else if(seqdiff >= RESEQ){
+    send_queue(sp,true);
+    int16_t const lost = rtp->seq - sp->rtp.seq;
+    if(lost >= RESEQ){
+      atomic_fetch_add(&sp->drops,lost);
+      sp->rtp.seq = rtp->seq;
+    }
+  }
+  sp->rtp.odd_seq_set = false;
+  struct block ** const qp = &sp->reseq[rtp->seq % RESEQ];
+  if(*qp != NULL){
+    atomic_fetch_add(&sp->dupes,1);
+    return;
+  }
+  struct block * const bp = new_block(sp,frames,rtp->timestamp);
+  if(bp == NULL)
+    return;
+  convert_iq(bp->samples,data,frames,encoding);
+  bp->marker = rtp->marker;
+  *qp = bp;
+  sp->pending++;
+  send_queue(sp,false);
+}
+
+static void send_queue(struct session *sp,bool flush){
+  for(int i=0; i < RESEQ; i++,sp->rtp.seq++){
+    struct block ** const qp = &sp->reseq[sp->rtp.seq % RESEQ];
+    struct block * const bp = *qp;
+    if(bp == NULL){
+      if(!flush || sp->pending == 0)
+        break;
+      atomic_fetch_add(&sp->drops,1);
+      continue;
+    }
+    *qp = NULL;
+    sp->pending--;
+    int32_t const jump = (int32_t)(bp->timestamp - sp->rtp.timestamp);
+    if(jump > 0 && !bp->marker){
+      if(jump <= Max_fill * sp->samprate){
+        struct block * const zp = new_block(sp,jump,sp->rtp.timestamp);
+        if(zp != NULL){
+          memset(zp->samples,0,jump * sizeof(zp->samples[0]));
+          enqueue_block(sp,zp);
+          atomic_fetch_add(&sp->filled,jump);
+        }
+      } else {
+        atomic_fetch_add(&sp->resyncs,1);
+        if(Verbose)
+          session_event(sp,bp->time,"timestamp jump %'d samples (%.1f sec), resynchronizing",jump,(double)jump / sp->samprate);
+      }
+    } else if(jump < 0)
+      atomic_fetch_add(&sp->resyncs,1);
+    sp->rtp.timestamp = bp->timestamp + bp->count;
+    enqueue_block(sp,bp);
+  }
+}
+
+static struct block *new_block(struct session const *sp,int count,uint32_t timestamp){
+  struct block * const bp = malloc(sizeof(*bp) + count * sizeof(bp->samples[0]));
+  if(bp == NULL)
+    return NULL;
+  bp->next = NULL;
+  bp->timestamp = timestamp;
+  bp->marker = false;
+  bp->samprate = sp->samprate;
+  bp->frequency = sp->chan.tune.freq;
+  bp->bb_power = sp->chan.sig.bb_power;
+  bp->n0 = sp->chan.sig.n0;
+  bp->low = sp->chan.filter.min_IF;
+  bp->high = sp->chan.filter.max_IF;
+  bp->time = session_time(sp,timestamp);
+  bp->count = count;
+  return bp;
+}
+
+static void enqueue_block(struct session *sp,struct block *bp){
+  bp->next = NULL;
+  pthread_mutex_lock(&sp->qmutex);
+  if(sp->qsamples + bp->count > Max_queue * sp->samprate){
+    pthread_mutex_unlock(&sp->qmutex);
+    atomic_fetch_add(&sp->overruns,1);
+    FREE(bp);
+    return;
+  }
+  if(sp->qtail != NULL)
+    sp->qtail->next = bp;
+  else
+    sp->queue = bp;
+  sp->qtail = bp;
+  sp->qsamples += bp->count;
+  pthread_cond_signal(&sp->qcond);
+  pthread_mutex_unlock(&sp->qmutex);
+}
+
+static int64_t session_time(struct session const *sp,uint32_t timestamp){
+  if(sp->chan.clocktime == 0 || sp->samprate <= 0)
+    return 0;
+  return sp->chan.clocktime + (int64_t)BILLION * (int32_t)(timestamp - sp->chan.output.time_snap) / sp->samprate;
+}
+
+static void scan_sessions(int64_t now){
+  struct session *next = NULL;
+  for(struct session *sp = Sessions; sp != NULL; sp = next){
+    next = sp->next;
+    int64_t const last = sp->running ? sp->last_data : sp->last_status;
+    if(now - last >= Timeout * BILLION)
+      close_session(sp,"idle timeout");
+  }
+}
+
+static bool same_socket(struct sockaddr_storage const *a,struct sockaddr_storage const *b){
+  return address_match(a,b) == 1 && getportnumber(a) == getportnumber(b);
+}
+
+static struct session *lookup_session(struct sockaddr_storage const *sender,uint32_t ssrc){
+  struct session *sp;
+  for(sp = Sessions; sp != NULL; sp = sp->next){
+    if(sp->ssrc == ssrc && same_socket(&sp->sender,sender))
+      break;
+  }
+  if(sp != NULL && sp->prev != NULL){
+    sp->prev->next = sp->next;
+    if(sp->next != NULL)
+      sp->next->prev = sp->prev;
+    sp->next = Sessions;
+    sp->prev = NULL;
+    Sessions->prev = sp;
+    Sessions = sp;
+  }
+  return sp;
+}
+
+static struct session *create_session(struct sockaddr_storage const *sender,uint32_t ssrc){
+  struct session * const sp = calloc(1,sizeof(*sp));
+  if(sp == NULL)
+    return NULL;
+  sp->ssrc = ssrc;
+  memcpy(&sp->sender,sender,sizeof(sp->sender));
+  memcpy(sp->pt_table,PT_table,sizeof(sp->pt_table));
+  sp->last_status = sp->last_data = gps_time_ns();
+  pthread_mutex_init(&sp->qmutex,NULL);
+  pthread_cond_init(&sp->qcond,NULL);
+  atomic_init(&sp->terminate,false);
+  sp->prev = NULL;
+  sp->next = Sessions;
+  if(sp->next != NULL)
+    sp->next->prev = sp;
+  Sessions = sp;
+  return sp;
+}
+
+static int start_decoder(struct session *sp){
+  if(pthread_create(&sp->thread,NULL,decode_task,sp) != 0){
+    perror("pthread_create");
+    return -1;
+  }
+  sp->running = true;
+  return 0;
+}
+
+static void close_session(struct session *sp,char const *reason){
+  if(sp == NULL)
+    return;
+  if(sp->running){
+    send_queue(sp,true);
+    atomic_store(&sp->terminate,true);
+    pthread_mutex_lock(&sp->qmutex);
+    pthread_cond_broadcast(&sp->qcond);
+    pthread_mutex_unlock(&sp->qmutex);
+    pthread_join(sp->thread,NULL);
+    sp->running = false;
+  }
+  if(Verbose)
+    session_event(sp,0,"closed (%s): packets %'llu drops %'llu dupes %'llu filled %'llu resyncs %'llu overruns %'llu unusable %'llu",
+                  reason,
+                  (unsigned long long)sp->packets,(unsigned long long)sp->drops,(unsigned long long)sp->dupes,
+                  (unsigned long long)sp->filled,(unsigned long long)sp->resyncs,(unsigned long long)sp->overruns,
+                  (unsigned long long)sp->unusable);
+  if(sp->prev != NULL)
+    sp->prev->next = sp->next;
+  else
+    Sessions = sp->next;
+  if(sp->next != NULL)
+    sp->next->prev = sp->prev;
+  for(int i=0; i < RESEQ; i++)
+    FREE(sp->reseq[i]);
+  struct block *next = NULL;
+  for(struct block *bp = sp->queue; bp != NULL; bp = next){
+    next = bp->next;
+    FREE(bp);
+  }
+  pthread_mutex_destroy(&sp->qmutex);
+  pthread_cond_destroy(&sp->qcond);
+  FREE(sp);
+}
+
+static void cleanup(void){
+  while(Sessions != NULL)
+    close_session(Sessions,"shutdown");
+}
+
+// ---------------------------------------------------------------------------
+// Decoding
+
+// One per channel: take blocks off the queue and run the carrier's decoder over them. A change of
+// sample rate makes the decoder again
+static void *decode_task(void *arg){
+  struct session * const sp = (struct session *)arg;
+  assert(sp != NULL);
+  {
+    char name[100];
+    snprintf(name,sizeof(name),"dmr %u",sp->ssrc);
+    pthread_setname(name);
+  }
+  struct decoder dec = {
+    .sp = sp,
+  };
+  for(int t=0; t < 2; t++)
+    dec.slot[t].audio = dmr_audio_create(Audio_group,sp->ssrc * 10 + t + 1); // NULL without --pcm-out
+  struct dmr_chan_handlers const h = {
+    .frame = voice_frame,
+    .event = voice_event,
+    .log = voice_log,
+    .arg = &dec,
+  };
+  struct dmr_chan_config config;
+  dmr_chan_config_init(&config);
+  config.color_code = Color_code;
+  config.mobile_station = config.direct = Mobile;
+  while(true){
+    pthread_mutex_lock(&sp->qmutex);
+    while(sp->queue == NULL && !atomic_load(&sp->terminate)){
+      struct timespec deadline;
+      calculate_deadline(&deadline,BILLION);
+      pthread_cond_timedwait(&sp->qcond,&sp->qmutex,&deadline);
+    }
+    struct block *bp = sp->queue;
+    if(bp != NULL){
+      sp->queue = bp->next;
+      if(sp->queue == NULL)
+        sp->qtail = NULL;
+      sp->qsamples -= bp->count;
+    }
+    pthread_mutex_unlock(&sp->qmutex);
+    if(bp == NULL)
+      break;
+
+    if(bp->samprate != dec.samprate){
+      for(int t=0; t < 2; t++)
+        dmr_audio_end(dec.slot[t].audio);
+      dmr_chan_destroy(dec.chan);
+      dec.samprate = bp->samprate;
+      dec.samples = 0;
+      dec.next_report = (uint64_t)(Update * dec.samprate);
+      dec.chan = dmr_chan_create(&config,dec.samprate,&h);
+      if(dec.chan == NULL)
+        fprintf(stderr,"ssrc %u: can't create DMR receiver at %'.0lf Hz (needs %d Hz)\n",sp->ssrc,dec.samprate,4 * DMR_SYMBOL_RATE);
+    }
+    dec.frequency = bp->frequency;
+    dec.block_time = bp->time;
+    dec.bb_power = bp->bb_power;
+    dec.n0 = bp->n0;
+    dec.low = bp->low;
+    dec.high = bp->high;
+    for(int t=0; t < 2; t++)
+      dmr_audio_set_signal(dec.slot[t].audio,dec.frequency,dec.bb_power,dec.n0,dec.low,dec.high);
+    if(dec.chan != NULL)
+      dmr_chan_samples(dec.chan,bp->samples,bp->count,bp->time); // voice_frame(), voice_event() run in here
+    int64_t const end = bp->time != 0 ? bp->time + llrint(1e9 * bp->count / dec.samprate) : 0;
+    for(int t=0; t < 2; t++)
+      dmr_audio_poll(dec.slot[t].audio,end);
+    dec.samples += bp->count;
+    FREE(bp);
+    if(Verbose && Update > 0 && dec.samples >= dec.next_report){
+      status_line(&dec);
+      dec.next_report += (uint64_t)(Update * dec.samprate);
+    }
+  }
+  dmr_chan_destroy(dec.chan); // ends what is in progress: voice_event() runs in here
+  for(int t=0; t < 2; t++){
+    dmr_audio_destroy(dec.slot[t].audio);
+  }
+  return NULL;
+}
+
+// The stream a frame goes to: a group call's talkgroup, else the channel's own for the slot
+static uint32_t frame_ssrc(struct decoder const *dp,struct dmr_chan_frame const *f){
+  if(f->group && f->destination != 0)
+    return f->destination;
+  return dp->sp->ssrc * 10 + f->slot;
+}
+
+// Claim a talkgroup stream for this channel and slot, or find it is another's
+static bool claim_stream(struct decoder const *dp,int slot,uint32_t ssrc,int64_t when){
+  if(when == 0)
+    when = gps_time_ns();
+  pthread_mutex_lock(&Streams_mutex);
+  struct stream *free_entry = NULL;
+  bool ours = false;
+  bool found = false;
+  for(int i=0; i < MAX_STREAMS; i++){
+    struct stream * const s = &Streams[i];
+    if(s->ssrc == 0 || when - s->last > Stream_hold){
+      if(free_entry == NULL)
+        free_entry = s;
+      if(s->ssrc != ssrc)
+        continue;
+    }
+    if(s->ssrc == ssrc){
+      found = true;
+      if((s->owner == dp->sp->ssrc && s->slot == slot) || when - s->last > Stream_hold){
+        s->owner = dp->sp->ssrc;
+        s->slot = slot;
+        s->last = when;
+        ours = true;
+      }
+      break;
+    }
+  }
+  if(!found && free_entry != NULL){
+    free_entry->ssrc = ssrc;
+    free_entry->owner = dp->sp->ssrc;
+    free_entry->slot = slot;
+    free_entry->last = when;
+    ours = true;
+  }
+  pthread_mutex_unlock(&Streams_mutex);
+  return ours;
+}
+
+static void release_stream(struct decoder const *dp,int slot,uint32_t ssrc){
+  pthread_mutex_lock(&Streams_mutex);
+  for(int i=0; i < MAX_STREAMS; i++){
+    struct stream * const s = &Streams[i];
+    if(s->ssrc == ssrc && s->owner == dp->sp->ssrc && s->slot == slot){
+      s->ssrc = 0;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&Streams_mutex);
+}
+
+static void describe(char *buf,size_t size,struct decoder const *dp,struct dmr_chan_frame const *f){
+  int n;
+  if(f->destination == 0)
+    n = snprintf(buf,size,"DMR %.4f MHz slot %d",dp->frequency * 1e-6,f->slot);
+  else
+    n = snprintf(buf,size,"DMR %s %u",f->group ? "TG" : "unit",f->destination);
+  if(n > 0 && (size_t)n < size && f->source != 0)
+    n += snprintf(buf + n,size - n," src %u",f->source);
+  if(n > 0 && (size_t)n < size && f->alias[0] != '\0')
+    n += snprintf(buf + n,size - n," \"%s\"",f->alias);
+  if(n > 0 && (size_t)n < size && f->destination != 0)
+    snprintf(buf + n,size - n," %.4f MHz slot %d",dp->frequency * 1e-6,f->slot);
+}
+
+// A frame the call tracker released. Only clear frames are heard
+static void voice_frame(void *arg,struct dmr_chan_frame const *f){
+  struct decoder * const dp = arg;
+  if(f->slot < 1 || f->slot > 2 || f->label != DMR_CHAN_CLEAR)
+    return;
+  struct slot * const s = &dp->slot[f->slot - 1];
+  if(s->audio == NULL)
+    return;
+  uint32_t const ssrc = frame_ssrc(dp,f);
+  if(ssrc != s->ssrc){
+    if(s->sending)
+      release_stream(dp,f->slot,s->ssrc);
+    dmr_audio_end(s->audio);
+    s->ssrc = ssrc;
+    s->sending = false;
+    s->refused = false;
+  }
+  if(s->refused)
+    return;
+  if(!claim_stream(dp,f->slot,ssrc,f->when)){
+    if(!s->sending){
+      s->refused = true;
+      if(Verbose)
+        decoder_event(dp,f->when,"slot %d: the same call is already being sent from another channel",f->slot);
+    } else {
+      s->sending = false;
+      dmr_audio_end(s->audio);
+    }
+    return;
+  }
+  if(!s->sending){
+    char desc[256];
+    describe(desc,sizeof desc,dp,f);
+    dmr_audio_set_stream(s->audio,ssrc,desc);
+    s->sending = true;
+  }
+  dmr_audio_frame(s->audio,f->bits,f->when);
+  s->last = f->when;
+}
+
+// A transmission started or ended on a slot
+static void voice_event(void *arg,struct dmr_chan_event const *e){
+  struct decoder * const dp = arg;
+  char who[160] = "";
+  if(e->destination != 0){
+    int n = snprintf(who,sizeof who,"%s %u",e->group ? "TG" : "unit",e->destination);
+    if(n > 0 && (size_t)n < sizeof who && e->source != 0)
+      snprintf(who + n,sizeof who - n," src %u",e->source);
+  } else
+    strlcpy(who,"(no LC yet)",sizeof who);
+  if(e->start)
+    decoder_event(dp,e->when,"slot %d transmission start %s cc %d (%s)",e->slot,who,e->color_code,e->how != NULL ? e->how : "");
+  else {
+    decoder_event(dp,e->when,"slot %d transmission end %s: %s, %d frames %s",e->slot,who,e->how != NULL ? e->how : "",
+                  e->frames,e->label != NULL ? e->label : "");
+    if(e->slot >= 1 && e->slot <= 2){
+      struct slot * const s = &dp->slot[e->slot - 1];
+      if(s->sending)
+        release_stream(dp,e->slot,s->ssrc);
+      dmr_audio_end(s->audio);
+      s->sending = false;
+      s->refused = false;
+      s->ssrc = 0;
+    }
+  }
+}
+
+static void voice_log(void *arg,int64_t when,char const *text){
+  struct decoder * const dp = arg;
+  if(Verbose)
+    decoder_event(dp,when,"%s",text);
+}
+
+static void status_line(struct decoder const *dp){
+  struct dmr_chan_stats st;
+  memset(&st,0,sizeof st);
+  dmr_chan_get_stats(dp->chan,&st);
+  decoder_event(dp,0,"bursts %'llu syncs %'llu acquisitions %'llu voice %'llu frames clear %'llu encrypted %'llu unconfirmed %'llu cc %d offset %+.0f Hz",
+                (unsigned long long)st.bursts,(unsigned long long)st.syncs,(unsigned long long)st.acquisitions,
+                (unsigned long long)st.voice_bursts,(unsigned long long)st.frames_clear,(unsigned long long)st.frames_encrypted,
+                (unsigned long long)st.frames_unconfirmed,st.color_code,st.frequency_offset);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers, as p25d's
+
+static int sample_size(enum encoding encoding){
+  switch(encoding){
+  case S16LE:
+  case S16BE:
+    return sizeof(int16_t);
+  case F32LE:
+  case F32BE:
+    return sizeof(float);
+#ifdef HAS_FLOAT16
+  case F16LE:
+  case F16BE:
+    return sizeof(float16_t);
+#endif
+  default:
+    return 0;
+  }
+}
+
+static int convert_iq(float complex *out,uint8_t const *in,int frames,enum encoding encoding){
+  float * const fp = (float *)out;
+  size_t const count = 2 * (size_t)frames;
+  switch(encoding){
+  case S16BE:
+    import_s16_be(fp,in,count);
+    break;
+  case S16LE:
+    import_s16_le(fp,in,count);
+    break;
+  case F32LE:
+    import_f32_le(fp,in,count);
+    break;
+  case F32BE:
+    import_f32_be(fp,in,count);
+    break;
+#ifdef HAS_FLOAT16
+  case F16LE:
+    import_f16_le(fp,in,count);
+    break;
+  case F16BE:
+    import_f16_be(fp,in,count);
+    break;
+#endif
+  default:
+    return -1;
+  }
+  return frames;
+}
+
+static int calculate_deadline(struct timespec *deadline,int64_t timeout){
+  assert(deadline != NULL);
+  if(deadline == NULL)
+    return -1;
+  clock_gettime(CLOCK_REALTIME,deadline);
+  if(timeout > 0){
+    deadline->tv_nsec += timeout % BILLION;
+    deadline->tv_sec += timeout / BILLION;
+    if(deadline->tv_nsec >= BILLION){
+      deadline->tv_nsec -= BILLION;
+      deadline->tv_sec++;
+    }
+  }
+  return 0;
+}
+
+// Logging, as p25d's: one line per event on standard output
+//   Mon 23 Nov 2026 21:02:03.123456 UTC ssrc 453425 453.425000 MHz <event text>
+static void log_event(uint32_t ssrc,double frequency,int64_t when,char const *fmt,va_list ap){
+  char timestring[100];
+  format_gpstime(timestring,sizeof(timestring),when != 0 ? when : gps_time_ns());
+  pthread_mutex_lock(&Output_mutex);
+  fprintf(stdout,"%s ssrc %u %.6lf MHz ",timestring,ssrc,frequency * 1e-6);
+  vfprintf(stdout,fmt,ap);
+  fputc('\n',stdout);
+  pthread_mutex_unlock(&Output_mutex);
+}
+
+static void session_event(struct session const *sp,int64_t when,char const *fmt,...){
+  va_list ap;
+  va_start(ap,fmt);
+  log_event(sp->ssrc,sp->chan.tune.freq,when,fmt,ap);
+  va_end(ap);
+}
+
+static void decoder_event(struct decoder const *dp,int64_t when,char const *fmt,...){
+  va_list ap;
+  va_start(ap,fmt);
+  log_event(dp->sp->ssrc,dp->frequency,when,fmt,ap);
+  va_end(ap);
+}
