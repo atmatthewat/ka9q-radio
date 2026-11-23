@@ -1737,10 +1737,10 @@ journalctl -u radiod@hf -f</pre>
     each in its own thread. It decodes and logs every trunking message, header,
     link control word, encryption sync and packet data unit. When a control
     channel grants a voice channel, p25d asks radiod for that channel, decodes
-    it, and lets it go when the call ends. Phase 1 (FDMA) control, voice and
-    conventional channels are decoded, and the Phase 2 (TDMA) control and voice
-    channels of trunked systems, both timeslots of a carrier from one radiod
-    channel.</p>
+    it, and lets it go when the hang time after the call's end has passed with
+    no other call granted there. Phase 1 (FDMA) control, voice and conventional
+    channels are decoded, and the Phase 2 (TDMA) control and voice channels of
+    trunked systems, both timeslots of a carrier from one radiod channel.</p>
 <p class="Pp">The speech of clear (unencrypted) calls can be sent as an 8 kHz
     RTP audio stream that monitor plays and pcmrecord records (when p25d is
     built with mbelib), and the vocoder frames themselves can be sent as an RTP
@@ -1793,6 +1793,26 @@ journalctl -u radiod@hf -f</pre>
   <dt id="e,"><a class="permalink" href="#e,"><b>-e, --encrypted</b></a></dt>
   <dd>Follow encrypted calls too. They are logged; their voice is never
     decoded.</dd>
+  <dt id="H"><a class="permalink" href="#H"><b>-H seconds, --hangtime
+    seconds</b></a></dt>
+  <dd>Keep a voice channel, and its receiver, this long after the last call on
+      it ends, so that a call granted there again finds it running. Default 30;
+      fractions are allowed; 0 releases the channel as soon as its last call
+      ends. The clock starts at the end of the last call on the channel; for 3 s
+      after a call it followed (or the hang time, if shorter) a grant update
+      naming the same call there starts no new call, while a grant, voice, or an
+      update naming another talkgroup does: a reply announced only by updates is
+      followed from its own voice. The default comes from a survey of four
+      trunked sites: 3 s catches every deliberate reuse (systems' own hang and
+      replies) and saves about half of all channel requests for the least load;
+      30 s saves 64 to 84% on busy systems for two to three idle receivers per
+      site on average, the peak being bounded by the site's voice carriers.
+      Quiet systems gain nothing past 3 s. A Phase 2 channel is kept only when
+      neither timeslot has a call. -m counts calls, not kept channels; there is
+      at most one kept channel per voice frequency granted in the hang time, and
+      at most 64 voice channels per control channel in all. Kept channels are
+      released at once when p25d exits or the control channel goes away. With
+      -v, keeping, reusing and releasing a channel are logged.</dd>
   <dt id="S"><a class="permalink" href="#S"><b>-S ssrc, --ssrc ssrc</b></a></dt>
   <dd>Decode only this channel. Turns call following off.</dd>
   <dt id="o"><a class="permalink" href="#o"><b>-o source, --source
@@ -1849,7 +1869,8 @@ freq = &quot;857m98125&quot;</pre>
     that a Phase 2 voice channel is always asked for at 24 kHz, and a Phase 1
     voice channel granted on a Phase 2 control channel at 19.2 kHz. They need no
     configuration, except that radiod builds them from its [global] section: see
-    NOTES.</p>
+    NOTES. A voice channel is released when the hang time (-H) after its last
+    call has passed, or at once when p25d exits.</p>
 </section>
 <section class="Sh">
 <h1 class="Sh" id="INPUT_AND_OUTPUT"><a class="permalink" href="#INPUT_AND_OUTPUT">INPUT

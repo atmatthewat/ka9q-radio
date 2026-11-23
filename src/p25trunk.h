@@ -44,6 +44,15 @@ struct p25_trunk_config {
   int nallow;                 // 0: every talkgroup
   uint16_t const *deny;       // group calls on these talkgroups are never followed (copied)
   int ndeny;
+  // Quiet time, ns (0: off, the default). Systems go on naming a channel in grant updates for a
+  // second or two after a call's last voice, reply or not, and an update carries no talker, so an
+  // update alone can't tell a reply from that hang time; without this each one starts a call
+  // with no voice. For this long after a call ends that was followed (and is received:
+  // p25_trunk_set_heard()), an update naming the same call on the same channel starts no call; an
+  // explicit grant, voice there, or an update naming another call still do. Only for a caller
+  // that keeps receiving the channel at least this long after the call: a reply announced by
+  // updates alone is then started from its own voice there. See begin_call() in p25trunk.c
+  int64_t update_quiet;
 };
 
 enum p25_trunk_event_type {
@@ -276,6 +285,10 @@ void p25_trunk_set_control(struct p25_trunk *t,uint64_t freq_hz,float offset_hz)
 // A Phase 2 control channel whose LCCH is on one timeslot (0 or 1) of its carrier: voice on the
 // other slot is traffic, not a sign that control has moved. -1 (the default): FDMA, or LCCH on both
 void p25_trunk_set_control_slot(struct p25_trunk *t,int slot);
+// Whether the caller receives a call the logic follows (default yes). One it doesn't (a limit or
+// a refusal of its own) leaves nothing listening on the channel, so the quiet time does not apply
+// after it (update_quiet)
+void p25_trunk_set_heard(struct p25_trunk *t,uint32_t call_id,bool heard);
 
 // The band plan this site has broadcast (for the caller's log lines)
 struct p25_bandplan const *p25_trunk_bandplan(struct p25_trunk const *t);

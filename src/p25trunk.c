@@ -63,6 +63,7 @@ struct call {
   bool start_pending;
   bool refreshed;            // a grant named it during this call into the library
   bool followed;
+  bool unheard;              // followed, but the caller does not receive it (p25_trunk_set_heard())
   enum p25_trunk_why why;
   uint8_t sig[64];           // attributes last reported
 };
@@ -113,6 +114,9 @@ struct p25_trunk {
   struct p25_msg pend_msg;
   struct p25_trunk_label label;
   int64_t now;
+  struct call ended[P25_TRUNK_MAX_CALLS]; // calls ended lately, for config.update_quiet
+  int64_t ended_at[P25_TRUNK_MAX_CALLS];
+  int next_ended;
 };
 
 // Link control data: who a voice unit belongs to
@@ -772,6 +776,11 @@ static void end_call(struct p25_trunk *t, struct call *c, enum p25_trunk_end rea
   size_t n = strlen(e.text);
   snprintf(e.text + n, sizeof e.text - n, " reason=%s", p25_trunk_end_name(reason));
   emit(t, &e);
+  if(t->config.update_quiet > 0){
+    t->ended[t->next_ended] = *c;
+    t->ended_at[t->next_ended] = t->now;
+    t->next_ended = (t->next_ended + 1) % P25_TRUNK_MAX_CALLS;
+  }
   c->used = false;
 }
 
@@ -866,6 +875,23 @@ static struct call *begin_call(struct p25_trunk *t, struct key const *k, enum p2
     }
     mark_harris(t, c);
     return c;
+  }
+  if(c == NULL && origin == ORIGIN_UPDATE && t->config.update_quiet > 0){
+    // The quiet time (p25trunk.h, update_quiet). A grant update naming the call that ended on
+    // this channel a moment ago is most likely the system's own hang time after it, and an
+    // update has no talker to say otherwise; starting a call from it would log a call that
+    // never had voice, count it against the caller's limit and keep the channel in use for
+    // nothing. So none is started. No reply is lost by it: the caller is still receiving the
+    // channel (that is the condition for setting a quiet time), so a reply announced by updates
+    // alone starts its call from its own header or first voice unit, with its talker, a few
+    // tenths of a second later. Only after a call that was followed and received: after any
+    // other nothing is listening there, and the update must start a call as before
+    for(int i = 0; i < P25_TRUNK_MAX_CALLS; i++){
+      struct call const *e = &t->ended[i];
+      if(e->used && e->followed && !e->unheard && e->freq == k->freq && e->slot == k->slot
+         && t->now - t->ended_at[i] < t->config.update_quiet && same_call(t, e, tg, type, unit))
+        return NULL;
+    }
   }
   if(c != NULL)
     end_call(t, c, P25_TRUNK_END_NEW_CALL);
@@ -1716,6 +1742,12 @@ void p25_trunk_set_control(struct p25_trunk *t, uint64_t freq_hz, float offset_h
     return;
   t->control_freq = freq_hz;
   t->control_offset = offset_hz;
+}
+
+void p25_trunk_set_heard(struct p25_trunk *t, uint32_t call_id, bool heard){
+  for(int i = 0; t != NULL && i < P25_TRUNK_MAX_CALLS; i++)
+    if(t->calls[i].used && t->calls[i].id == call_id)
+      t->calls[i].unheard = !heard;
 }
 
 void p25_trunk_set_control_slot(struct p25_trunk *t, int slot){

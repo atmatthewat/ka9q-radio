@@ -49,6 +49,17 @@
 #define MAX_EVENTS 128 // Trunking events waiting to be acted on, per site
 #define MAX_WORK 256   // Log lines and channel requests waiting for a site's lock to be let go
 #define MAX_REFUSED 64 // Frequencies radiod refused, per site, remembered so each is logged once
+#define MAX_VCHANS P25_TRUNK_MAX_CALLS // Voice channels a site has in radiod, in use or kept
+// Seconds a voice channel is kept after its last call ends (-H). From a survey of four trunked
+// sites (96 hours): systems keep a channel assigned 0.85 s (Phase 2) to 1.9 s (Phase 1; 99th
+// percentile 2.8 s) after the last voice, and a reply on the same talkgroup and frequency always
+// came within 2.75 s, so 3 s catches every deliberate reuse and saves about half of all channel
+// requests for a quarter to half an idle receiver per site on average. Past that a frequency is
+// reused only as the system rotates through its carriers, and on busy systems the saving keeps
+// growing: 10 s saves 51-60% for about one idle receiver per site, 30 s 64-84% for two to three.
+// The peak is bounded by the site's voice carriers whatever the hang time: a longer one costs
+// average load, not peak
+#define DEFAULT_HANGTIME 30.0
 
 struct site;
 struct work;
@@ -228,6 +239,25 @@ struct fcall {
   int release;               // for the voice channel's thread: held units released, 1 clear, 2 not clear
 };
 
+// A voice channel the site has in radiod, one per frequency (and so per SSRC): from the first
+// call that asks for it while any call needs it, then for the hang time (-H) after the last of
+// them ends, so that a call granted there again soon finds the channel there and its receiver
+// still running, locked to the carrier. Its decode thread keeps running meanwhile, and learns
+// from here which receiver the channel's calls need
+struct vchan {
+  bool used;
+  uint32_t ssrc;
+  uint64_t freq_hz;
+  bool tdma;                 // asked for in the Phase 2 form: its thread runs the Phase 2 receiver
+  bool seed;                 // the control channel's carrier offset, for that receiver
+  float seed_hz;
+  int64_t kept;              // site time its last call ended; 0 while a call needs it
+  int64_t refreshed;         // site time it was last kept alive while kept
+  bool said;                 // the "kept" line is out (-v)
+  bool ended[2];             // a call on it (timeslot 0 or 1; FDMA 0) ended while the channel
+			     // stays: its thread ends the voice output's call before the next unit
+};
+
 // One per control channel: its trunking logic and the calls followed from it
 // Lock order: Sites_mutex, then a site's lock, then Ctl_mutex. Output_mutex is taken alone
 struct site {
@@ -244,6 +274,7 @@ struct site {
   bool carrier_granted;      // carrier_hz is the frequency of a grant of the carrier's other slot
   int64_t now;               // last time given to the trunking logic: it must not go back
   struct fcall calls[P25_TRUNK_MAX_CALLS];
+  struct vchan vchans[MAX_VCHANS];
   uint64_t refused[MAX_REFUSED];
   int nrefused;
   struct p25_trunk_event events[MAX_EVENTS]; // reported by the trunking logic, not yet acted on
@@ -288,6 +319,7 @@ static int IP_tos = DEFAULT_IP_TOS;
 static bool Follow = true;            // Ask radiod for the voice channels of calls granted on a control channel
 static bool Follow_encrypted;         // Including encrypted calls (logged, never heard)
 static int Max_calls;                 // Most calls followed at once, 0 = no limit
+static double Hangtime = DEFAULT_HANGTIME; // Seconds a voice channel is kept after its last call, 0 = none
 static uint16_t Allow[MAX_TALKGROUPS],Deny[MAX_TALKGROUPS]; // Talkgroups to follow (none: all) and not to follow
 static int Nallow,Ndeny;
 
@@ -299,6 +331,21 @@ static double const Max_queue = 5.0;  // Seconds of samples queued to a decoder 
 // leave it behind for long
 static double const Lifetime = P25_TRUNK_CALL_TIMEOUT * 1e-9 + 2;
 static int const Ctl_ttl = 1;         // Commands to radiod, as tune and control send them
+// The trunking logic's quiet time (p25_trunk_config.update_quiet). Systems go on naming a
+// channel in grant updates for a second or two after a call's last voice (surveyed: up to 1.9 s,
+// 99th percentile 2.8 s), whether or not anyone replies, and an update carries no talker, so an
+// update alone can't tell a reply from that hang time. Without the quiet time each such update
+// started a call: logged as started, then ended with no voice, counted under -m, and keeping the
+// channel in use, so the hang clock started again from that phantom's end. With it, for this
+// long after a call p25d followed, an update naming the same call on that channel starts nothing;
+// an explicit grant, voice there, or an update naming another talkgroup still do. No call is
+// lost by it because the channel is kept at least that long (never longer than the hang time):
+// a reply announced by updates alone starts its call from its own header or first voice unit,
+// with its talker, a few tenths of a second later than the update would have. With no hang time
+// nothing is listening after the call, so it is off and the updates start calls as they always
+// did; and only after a call p25d followed and received (p25_trunk_set_heard(): not one beyond
+// -m, nor one whose channel radiod refused), for the same reason
+static double const Update_quiet = 3;
 // A Phase 2 (TDMA) voice channel is asked for at 24 kHz (four samples per 6000 baud symbol; the
 // Phase 2 receiver needs at least that, and the control channel's 19.2 kHz is too little), with
 // the filter at +/-5 kHz: H-DQPSK with its root raised cosine (rolloff 0.2) occupies +/-3.6 kHz,
@@ -369,6 +416,7 @@ static void control_block(struct decoder *dp);
 static void control_lost(struct decoder *dp);
 static void voice_unit(struct decoder *dp,uint64_t sample,struct p25_frame const *frame);
 static bool link_voice(struct decoder *dp);
+static bool voice_moved(struct decoder *dp);
 static void conv_unit(struct decoder *dp,uint64_t sample,struct p25_frame const *frame);
 static void conv_end(struct decoder *dp,uint64_t sample,char const *how);
 static void block_done(struct decoder *dp,int count);
@@ -385,6 +433,7 @@ static struct option Options[] = {
   {"frames-encrypted", no_argument, NULL, 'E'},
   {"frames-out", required_argument, NULL, 'F'},
   {"talkgroups", required_argument, NULL, 'g'},
+  {"hangtime", required_argument, NULL, 'H'},
   {"locale", required_argument, NULL, 'l'},
   {"max-calls", required_argument, NULL, 'm'},
   {"name", required_argument, NULL, 'N'},
@@ -401,10 +450,10 @@ static struct option Options[] = {
   {"version", no_argument, NULL, 'V'},
   {NULL, 0, NULL, 0},
 };
-static char const Optstring[] = "A:eEF:g:I:l:m:nN:o:p:R:S:t:T:u:vVx:";
+static char const Optstring[] = "A:eEF:g:H:I:l:m:nN:o:p:R:S:t:T:u:vVx:";
 
 static void usage(void){
-  fprintf(stderr,"Usage: %s [-v|--verbose] [-V|--version] [-l|--locale locale] [-A|--iface interface] [-o|--source <source-name-or-address>] [-S|--ssrc ssrc] [-t|--timeout seconds] [-u|--update seconds] [-R|--pcm-out audio_mcast_address] [-F|--frames-out frames_mcast_address] [-E|--frames-encrypted] [-N|--name service_name] [-T|--ttl ttl] [-p|--tos tos] [-n|--no-follow] [-g|--talkgroups list] [-x|--exclude list] [-m|--max-calls n] [-e|--encrypted] [-I|--input] iq_mcast_address [iq_mcast_address ...]\n",App_path);
+  fprintf(stderr,"Usage: %s [-v|--verbose] [-V|--version] [-l|--locale locale] [-A|--iface interface] [-o|--source <source-name-or-address>] [-S|--ssrc ssrc] [-t|--timeout seconds] [-u|--update seconds] [-R|--pcm-out audio_mcast_address] [-F|--frames-out frames_mcast_address] [-E|--frames-encrypted] [-N|--name service_name] [-T|--ttl ttl] [-p|--tos tos] [-n|--no-follow] [-g|--talkgroups list] [-x|--exclude list] [-m|--max-calls n] [-H|--hangtime seconds] [-e|--encrypted] [-I|--input] iq_mcast_address [iq_mcast_address ...]\n",App_path);
 }
 
 int main(int argc,char *argv[]){
@@ -437,6 +486,17 @@ int main(int argc,char *argv[]){
       break;
     case 'g':
       Nallow = parse_talkgroups(Allow,Nallow,optarg);
+      break;
+    case 'H':
+      {
+	char *ptr = NULL;
+	double const x = strtod(optarg,&ptr);
+	if(ptr == optarg || *ptr != '\0' || !isfinite(x) || x < 0 || x > 86400){
+	  fprintf(stderr,"Bad hang time \"%s\": seconds, 0 (release at once) to 86400\n",optarg);
+	  exit(EX_USAGE);
+	}
+	Hangtime = x;
+      }
       break;
     case 'l':
       Locale = optarg;
@@ -1040,6 +1100,9 @@ static void *decode_task(void *arg){
       break; // Told to terminate, and nothing left
 
     dec.frequency = bp->frequency;
+    if(dec.voice && voice_moved(&dec))
+      dec.voice = false; // asked for again in the other form: linked anew just below, which starts
+			 // the receiver and streams that form needs as for a new channel
     if(Follow && !dec.voice && !dec.control && link_voice(&dec) && dec.samprate != 0
        && (dec.choosing || (dec.rx == RX_PHASE2) != (dec.p2 != NULL)))
       dec.samprate = 0; // a channel already running, now granted: start the receiver its grant says
@@ -1063,7 +1126,10 @@ static void *decode_task(void *arg){
       // receiver can take, it runs beside the Phase 1 receiver until one of them decodes a
       // message that passes its check (choose())
       dec.choosing = !dec.voice && dec.samprate >= P2_samprate;
-      if(dec.rx == RX_PHASE2 || dec.choosing){
+      // A channel kept after a Phase 1 call and granted again as Phase 2 is still in its earlier
+      // form for a moment: its receiver starts when the Phase 2 form (P2_samprate) arrives
+      bool const waiting = dec.voice && dec.rx == RX_PHASE2 && dec.samprate < P2_samprate;
+      if((dec.rx == RX_PHASE2 || dec.choosing) && !waiting){
 	dec.p2 = create_p25p2(dec.samprate);
 	if(dec.p2 == NULL)
 	  fprintf(stderr,"ssrc %u: can't create P25 Phase 2 receiver at %'.0lf Hz (needs at least %d Hz)\n",
@@ -1344,6 +1410,49 @@ static void status_line(struct decoder const *dp){
 // (bookkeeping under the site's lock, then log lines and commands to radiod after letting it go),
 // so no lock is held while writing the log or sending, and the site lock is never taken while
 // holding Ctl_mutex.
+//
+// Voice channels and the hang time.
+//
+// A voice channel's life. A grant for a followed call makes p25d ask radiod for a channel on
+// the voice frequency (want_channel(), ask_channel()); radiod starts sending its I/Q, and a decode
+// thread starts for it like any other stream and finds its entry (struct vchan, link_voice()).
+// While any call needs it (both timeslots of a Phase 2 carrier share it) it is kept alive by
+// grant updates and voice. When the last call on it ends it is not released but kept (let_go()),
+// still asked for and its receiver still running, for the hang time (-H). A call granted there,
+// or voice heard there, in that time uses it as it is; with none, hang_tick() releases it as a
+// channel used to be released at once.
+//
+// Why. Systems reuse frequencies: the reply in a conversation is usually granted the channel the
+// call before it had, and later calls come back to channels used a little earlier. Without a hang
+// time each of those means radiod building a new channel, and p25d's receiver for it finding the
+// carrier, symbol timing and frame sync again. What the hang time buys is fewer channels built
+// (about half of all requests at 3 s, more on busy systems: see DEFAULT_HANGTIME) and a receiver
+// already locked when the next call starts. It does not, with the usual grant lead (the first
+// voice 0.4 s or more after the grant), buy speech: a fresh channel is up in tens of
+// milliseconds and loses nothing measurable. Its cost is a radiod channel and a receiver thread
+// per kept channel, on average a few per site at the default.
+//
+// The clock starts when the last call on the channel ends, as the trunking logic decides it
+// (terminator, timeout, the channel granted to another call, the call no longer followed). The
+// grant updates systems send for a second or two afterwards do not start it again: the trunking
+// logic's quiet time (Update_quiet) keeps them from starting a call.
+//
+// A kept channel goes early when the control channel is lost or p25d exits (control_lost():
+// nothing would end it otherwise), when the table is full and room is needed (new_vchan(): the
+// one kept longest), and in a sense when it is granted in the other form (Phase 1 kept, Phase 2
+// granted, or the reverse: it is asked for in the new form and its thread linked anew,
+// voice_moved(), exactly as a new channel would be).
+//
+// The bound: one entry per voice frequency (radiod's SSRC is per frequency, and want_channel()
+// finds a kept one by frequency), so a site never keeps more channels than voice frequencies it
+// has granted within the hang time, and never more than MAX_VCHANS in use and kept together.
+// -m counts calls, not kept channels: it limits what is decoded and heard, and a kept channel
+// decodes nothing that is heard until a call is followed on it; its cost is bounded by the above.
+//
+// The voice output must not carry one call's state into the next on a kept channel: held units
+// and the confirmation that a transmission is clear belong to a call. When a call on a kept
+// channel ends, let_go() marks the channel (ended[]), and its thread ends the voice output's call
+// (p25_audio_call_end()) before the next unit is handed on (voice_unit(), p2_burst()).
 
 // Find or create the chanctl handle for the radiod that sent this status, and show it the status.
 // For a control channel, also keep its site's handle and channel format current. Input thread
@@ -1421,6 +1530,7 @@ static struct p25_trunk *site_trunk(struct site *site){
       .nallow = Nallow,
       .deny = Ndeny > 0 ? Deny : NULL,
       .ndeny = Ndeny,
+      .update_quiet = llrint(fmin(Hangtime,Update_quiet) * BILLION),
     };
     site->trunk = create_p25_trunk(&config,trunk_event,site);
   }
@@ -1466,6 +1576,28 @@ static int requested_count(struct site const *site){
   return n;
 }
 
+// Does a call other than 'except' still need the channel 'ssrc'?
+static bool ssrc_needed(struct site const *site,uint32_t ssrc,struct fcall const *except){
+  for(int i=0; i < P25_TRUNK_MAX_CALLS; i++){
+    struct fcall const * const fc = &site->calls[i];
+    if(fc != except && fc->used && fc->requested && fc->ssrc == ssrc)
+      return true;
+  }
+  return false;
+}
+static struct vchan *vchan_freq(struct site *site,uint64_t freq_hz){
+  for(int i=0; i < MAX_VCHANS; i++)
+    if(site->vchans[i].used && site->vchans[i].freq_hz == freq_hz)
+      return &site->vchans[i];
+  return NULL;
+}
+static struct vchan *vchan_ssrc(struct site *site,uint32_t ssrc){
+  for(int i=0; i < MAX_VCHANS; i++)
+    if(site->vchans[i].used && site->vchans[i].ssrc == ssrc)
+      return &site->vchans[i];
+  return NULL;
+}
+
 static struct work *add_work(struct decoder *dp,int *nwork,enum work_kind kind){
   if(*nwork >= MAX_WORK)
     return NULL;
@@ -1484,6 +1616,62 @@ static void add_log(struct decoder *dp,int *nwork,int64_t when,char const *fmt,.
   va_start(ap,fmt);
   vsnprintf(w->text,sizeof w->text,fmt,ap);
   va_end(ap);
+}
+// Let a kept voice channel go now. 'why' for the -v line, which comes only if its "kept" line did
+static void drop_vchan(struct decoder *dp,int *nwork,struct site *site,struct vchan *vc,char const *why){
+  if(vc->said)
+    add_log(dp,nwork,site->now,"NAC %03x voice channel %.6lf MHz ssrc %u released: %s",site->nac,vc->freq_hz * 1e-6,vc->ssrc,why);
+  struct work * const w = add_work(dp,nwork,WORK_RELEASE);
+  if(w != NULL)
+    w->ssrc = vc->ssrc;
+  vc->used = false;
+}
+
+// A free entry for a new voice channel. The table holds as many as calls can be tracked, and
+// every call needing a channel has one, so if it is full at least one entry is a kept channel: the
+// one kept longest is let go for it. Under the site's lock
+static struct vchan *new_vchan(struct decoder *dp,int *nwork,struct site *site){
+  struct vchan *oldest = NULL;
+  for(int i=0; i < MAX_VCHANS; i++){
+    struct vchan * const vc = &site->vchans[i];
+    if(!vc->used)
+      return vc;
+    if(vc->kept != 0 && (oldest == NULL || vc->kept < oldest->kept))
+      oldest = vc;
+  }
+  if(oldest != NULL)
+    drop_vchan(dp,nwork,site,oldest,"room needed for another");
+  return oldest;
+}
+
+// Once per control channel block: each voice channel kept after its last call is kept alive, and
+// let go when the hang time has passed with no call on it. Under the site's lock
+static void hang_tick(struct decoder *dp,int *nwork,struct site *site){
+  int64_t const hang = llrint(Hangtime * BILLION);
+  for(int i=0; i < MAX_VCHANS; i++){
+    struct vchan * const vc = &site->vchans[i];
+    if(!vc->used || vc->kept == 0)
+      continue;
+    if(Verbose && !vc->said){
+      // Said here, a block after it was kept, not in let_go(): a channel granted to the next call
+      // in the same batch of events (a grant naming another call ends the last) gets no line
+      add_log(dp,nwork,vc->kept,"NAC %03x voice channel %.6lf MHz ssrc %u kept for %g s",site->nac,vc->freq_hz * 1e-6,vc->ssrc,Hangtime);
+      vc->said = true;
+    }
+    if(site->now - vc->kept >= hang){
+      char why[64];
+      snprintf(why,sizeof why,"no call for %g s",Hangtime);
+      drop_vchan(dp,nwork,site,vc,why);
+    } else if(site->now - vc->refreshed >= BILLION / 2){
+      // Nothing else keeps it alive now (no grants, no voice): radiod lets a channel go a Lifetime
+      // after the last request. Every half second is often enough to be well inside that and
+      // cheap: chanctl sends a keepalive only when one is due (a third of the Lifetime)
+      struct work * const w = add_work(dp,nwork,WORK_REFRESH);
+      if(w != NULL)
+	w->ssrc = vc->ssrc;
+      vc->refreshed = site->now;
+    }
+  }
 }
 
 // Which receiver a voice channel needs, from the call's flags; the voice channel's decode thread
@@ -1535,8 +1723,9 @@ static char const *flag_text(uint32_t flags,char *buf,size_t size){
   return buf;
 }
 
-// Ask for a call's channel. Under the site's lock (Ctl_mutex nests inside it)
-static bool want_channel(struct site *site,struct fcall *fc,char const **why){
+// Ask for a call's channel: the one kept on its frequency if there is one, else a new one. Under
+// the site's lock (Ctl_mutex nests inside it)
+static bool want_channel(struct decoder *dp,int *nwork,struct site *site,struct fcall *fc,char const **why){
   if(fc->freq_hz == 0){
     *why = "channel not in the band plan";
     return false;
@@ -1558,6 +1747,8 @@ static bool want_channel(struct site *site,struct fcall *fc,char const **why){
     *why = NULL;
     return true;
   }
+  bool const tdma = (fc->flags & P25_TRUNK_F_TDMA) != 0;
+  struct vchan *vc = vchan_freq(site,fc->freq_hz);
   if(was_refused(site,fc->freq_hz)){
     *why = "radiod refused this frequency";
     fc->refused = true;
@@ -1566,6 +1757,25 @@ static bool want_channel(struct site *site,struct fcall *fc,char const **why){
   if(Max_calls > 0 && requested_count(site) >= Max_calls){
     *why = "already following the most calls allowed (--max-calls)";
     return false;
+  }
+  if(vc != NULL){
+    // In use by the other timeslot's call, or kept since its last call: this one uses it. Granted
+    // in the other form (rare), it is asked for in that form (ask_channel()) and its thread links
+    // it anew (voice_moved()), as a new channel
+    if(vc->kept != 0 && vc->said)
+      add_log(dp,nwork,site->now,"NAC %03x voice channel %.6lf MHz ssrc %u reused after %.1f s",site->nac,
+	      vc->freq_hz * 1e-6,vc->ssrc,(site->now - vc->kept) * 1e-9);
+    vc->kept = 0;
+    vc->said = false;
+    if(vc->tdma != tdma){
+      vc->tdma = tdma;
+      vc->seed = fc->seed;
+      vc->seed_hz = fc->seed_hz;
+    }
+    fc->ssrc = vc->ssrc;
+    fc->requested = true;
+    *why = NULL;
+    return true; // the caller logs the call, then asks
   }
   pthread_mutex_lock(&Ctl_mutex);
   uint32_t ssrc = 0;
@@ -1580,6 +1790,17 @@ static bool want_channel(struct site *site,struct fcall *fc,char const **why){
     *why = "radiod's command address or the control channel's format not known yet";
     return false;
   }
+  if((vc = new_vchan(dp,nwork,site)) == NULL){
+    *why = "no room for another voice channel"; // can't be: a call needing one has one
+    return false;
+  }
+  memset(vc,0,sizeof *vc);
+  vc->used = true;
+  vc->ssrc = ssrc;
+  vc->freq_hz = fc->freq_hz;
+  vc->tdma = tdma;
+  vc->seed = fc->seed;
+  vc->seed_hz = fc->seed_hz;
   fc->ssrc = ssrc;
   fc->requested = true;
   *why = NULL;
@@ -1600,18 +1821,26 @@ static void ask_channel(struct decoder *dp,int *nwork,struct fcall const *fc){
 }
 
 // The call no longer needs its channel. The channel is let go only when no other call needs it
-// (the other slot of a Phase 2 channel)
-static void let_go(struct decoder *dp,int *nwork,struct fcall *fc){
+// (the other slot of a Phase 2 channel), and then, with 'keep' and a hang time (-H), only once
+// the hang time has passed with no call granted there (hang_tick())
+static void let_go(struct decoder *dp,int *nwork,struct fcall *fc,bool keep){
   fc->local = false; // the control channel's own carrier: nothing to release
   if(!fc->requested)
     return;
   fc->requested = false;
-  struct site const * const site = dp->site;
-  for(int i=0; site != NULL && i < P25_TRUNK_MAX_CALLS; i++){
-    struct fcall const * const other = &site->calls[i];
-    if(other != fc && other->used && other->requested && other->ssrc == fc->ssrc)
-      return;
+  struct site * const site = dp->site;
+  struct vchan * const vc = vchan_ssrc(site,fc->ssrc);
+  if(vc != NULL && Hangtime > 0)
+    vc->ended[fc->slot > 0 ? 1 : 0] = true; // the channel may stay: its thread ends the call's voice output
+  if(ssrc_needed(site,fc->ssrc,fc))
+    return;
+  if(vc != NULL && keep && Hangtime > 0){
+    vc->kept = vc->refreshed = site->now != 0 ? site->now : 1;
+    vc->said = false;
+    return;
   }
+  if(vc != NULL)
+    vc->used = false;
   struct work * const w = add_work(dp,nwork,WORK_RELEASE);
   if(w != NULL){
     w->ssrc = fc->ssrc;
@@ -1671,7 +1900,9 @@ static int take_events(struct decoder *dp,struct site *site,int nwork){
       fc->seed_hz = e->seed_offset_hz;
       {
 	char const *why = p25_trunk_why_name(e->why_not);
-	bool const follow = (e->flags & P25_TRUNK_F_FOLLOW) && want_channel(site,fc,&why);
+	bool const follow = (e->flags & P25_TRUNK_F_FOLLOW) && want_channel(dp,&nwork,site,fc,&why);
+	if((e->flags & P25_TRUNK_F_FOLLOW) && !follow)
+	  p25_trunk_set_heard(site->trunk,fc->id,false); // -m or no channel: no quiet time after it
 	call_text(id,sizeof id,fc);
 	if(follow){
 	  add_log(dp,&nwork,e->time,"NAC %03x call start %s ssrc %u%s",site->nac,id,fc->ssrc,flag_text(fc->flags,flags,sizeof flags));
@@ -1697,7 +1928,7 @@ static int take_events(struct decoder *dp,struct site *site,int nwork){
       }
       fc->flags = e->flags;
       if((fc->requested || fc->local) && !(e->flags & P25_TRUNK_F_FOLLOW)){
-	let_go(dp,&nwork,fc);
+	let_go(dp,&nwork,fc,true);
 	call_text(id,sizeof id,fc);
 	add_log(dp,&nwork,e->time,"NAC %03x call %s no longer followed: %s",site->nac,id,p25_trunk_why_name(e->why_not));
       } else if(fc->local){
@@ -1708,7 +1939,8 @@ static int take_events(struct decoder *dp,struct site *site,int nwork){
       } else if((e->flags & P25_TRUNK_F_FOLLOW) && !fc->refused){
 	// Now followed (no longer encrypted, or room under --max-calls): it may be heard from here on
 	char const *why = NULL;
-	if(want_channel(site,fc,&why)){
+	if(want_channel(dp,&nwork,site,fc,&why)){
+	  p25_trunk_set_heard(site->trunk,fc->id,true);
 	  call_text(id,sizeof id,fc);
 	  add_log(dp,&nwork,e->time,"NAC %03x call now followed %s ssrc %u%s",site->nac,id,fc->ssrc,flag_text(fc->flags,flags,sizeof flags));
 	  ask_channel(dp,&nwork,fc);
@@ -1730,7 +1962,7 @@ static int take_events(struct decoder *dp,struct site *site,int nwork){
       fc->flags = e->flags;
       if(fc->requested || fc->local || fc->ssrc != 0 || Verbose)
 	log_end(dp,&nwork,site,fc,e->time,p25_trunk_end_name(e->end_reason));
-      let_go(dp,&nwork,fc);
+      let_go(dp,&nwork,fc,true);
       fc->used = false;
       break;
     case P25_TRUNK_SITE:
@@ -1786,6 +2018,10 @@ static void site_unlock(struct site *site,struct decoder *dp,int nwork){
 	if(fc != NULL && (err == ERANGE || err == EEXIST)){
 	  fc->requested = false;
 	  fc->refused = true;
+	  p25_trunk_set_heard(site->trunk,fc->id,false); // nothing listens there: no quiet time after it
+	  struct vchan * const vc = vchan_ssrc(site,w->ssrc);
+	  if(vc != NULL && !ssrc_needed(site,w->ssrc,NULL))
+	    vc->kept = site->now; // nothing needs it: let hang_tick() let it go
 	}
 	pthread_mutex_unlock(&site->lock);
 	if(first || (err != ERANGE && err != EEXIST && Verbose))
@@ -1871,10 +2107,13 @@ static void control_block(struct decoder *dp){
       p25_trunk_set_control(site->trunk,site->carrier_hz,p25p2_frequency_offset(dp->p2));
     p25_trunk_tick(site->trunk,site_time(site,decoder_time(dp,dp->block_start)));
   }
-  site_unlock(site,dp,0);
+  int nwork = take_events(dp,site,0); // calls that timed out just now let their channels go first
+  hang_tick(dp,&nwork,site);
+  site_unlock(site,dp,nwork);
 }
 
-// The control channel's stream has gone (its session closed): end its calls, let their channels go
+// The control channel's stream has gone (its session closed): end its calls, let their channels
+// go, and the channels kept after their calls too, at once
 static void control_lost(struct decoder *dp){
   struct site * const site = dp->site;
   pthread_mutex_lock(&site->lock);
@@ -1886,9 +2125,12 @@ static void control_lost(struct decoder *dp){
       continue;
     if(fc->requested || fc->ssrc != 0 || Verbose)
       log_end(dp,&nwork,site,fc,now,Terminate ? "p25d shutting down" : "control channel lost");
-    let_go(dp,&nwork,fc);
+    let_go(dp,&nwork,fc,false);
     fc->used = false;
   }
+  for(int i=0; i < MAX_VCHANS; i++)
+    if(site->vchans[i].used)
+      drop_vchan(dp,&nwork,site,&site->vchans[i],Terminate ? "p25d shutting down" : "control channel lost");
   delete_p25_trunk(site->trunk); // a new one if the channel comes back
   site->trunk = NULL;
   site_unlock(site,dp,nwork);
@@ -1903,18 +2145,15 @@ static bool link_voice(struct decoder *dp){
     if(address_match(&site->sender,&sp->sender) != 1)
       continue; // another radiod's
     pthread_mutex_lock(&site->lock);
-    for(int i=0; i < P25_TRUNK_MAX_CALLS; i++){
-      struct fcall const * const fc = &site->calls[i];
-      if(fc->used && fc->requested && fc->ssrc == sp->ssrc){
-	dp->site = site;
-	dp->voice = true;
-	dp->trunk_freq = fc->freq_hz;
-	dp->seed = fc->seed;
-	dp->seed_hz = fc->seed_hz;
-	char const *why;
-	dp->rx = choose_receiver(fc->flags,&why);
-	break;
-      }
+    // Every channel a call asked for has an entry, as has one kept after its last call
+    struct vchan const * const vc = vchan_ssrc(site,sp->ssrc);
+    if(vc != NULL){
+      dp->site = site;
+      dp->voice = true;
+      dp->trunk_freq = vc->freq_hz;
+      dp->seed = vc->seed;
+      dp->seed_hz = vc->seed_hz;
+      dp->rx = vc->tdma ? RX_PHASE2 : RX_PHASE1;
     }
     pthread_mutex_unlock(&site->lock);
   }
@@ -1932,7 +2171,8 @@ static bool link_voice(struct decoder *dp){
     }
     p25_audio_destroy(dp->audio); // the Phase 1 streams are not used here
     dp->audio = NULL;
-  }
+  } else if(dp->voice && dp->audio == NULL) // linked again as Phase 1 after Phase 2 (voice_moved())
+    dp->audio = p25_audio_create(Audio_group,Frames_group,dp->sp->ssrc);
   if(dp->voice && Verbose)
     decoder_event(dp,dp->samples,"voice channel (%s) for calls granted on ssrc %u, receiver %s",
 		  dp->rx == RX_PHASE2 ? "Phase 2, two timeslots" : "Phase 1",dp->site->ssrc,
@@ -1940,6 +2180,17 @@ static bool link_voice(struct decoder *dp){
   if(dp->voice && dp->seed && Verbose > 1)
     decoder_event(dp,dp->samples,"seed %.9g Hz",dp->seed_hz); // exactly, for comparing with an offline decode
   return dp->voice;
+}
+
+// Once per block of a voice channel: has its channel been asked for again in the other form (a
+// channel kept after a Phase 1 call granted as Phase 2, or the reverse)? Then the caller links it
+// anew, and decode_task() starts the receiver that form needs
+static bool voice_moved(struct decoder *dp){
+  pthread_mutex_lock(&dp->site->lock);
+  struct vchan const * const vc = vchan_ssrc(dp->site,dp->sp->ssrc);
+  bool const moved = vc != NULL && vc->tdma != (dp->rx == RX_PHASE2);
+  pthread_mutex_unlock(&dp->site->lock);
+  return moved;
 }
 
 // What the trunking logic's label says for the voice output. A held unit whose own label says
@@ -2024,6 +2275,10 @@ static void voice_unit(struct decoder *dp,uint64_t sample,struct p25_frame const
     }
   }
   nwork = take_events(dp,site,nwork); // a call this unit started is in the table now
+  struct vchan * const vc = vchan_ssrc(site,dp->sp->ssrc);
+  bool const ended = vc != NULL && vc->ended[0]; // a call here ended (perhaps by this unit), the channel stays
+  if(ended)
+    vc->ended[0] = false;
   bool followed = false;
   if(unit){
     struct fcall * const fc = label.call_id != 0 ? find_call(site,label.call_id) : find_call_freq(site,dp->trunk_freq,-1);
@@ -2058,6 +2313,12 @@ static void voice_unit(struct decoder *dp,uint64_t sample,struct p25_frame const
     decoder_event(dp,sample,"NAC %03x talker alias src %u \"%s\"",frame->nac,label.source,alias.text);
   if(!followed)
     label.decision = P25_TRUNK_VOICE_NONE;
+  if(ended){
+    // Nothing of the call that ended carries into the next on this channel: held units go, and
+    // the next transmission is clear only once its own header or sync says so
+    p25_audio_call_end(dp->audio);
+    dp->call_id = 0;
+  }
   if((ldu || (duid == P25_DUID_HDU && label.call_id != 0)) && label.call_id != dp->call_id){
     // Another call (or none) on this channel: what was held for the last one is never decoded.
     // Not when the first call is learned (none before): the transmission is the same, and what its
@@ -2424,6 +2685,10 @@ static void p2_burst(void *arg,struct p25p2_burst const *b){
     }
   }
   nwork = take_events(dp,site,nwork); // a call this burst started is in the table now
+  struct vchan * const vc = dp->voice ? vchan_ssrc(site,dp->sp->ssrc) : NULL;
+  bool const ended = vc != NULL && vc->ended[ts]; // as for Phase 1, per timeslot
+  if(ended)
+    vc->ended[ts] = false;
   struct fcall * const fc = label.call_id != 0 ? find_call(site,label.call_id) : find_call_freq(site,freq,ts);
   if(!dp->voice && (fc == NULL || !fc->local))
     label.decision = P25_TRUNK_VOICE_NONE; // the control carrier's traffic slot: only a call followed there is heard
@@ -2452,6 +2717,11 @@ static void p2_burst(void *arg,struct p25p2_burst const *b){
 
   if(new_alias)
     decoder_event(dp,sample,"slot %d talker alias \"%s\"",ts,alias.text);
+  if(ended){
+    // As for Phase 1: nothing of the call that ended carries into the timeslot's next
+    p25_audio_call_end(s->audio);
+    s->call_id = 0;
+  }
   if(voice && label.call_id != s->call_id){
     // Another call (or none) on this timeslot: what was held for the last one is never decoded
     if(s->call_id != 0)
