@@ -42,6 +42,14 @@ int trellis_34_decode(uint8_t *out,uint8_t const *in,int nsyms);
 // Returns the path metric (FLT_MAX, out[] zeroed, if no path has a finite metric)
 float trellis_12_decode_soft(uint8_t *out,float const *phase,int nsyms);
 float trellis_34_decode_soft(uint8_t *out,float const *phase,int nsyms);
+// The rate 3/4 output table, Trellis_34[previous tribit][tribit]: the 4-bit symbol (two dibits,
+// the first in the high bits). DMR uses the same code
+extern uint8_t const Trellis_34[8][8];
+
+// Generic CRC register: the remainder of M(x) x^width by x^width + poly (poly without its
+// x^width term), M = bits[0..n-1] with bits[0] the highest power, register preset to preset.
+// Not inverted. width 1-32
+uint32_t crc_remainder(uint8_t const *bits,int n,uint32_t poly,int width,uint32_t preset);
 
 // CRC-CCITT as P25 uses it (TSBK, PDU header): x^16+x^12+x^5+1, zero preset, msb first, inverted
 uint16_t crc_ccitt(uint8_t const *bits,int n);

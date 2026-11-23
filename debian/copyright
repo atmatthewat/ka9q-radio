@@ -19,6 +19,7 @@ Files:
  src/p25*
  src/chanctl.*
  src/dfec.*
+ src/dmr*
  src/digital.h
  src/dsync.c
  src/rs63.*
@@ -33,7 +34,9 @@ Comment:
  the multi-fragment messages) and src/p25alias.c (Motorola talker alias
  table) hold tables after sdrtrunk, Copyright Dennis
  Sheirer, and OP25, Copyright Max H. Parke KA1RBI, Graham J. Norbury and
- others, both GPL-3.0+; each is credited beside the table.
+ others, both GPL-3.0+; each is credited beside the table. src/dmrfec.c
+ likewise holds the DMR Hamming generator matrices, CACH bit positions,
+ block product code layouts and CRC masks as sdrtrunk and OP25 have them.
 
 License: GPL-3.0+
  This package is free software: you can redistribute it and/or modify
