@@ -10,6 +10,9 @@
 
 #include "dmr.h"
 
+struct dmr_site;
+struct dmr_control_log;
+
 // What a voice frame's label says. Only DMR_CHAN_CLEAR may ever be heard
 enum dmr_chan_label { DMR_CHAN_CLEAR = 0, DMR_CHAN_ENCRYPTED, DMR_CHAN_UNCONFIRMED };
 
@@ -53,6 +56,14 @@ struct dmr_chan_config {
   bool base_station;               // look for base station syncs (a repeater output; default)
   bool mobile_station;             // and MS syncs
   bool direct;                     // and direct mode syncs
+  // The site this carrier belongs to, and the control log its lines go to (both the owner's, shared
+  // by the site's channels, outliving the channel; either may be NULL: no CSBKs decoded then without
+  // a site, no lines without a log). The channel attaches itself to the site as channel_id
+  struct dmr_site *site;
+  struct dmr_control_log *log;
+  char const *channel_id;          // unique among the site's channels; NULL: "dmr"
+  uint64_t frequency_hz;           // the carrier's (the downlink)
+  uint16_t lcn;                    // its logical channel number in the site; 0 unknown / conventional
 };
 void dmr_chan_config_init(struct dmr_chan_config *c);
 
@@ -62,6 +73,8 @@ struct dmr_chan *dmr_chan_create(struct dmr_chan_config const *config,double sam
 void dmr_chan_destroy(struct dmr_chan *c);  // flushes: transmissions in progress end
 // A block of samples whose first sample was sent at 'when' (ns since the GPS epoch; 0 if not known)
 void dmr_chan_samples(struct dmr_chan *c,float complex const *iq,int n,int64_t when);
+// End the transmission on a slot (the site heard a channel release, P_CLEAR). On the channel's thread
+void dmr_chan_end_call(struct dmr_chan *c,uint8_t slot);
 
 struct dmr_chan_stats {
   uint64_t samples;

@@ -33,6 +33,7 @@
 #include "p25audio.h"
 #include "dmr.h"
 #include "dmrchan.h"
+#include "dmrsite.h"
 #include "dmraudio.h"
 #include "dmrvote.h"
 
@@ -101,6 +102,12 @@ struct decoder {
   uint64_t next_report;    // sample count for the next -v status line
   float bb_power,n0,low,high;
   struct slot slot[2];
+  // The carrier's site and its control log. One each per channel for now: grouping a system's
+  // repeaters into sites, and sites into a system, is the site's job once dmrd is told which they are
+  struct dmr_site *site;
+  struct dmr_control_log *log;
+  char channel_id[16];     // the SSRC
+  uint64_t site_clock;     // the site's clock, us, never going back
 };
 
 // One for each channel (SSRC) being decoded
@@ -160,6 +167,7 @@ static int Mcast_ttl = DEFAULT_TTL;
 static int IP_tos = DEFAULT_IP_TOS;
 static int Color_code = -1;           // -c: pinned 0-15, -1 tracked, -2 any
 static bool Mobile;                   // -M: also MS and direct mode syncs (simplex, talkaround)
+static enum dmr_system_type System_type = DMR_SYSTEM_CONVENTIONAL; // -y
 
 // Tuning constants
 static double const Max_fill = 1.0;   // Fill gaps up to this many seconds with zeroes; resynchronize on longer ones
@@ -203,6 +211,10 @@ static void voice_event(void *arg,struct dmr_chan_event const *e);
 static void voice_log(void *arg,int64_t when,char const *text);
 static void status_line(struct decoder const *dp);
 static void vote_end(void *arg,struct dmr_vote_result const *r);
+static void control_line(void *arg,struct dmr_control_line const *line);
+static void control_clear(void *arg,struct dmr_site_context const *channel,uint8_t slot,char const *reason);
+static int64_t control_wall_clock(void *arg);
+static uint64_t control_site_clock(void *arg);
 
 static struct option Options[] = {
   {"iface", required_argument, NULL, 'A'},
@@ -220,12 +232,13 @@ static struct option Options[] = {
   {"update", required_argument, NULL, 'u'},
   {"verbose", no_argument, NULL, 'v'},
   {"version", no_argument, NULL, 'V'},
+  {"system-type", required_argument, NULL, 'y'},
   {NULL, 0, NULL, 0},
 };
-static char const Optstring[] = "A:c:I:l:MN:o:p:R:S:t:T:u:vV";
+static char const Optstring[] = "A:c:I:l:MN:o:p:R:S:t:T:u:vVy:";
 
 static void usage(void){
-  fprintf(stderr,"Usage: %s [-v|--verbose] [-V|--version] [-l|--locale locale] [-A|--iface interface] [-o|--source <source-name-or-address>] [-S|--ssrc ssrc] [-t|--timeout seconds] [-u|--update seconds] [-c|--color-code n|any|track] [-M|--mobile] [-R|--pcm-out audio_mcast_address] [-N|--name service_name] [-T|--ttl ttl] [-p|--tos tos] [-I|--input] iq_mcast_address [iq_mcast_address ...]\n",App_path);
+  fprintf(stderr,"Usage: %s [-v|--verbose] [-V|--version] [-l|--locale locale] [-A|--iface interface] [-o|--source <source-name-or-address>] [-S|--ssrc ssrc] [-t|--timeout seconds] [-u|--update seconds] [-c|--color-code n|any|track] [-M|--mobile] [-y|--system-type conventional|capacity_plus|...] [-R|--pcm-out audio_mcast_address] [-N|--name service_name] [-T|--ttl ttl] [-p|--tos tos] [-I|--input] iq_mcast_address [iq_mcast_address ...]\n",App_path);
 }
 
 int main(int argc,char *argv[]){
@@ -251,6 +264,12 @@ int main(int argc,char *argv[]){
           exit(EX_USAGE);
         }
         Color_code = (int)x;
+      }
+      break;
+    case 'y':
+      if(!dmr_system_type_from_name(optarg,&System_type)){
+        fprintf(stderr,"Unknown system type \"%s\": conventional, tier3, capacity_plus, linked_capacity_plus, connect_plus, capacity_max, hytera_xpt or hytera_tier3\n",optarg);
+        exit(EX_USAGE);
       }
       break;
     case 'I':
@@ -759,10 +778,12 @@ static void *decode_task(void *arg){
     .log = voice_log,
     .arg = &dec,
   };
+  snprintf(dec.channel_id,sizeof dec.channel_id,"%u",sp->ssrc);
   struct dmr_chan_config config;
   dmr_chan_config_init(&config);
   config.color_code = Color_code;
   config.mobile_station = config.direct = Mobile;
+  config.channel_id = dec.channel_id;
   while(true){
     pthread_mutex_lock(&sp->qmutex);
     while(sp->queue == NULL && !atomic_load(&sp->terminate)){
@@ -781,7 +802,37 @@ static void *decode_task(void *arg){
     if(bp == NULL)
       break;
 
-    if(bp->samprate != dec.samprate){
+    dec.block_time = bp->time; // the control plane's clocks read it from here on
+    if(dec.site == NULL){
+      // The site and its log: named after the carrier, its clocks the signal's
+      struct dmr_control_log_options lo;
+      dmr_control_log_options_init(&lo);
+      strlcpy(lo.system_name,"DMR",sizeof lo.system_name);
+      snprintf(lo.site_name,sizeof lo.site_name,"%.4lf",bp->frequency * 1e-6);
+      lo.clock_us = control_wall_clock;
+      lo.clock_arg = &dec;
+      dec.log = dmr_control_log_create(&lo,control_line,&dec);
+      struct dmr_site_config sc;
+      dmr_site_config_init(&sc);
+      strlcpy(sc.system_name,lo.system_name,sizeof sc.system_name);
+      strlcpy(sc.site_name,lo.site_name,sizeof sc.site_name);
+      sc.type = System_type;
+      sc.system_color_code = Color_code; // -1 and -2 are the site's TRACK and ANY too
+      struct dmr_site_options so;
+      dmr_site_options_init(&so);
+      so.clock_us = control_site_clock;
+      so.clock_arg = &dec;
+      so.warnings_to_stderr = false; // they are lines of the log already
+      struct dmr_site_handlers sh = {
+        .clear = control_clear,
+        .arg = &dec,
+      };
+      dec.site = dmr_site_create(&sc,dec.log,&so,&sh);
+      config.site = dec.site;
+      config.log = dec.log;
+    }
+    if(bp->samprate != dec.samprate || (uint64_t)llrint(bp->frequency) != config.frequency_hz){
+      config.frequency_hz = (uint64_t)llrint(bp->frequency);
       dmr_chan_destroy(dec.chan); // ends what is in progress: voice_event() runs in here
       dec.samprate = bp->samprate;
       dec.samples = 0;
@@ -791,7 +842,6 @@ static void *decode_task(void *arg){
         fprintf(stderr,"ssrc %u: can't create DMR receiver at %'.0lf Hz (needs %d Hz)\n",sp->ssrc,dec.samprate,4 * DMR_SYMBOL_RATE);
     }
     dec.frequency = bp->frequency;
-    dec.block_time = bp->time;
     dec.bb_power = bp->bb_power;
     dec.n0 = bp->n0;
     dec.low = bp->low;
@@ -809,6 +859,8 @@ static void *decode_task(void *arg){
     }
   }
   dmr_chan_destroy(dec.chan); // ends what is in progress: voice_event() runs in here
+  dmr_site_destroy(dec.site);
+  dmr_control_log_destroy(dec.log); // its pending counts are written here
   return NULL;
 }
 
@@ -879,6 +931,47 @@ static void voice_event(void *arg,struct dmr_chan_event const *e){
 }
 
 // A voted stream ended: how many frames each repeater supplied
+// A line of the carrier's control log (CSBKs, link control, the site's identity, rest channel, grants
+// and warnings), on the channel's thread. Repeats are collapsed into counts by the log. Its own
+// timestamp is local time; ours is the signal's, as for every other line
+// Link control (LC, SLC) says again what the transmission lines say, so it is written only at -v
+static void control_line(void *arg,struct dmr_control_line const *line){
+  struct decoder const * const dp = arg;
+  if(!Verbose && (strcmp(line->kind,"LC") == 0 || strcmp(line->kind,"SLC") == 0))
+    return;
+  char cc[8] = "-";
+  if(line->color_code != DMR_NO_COLOR_CODE)
+    snprintf(cc,sizeof cc,"%u",line->color_code);
+  // "SLC NULL", not "SLC SLC NULL"
+  size_t const k = strlen(line->kind);
+  bool const named = strncmp(line->text,line->kind,k) == 0 && line->text[k] == ' ';
+  if(line->slot != 0)
+    decoder_event(dp,dp->block_time,"slot %u cc %s %s%s%s",line->slot,cc,named ? "" : line->kind,named ? "" : " ",line->text);
+  else
+    decoder_event(dp,dp->block_time,"cc %s %s%s%s",cc,named ? "" : line->kind,named ? "" : " ",line->text);
+}
+
+// A P_CLEAR: the site has released the slot, so its call has ended
+static void control_clear(void *arg,struct dmr_site_context const *channel,uint8_t slot,char const *reason){
+  (void)arg; (void)reason;
+  dmr_chan_end_call(channel->user,slot);
+}
+
+// The control plane's clocks: the signal's time where radiod gives it, so that its grace periods and
+// counts run with the signal and not with how fast it is decoded
+static int64_t control_wall_clock(void *arg){
+  struct decoder const * const dp = arg;
+  int64_t const gps = dp->block_time != 0 ? dp->block_time : gps_time_ns();
+  return gps / 1000 + ((int64_t)UNIX_EPOCH - GPS_UTC_OFFSET) * 1000000;
+}
+static uint64_t control_site_clock(void *arg){
+  struct decoder * const dp = arg;
+  int64_t const gps = dp->block_time != 0 ? dp->block_time : gps_time_ns();
+  if((uint64_t)(gps / 1000) > dp->site_clock)
+    dp->site_clock = (uint64_t)(gps / 1000);
+  return dp->site_clock;
+}
+
 static void vote_end(void *arg,struct dmr_vote_result const *r){
   (void)arg;
   char text[512];

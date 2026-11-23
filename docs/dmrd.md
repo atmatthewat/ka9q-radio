@@ -6,9 +6,10 @@ Matthew Kaufman, KA6SQG, November 2026
 
 - logs every transmission on each timeslot, with its talkgroup or unit, source, colour code, how it began and ended, and its encryption state;
 - sends the speech of clear (unencrypted) calls as ka9q-radio RTP audio streams that *monitor* plays and *pcmrecord* records (when built with mbelib);
-- when several repeaters carry the same call at once, as the repeaters of a multi-site system do, makes one stream of it and takes each 20 ms of speech from whichever repeater received it best.
+- when several repeaters carry the same call at once, as the repeaters of a multi-site system do, makes one stream of it and takes each 20 ms of speech from whichever repeater received it best;
+- decodes control signalling (CSBKs and multi-block CSBKs, short link control) and logs it with what it says about the site: its identity, the rest channel, neighbours, channel grants and releases.
 
-Not yet: decoding and logging of control-channel messages (CSBKs) and site state, following trunked calls on Capacity Plus, Connect Plus or Tier III systems by asking *radiod* for granted channels, and data packets.
+Not yet: grouping the repeaters of a site and the sites of a system from a configuration (each channel is its own site for now), following trunked calls on Capacity Plus, Connect Plus or Tier III systems by asking *radiod* for granted channels, and data packets.
 
 ## Configuring *radiod*
 
@@ -49,7 +50,8 @@ dmrd [options] dmr-iq.local [more groups ...]
 - **-p**, **--tos** *tos*: IP type of service of the voice output (default 184, expedited forwarding)
 - **-c**, **--color-code** *n*|**any**|**track**: the colour code to decode, 0-15; **track** (the default) takes each channel's from its first strong sync and follows it; **any** decodes every one
 - **-M**, **--mobile**: also look for mobile station and direct mode syncs (simplex, talkaround), not only repeater outputs
-- **-v**, **--verbose**: more messages; at -v each channel also logs a status line, and talker aliases and re-anchored clocks are logged
+- **-y**, **--system-type** *type*: the kind of system the channels belong to, which says how its signalling is read: **conventional** (the default; amateur repeaters, IP Site Connect), **tier3**, **capacity_plus**, **linked_capacity_plus**, **connect_plus**, **capacity_max**, **hytera_xpt** or **hytera_tier3**
+- **-v**, **--verbose**: more messages; at -v each channel also logs a status line, and link control, talker aliases and re-anchored clocks are logged
 - **-u**, **--update** *seconds*: interval between the -v status lines (default 10)
 - **-t**, **--timeout** *seconds*: close a channel after this long without data (default 20)
 - **-S**, **--ssrc** *ssrc*: decode only this channel
@@ -87,6 +89,14 @@ Mon 23 Nov 2026 22:35:04.252000 UTC stream 3 ended: 288 frames played, 0 lost; 4
 ```
 The time is that of the signal (the sender's clock, from *radiod*'s status), not of the decoding.
 
+Control signalling gets lines of its own, with the slot (none for a line about the carrier or the site), the colour code (**-** if not known), and what was heard. A message repeated many times, as a rest channel's beacons are, is written once and then counted, the count written a minute after its last repeat:
+```
+Mon 23 Nov 2026 21:25:30.149 UTC ssrc 453425 453.425000 MHz slot 1 cc 0 CSBK CAP+ SITE STATUS rest LSN 2 idle (x185 since 13:24:28, last 13:25:30)
+Mon 23 Nov 2026 21:27:22.469 UTC ssrc 453425 453.425000 MHz slot 2 cc 0 CSBK CAP+ SITE STATUS rest LSN 1 LSN2:tg 1
+Mon 23 Nov 2026 21:27:22.469 UTC ssrc 453425 453.425000 MHz cc - REST channel moved: LSN 2 (LCN 1 TS2) -> LSN 1 (LCN 1 TS1) (NOT CONFIGURED: the plan lists no such repeater)
+```
+The times in a count are local. Since each channel is its own site for now, a line about another repeater of the site says it is not configured. A channel release (P_CLEAR) heard on a slot ends the transmission there.
+
 ## Running as a service
 
 ```
@@ -106,6 +116,6 @@ The instance name is the multicast group. All instances append to **/var/log/dmr
 
 ### Credits
 
-sdrtrunk (Dennis Sheirer, GPL-3) and OP25 (Max H. Parke KA1RBI, Graham J. Norbury and others, GPL-3) were used as references for DMR implementation details, along with ETSI TS 102 361. Taken from them, with a credit beside each in the source: the sync words, the Hamming generator matrices, the CACH bit positions, the block product code layouts and interleaves, the RS(12,9) field and octet order, the CRC masks, and the link control, talker alias and burst layouts. The decoders are not theirs, and several of sdrtrunk's known errors (its EMB table for colour codes 8-15, its inverted RS(12,9) check, its CRC residual rule) are not repeated. Speech decoding uses mbelib (https://github.com/szechyjs/mbelib) when it is installed.
+sdrtrunk (Dennis Sheirer, GPL-3) and OP25 (Max H. Parke KA1RBI, Graham J. Norbury and others, GPL-3) were used as references for DMR implementation details, along with ETSI TS 102 361. Taken from them, with a credit beside each in the source: the sync words, the Hamming generator matrices, the CACH bit positions, the block product code layouts and interleaves, the RS(12,9) field and octet order, the CRC masks, the link control, talker alias and burst layouts, and the CSBK opcode table, message layouts and channel numbering (sdrtrunk; OP25 for parts of Connect Plus). The decoders are not theirs, and several of sdrtrunk's known errors (its EMB table for colour codes 8-15, its inverted RS(12,9) check, its CRC residual rule) are not repeated. Speech decoding uses mbelib (https://github.com/szechyjs/mbelib) when it is installed.
 
 Much of what is here was first worked out, prototyped and run in production by the author in the receivers behind scanrad.io. That is especially true of the front-end signal processing: the approach to receive filtering, carrier frequency tracking, symbol timing recovery and burst framing was originally written for those receivers and tuned there. Those receivers are not ka9q-radio code: what is here is that work, rewritten by the author in plain C for this tree with the assistance of Anthropic's Claude (the Fable and Opus models).

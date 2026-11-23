@@ -13,6 +13,8 @@
 #include "dmrsink.h"
 #include "dmrmsg.h"
 #include "dmrcall.h"
+#include "dmrcsbk.h"
+#include "dmrsite.h"
 #include "dmrchan.h"
 
 // Theory of operation
@@ -42,8 +44,13 @@
 // the symbol 1,728 symbols (360 ms) back, since the sink may hand a burst on up to that long after its
 // first dibit and a timeout must not run ahead of a burst still on its way.
 //
+// The control plane (dmrsite.c) takes every burst too, after the tracker, with the slot type as the
+// sink decoded it: it parses CSBKs and multi-block CSBKs and feeds the carrier's site (identity, rest
+// channel, channel map, grants), which is the owner's and shared by the site's channels: nothing here
+// assumes one radiod or one channel per site.
+//
 // The wiring the layers leave to their owner: on sync loss the message layer's state is dropped
-// before the tracker hears of it; a transmission the tracker ends by a fade, a header no voice
+// before the control plane and the tracker hear of it; a transmission the tracker ends by a fade, a header no voice
 // followed, or a release drops that slot's message state (its embedded LC and talker alias); a data
 // burst whose slot type names another colour code than the one the sink requires is another system
 // on the frequency, and reaches the tracker as a data burst that did not decode, which ends a
@@ -68,6 +75,8 @@ struct dmr_chan {
   struct dmr_rx *rx;
   struct dmr_msg_decoder msg;
   struct dmr_call_tracker tracker;
+  struct dmr_cplane *cplane;       // NULL without a site
+  struct dmr_site *site;
   struct dmr_channel channel;
   char channel_id[32];
   double samprate;
@@ -180,6 +189,7 @@ static void on_symbol(void *arg,uint64_t index){
   int64_t const behind = (int64_t)index - TICK_LAG_SYMBOLS;
   if(behind >= c->first_symbol)
     dmr_call_on_time(&c->tracker,&c->channel,time_of_symbol(c,(uint64_t)behind));
+  dmr_cplane_time(c->cplane);
   if(c->ticks % DRIFT_CHECK_TICKS == 0)
     check_clock(c,index);
 }
@@ -214,17 +224,21 @@ static void on_burst(void *arg,struct dmr_burst const *from_sink){
       c->h.log(c->h.arg,(int64_t)burst.timestamp_us * 1000,text);
     }
   }
-  if(!foreign_color_code(c,&burst)){
+  if(!foreign_color_code(c,&burst))
     dmr_call_on_burst(&c->tracker,&c->channel,&burst,&m);
-    return;
+  else {
+    // As a data burst that did not decode: it ends a transmission, and says nothing
+    struct dmr_burst undecoded = burst;
+    undecoded.slot_type_valid = false;
+    struct dmr_burst_messages nothing;
+    memset(&nothing,0,sizeof nothing);
+    nothing.slot = m.slot;
+    nothing.superframe_position = -1;
+    dmr_call_on_burst(&c->tracker,&c->channel,&undecoded,&nothing);
   }
-  // As a data burst that did not decode: it ends a transmission, and says nothing
-  burst.slot_type_valid = false;
-  struct dmr_burst_messages nothing;
-  memset(&nothing,0,sizeof nothing);
-  nothing.slot = m.slot;
-  nothing.superframe_position = -1;
-  dmr_call_on_burst(&c->tracker,&c->channel,&burst,&nothing);
+  // The control plane sees it as the sink framed it (it counts and logs another colour code itself)
+  if(c->cplane != NULL)
+    dmr_cplane_burst(c->cplane,&burst,&m);
 }
 
 static void on_acquired(void *arg){
@@ -237,6 +251,8 @@ static void on_lost(void *arg){
   if(c->flushing)
     return; // the sink's reset at the end is not a sync loss
   dmr_msg_reset(&c->msg);
+  if(c->cplane != NULL)
+    dmr_cplane_sync_lost(c->cplane);
   dmr_call_on_sync_lost(&c->tracker,&c->channel,time_of_symbol(c,c->symbol_index));
 }
 
@@ -309,8 +325,11 @@ static void on_call_start(void *arg,struct dmr_call_meta const *meta,struct dmr_
 
 static void on_call_end(void *arg,struct dmr_call_meta const *meta,struct dmr_call_info const *info){
   struct dmr_chan * const c = arg;
-  if(info->ended_by == DMR_END_FADE || info->ended_by == DMR_END_NO_VOICE || info->ended_by == DMR_END_RELEASE)
+  if(info->ended_by == DMR_END_FADE || info->ended_by == DMR_END_NO_VOICE || info->ended_by == DMR_END_RELEASE){
     dmr_msg_reset_slot(&c->msg,info->slot);
+    if(c->cplane != NULL)
+      dmr_cplane_reset_slot(c->cplane,info->slot);
+  }
   event(c,meta,info,false);
 }
 
@@ -349,10 +368,25 @@ struct dmr_chan *dmr_chan_create(struct dmr_chan_config const *config,double sam
   dmr_call_set_voice_sink(&c->tracker,on_voice,c);
   dmr_call_set_start_callback(&c->tracker,on_call_start,c);
   dmr_call_set_end_callback(&c->tracker,on_call_end,c);
-  strlcpy(c->channel_id,"dmr",sizeof c->channel_id);
+  strlcpy(c->channel_id,config->channel_id != NULL ? config->channel_id : "dmr",sizeof c->channel_id);
   c->channel.system_name = "DMR";
   c->channel.site_name = "";
   c->channel.channel_id = c->channel_id;
+  c->channel.frequency_hz = config->frequency_hz;
+  c->channel.lcn = config->lcn;
+  if(config->site != NULL){
+    struct dmr_site_context ctx;
+    memset(&ctx,0,sizeof ctx);
+    strlcpy(ctx.system_name,"DMR",sizeof ctx.system_name);
+    strlcpy(ctx.channel_id,c->channel_id,sizeof ctx.channel_id);
+    ctx.frequency_hz = config->frequency_hz;
+    ctx.lcn = config->lcn;
+    ctx.user = c;
+    struct dmr_cplane_options po;
+    dmr_cplane_options_init(&po);
+    c->cplane = dmr_cplane_create(&ctx,config->site,config->log,&po);
+    c->site = config->site;
+  }
   return c;
 }
 
@@ -363,6 +397,11 @@ void dmr_chan_destroy(struct dmr_chan *c){
   dmr_rx_flush(c->rx);
   c->flushing = false;
   dmr_call_flush(&c->tracker);
+  if(c->cplane != NULL){
+    dmr_cplane_flush(c->cplane);
+    dmr_cplane_destroy(c->cplane);
+    dmr_site_detach(c->site,c->channel_id); // what the site announces here is no longer monitored
+  }
   dmr_msg_reset(&c->msg);
   dmr_call_free(&c->tracker);
   delete_dmr_rx(c->rx);
@@ -387,6 +426,12 @@ void dmr_chan_samples(struct dmr_chan *c,float complex const *iq,int n,int64_t w
   c->stats.samples += (uint64_t)n;
   if(idle(c))
     anchor_to_samples(c);
+}
+
+void dmr_chan_end_call(struct dmr_chan *c,uint8_t slot){
+  if(c == NULL)
+    return;
+  dmr_call_end_call(&c->tracker,slot,DMR_END_RELEASE,c->anchored ? time_of_symbol(c,c->symbol_index) : 0);
 }
 
 void dmr_chan_get_stats(struct dmr_chan const *c,struct dmr_chan_stats *s){
