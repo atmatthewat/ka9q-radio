@@ -105,6 +105,7 @@ struct p25_pdu {
   // Completed sequence, valid when a call has just returned 1
   int kind;            // enum p25_pdu_kind
   int nbits;           // 96 + nblocks * block_bits
+  int crc;             // packet CRC over the data blocks: 1 passed, 0 failed, -1 there are no data blocks
   uint8_t payload[P25_PDU_MAX_BITS]; // the 96 header bits, then each data block's bits
 };
 

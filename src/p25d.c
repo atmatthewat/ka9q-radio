@@ -1373,7 +1373,7 @@ static void decoder_frame(void *arg,struct p25_frame const *frame){
       good = frame->ldu != NULL && frame->ldu->word.ok;
       break;
     case P25_DUID_PDU:
-      good = frame->pdu != NULL;
+      good = frame->pdu != NULL && frame->pdu->crc != 0;
       break;
     default:
       break;
@@ -1466,7 +1466,12 @@ static void decoder_frame(void *arg,struct p25_frame const *frame){
     end_of_voice(dp,sample,frame,"TDULC");
     break;
   case P25_DUID_PDU:
-    if(frame->pdu != NULL){
+    if(frame->pdu != NULL && frame->pdu->crc == 0){
+      // The header passed its CRC and the data blocks did not: nothing in them can be used, least
+      // of all a grant's channel
+      if(Verbose)
+	decoder_event(dp,sample,"NAC %03x PDU data blocks failed CRC, sync %.1f",frame->nac,frame->correlation);
+    } else if(frame->pdu != NULL){
       uint8_t octets[(P25_PDU_MAX_BITS + 7) / 8];
       p25_pack_bits(octets,frame->pdu->payload,frame->pdu->nbits);
       if(p25_decode_pdu(&msg,octets,frame->pdu->nbits / 8) == 0){
@@ -2397,6 +2402,8 @@ static void voice_unit(struct decoder *dp,uint64_t sample,struct p25_frame const
     p25_pack_bits(octets,frame->bits,96); // a trunking block on a voice channel: the logic takes it too
     have = p25_decode_tsbk(&msg,octets) == 0;
   }
+  if(duid == P25_DUID_HDU || duid == P25_DUID_TDU || duid == P25_DUID_TDULC)
+    p25_alias_end(&dp->alias); // between transmissions: an alias block held is the last talker's
   struct p25_alias_result alias;
   bool const new_alias = have && (duid == P25_DUID_LDU1 || duid == P25_DUID_TDULC) && p25_alias_lc(&dp->alias,&msg,&alias)
     && alias.len > 0;
@@ -2999,6 +3006,7 @@ static void conv_start_line(struct decoder *dp){
 // (a header, or link control naming another talkgroup or source), channel closed, shutdown
 static void conv_end(struct decoder *dp,uint64_t sample,char const *how){
   struct conv * const c = &dp->conv;
+  p25_alias_end(&dp->alias); // an alias block held is that transmission's talker's
   if(!c->active)
     return;
   if(c->units > 0 || Verbose){

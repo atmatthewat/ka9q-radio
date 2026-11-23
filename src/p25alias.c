@@ -27,9 +27,24 @@
 // alias whose CRC fails (or that has no text) is dropped and counted.
 //
 // L3Harris. In Phase 1, link control blocks 1 to 4 each carry seven octets of text (octets 2-8
-// of the word), with no check of their own beyond the link control's. The alias is blocks 1 and 2,
-// then 3 and 4 unless their text is already there, since on the air 3 and 4 often repeat 1 and
-// 2. A Phase 2 MAC structure carries the whole alias, decoded in p25p2mac.c.
+// of the word), with no check of their own beyond the link control's and nothing that says which
+// talker or which alias a block belongs to. As seen on the air (a VHF L3Harris simulcast,
+// 2026): a transmission sends block 1 in its first voice unit and then 2, 3, 4, 1, 2... in turn,
+// one in most LDU1s. Blocks 1 and 2 together are the alias, up to 14 characters, block 2 empty
+// for a short one; blocks 3 and 4 are the alias again. The two pairs are separate copies, not
+// one longer text: when a console takes a channel right after another talker, with no header
+// between, the site was seen to send blocks 1 and 2 still holding the last talker's alias and
+// blocks 3 and 4 the new one. So each pair is taken as a whole alias by itself, and the latest
+// pair is the alias. (sdrtrunk joins all four, leaving out a block whose text is already there;
+// that gives the same answer when the pairs agree, and the two aliases run together when they
+// do not. No alias using all four blocks as one text has been seen; one would come out here as
+// its two halves in turn.) Only one first half is held: block 1 waits for block 2, block 3 for
+// block 4, and any other block in between drops it. Since the blocks carry no identity, a first
+// half is also dropped when link control names another talker and when the caller says a
+// transmission began or ended (p25_alias_end()), so that one talker's first half is not joined
+// to the next talker's second. The halves are joined before blanks are trimmed, so that a
+// blank at the end of block 1 stays a blank within the alias. A Phase 2 MAC structure carries
+// the whole alias, decoded in p25p2mac.c.
 //
 // Each caller holds one struct p25_alias per channel or timeslot, so aliases on different
 // channels or slots never mix.
@@ -233,29 +248,9 @@ static bool mot_assemble(struct p25_alias *a, struct p25_mot_alias *m, int heade
   return true;
 }
 
-// L3Harris: blocks 1 and 2, then 3 and 4 unless they repeat what is there (on the air
-// blocks 3-4 often repeat 1-2)
-static bool harris_assemble(struct p25_alias const *a, struct p25_alias_result *out){
-  if(a->harris_len[0] == 0 || a->harris_len[1] == 0)
-    return false;
-  memset(out, 0, sizeof *out);
-  out->mfid = P25_MFID_HARRIS;
-  memcpy(out->text, a->harris[0], a->harris_len[0]);
-  out->len = a->harris_len[0];
-  for(int i = 1; i < 4; i++){
-    int const k = a->harris_len[i];
-    if(k == 0)
-      break;
-    bool found = false;
-    for(int j = 0; j + k <= out->len && !found; j++)
-      found = memcmp(out->text + j, a->harris[i], k) == 0;
-    if(found)
-      break;
-    memcpy(out->text + out->len, a->harris[i], k);
-    out->len += k;
-  }
-  out->text[out->len] = '\0';
-  return true;
+void p25_alias_end(struct p25_alias *a){
+  a->harris_first = 0;
+  a->harris_src = 0;
 }
 
 bool p25_alias_lc(struct p25_alias *a, struct p25_msg const *lc, struct p25_alias_result *out){
@@ -272,16 +267,38 @@ bool p25_alias_lc(struct p25_alias *a, struct p25_msg const *lc, struct p25_alia
       mot_block(&a->lc, lc->sequence, lc->block, frag, 44);
     }
     return mot_assemble(a, &a->lc, 0, 44, out);
-  case P25_LC_HARRIS_ALIAS: // octets 2-8 of blocks 1-4
-    if(lc->block < 1 || lc->block > 4)
-      return false;
-    {
-      char t[7];
-      memcpy(t, lc->raw + 2, 7);
-      a->harris_len[lc->block - 1] = trim(t, 7);
-      memcpy(a->harris[lc->block - 1], t, a->harris_len[lc->block - 1]);
+  case P25_LC_GRP_V_CH_USR:
+  case P25_LC_UU_V_CH_USR:
+    // The talker is named: a first half held from another talker is not this one's
+    if(lc->src != 0 && lc->src != a->harris_src){
+      if(a->harris_src != 0)
+        a->harris_first = 0;
+      a->harris_src = lc->src;
     }
-    return harris_assemble(a, out);
+    return false;
+  case P25_LC_HARRIS_ALIAS: // L3Harris blocks 1-4, text in octets 2-8: 1+2 is an alias, 3+4 another copy
+    {
+      int n = 7;
+      while(n > 0 && lc->raw[2 + n - 1] == '\0')
+        n--;
+      if(lc->block == 1 || lc->block == 3){
+        memcpy(a->harris, lc->raw + 2, n);
+        a->harris_len = n;
+        a->harris_first = lc->block;
+        return false;
+      }
+      bool const paired = a->harris_first != 0 && lc->block == a->harris_first + 1;
+      a->harris_first = 0;
+      if(!paired)
+        return false; // its first half was missed (or the block number is not 1-4)
+      memset(out, 0, sizeof *out);
+      out->mfid = P25_MFID_HARRIS;
+      memcpy(out->text, a->harris, a->harris_len);
+      memcpy(out->text + a->harris_len, lc->raw + 2, n);
+      out->len = trim(out->text, a->harris_len + n);
+      out->text[out->len] = '\0';
+      return out->len > 0;
+    }
   default:
     return false;
   }

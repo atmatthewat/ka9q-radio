@@ -53,6 +53,12 @@
 // unconfirmed packet's data block), rate 3/4 144 (a confirmed packet's data block). With
 // phases supplied the Viterbi decoder is soft
 // (dfec.c).
+// A packet's header has its own CRC, but that says nothing of the data blocks after it. Those
+// are covered by the packet CRC, the last 32 bits of the last block, taken over the data of all
+// the blocks (a confirmed block's serial number and CRC-9 left out). It matters most for
+// multi-block trunking messages, whose grants and channel numbers are in the data blocks: on a
+// weak control channel, messages whose header passed and whose data block did not were seen
+// to grant calls on channels that do not exist, before this was checked.
 
 // ---------------------------------------------------------------------------
 // Hexbit words (TIA-102.BAAA)
@@ -399,10 +405,33 @@ int p25_pdu_header(struct p25_pdu *p,struct p25_block *b,uint8_t const bits[P25_
   p->block_bits = p->confirmed ? 144 : 96;
   memcpy(p->payload,b->bits,96);
   p->nbits = 96;
+  p->crc = -1;
   if(p->blocks_to_follow == 0)
     return 1;
   p->pending = true;
   return 0;
+}
+
+// The packet CRC (TIA-102.BAAA): generator x^32+x^26+x^23+x^22+x^16+x^12+x^11+x^10+x^8+x^7+
+// x^5+x^4+x^2+x+1, no preset, inverted, most significant bit first. The data is each block's
+// bits, less the 16 that begin a confirmed block; the last 32 are the CRC
+static bool packet_crc_ok(struct p25_pdu const *p){
+  int const skip = p->confirmed ? 16 : 0;
+  int const per = p->block_bits - skip;
+  int const total = p->nblocks * per;
+  uint32_t crc = 0;
+  uint32_t sent = 0;
+  for(int i = 0; i < total; i++){
+    uint8_t const b = p->payload[96 + (i / per) * p->block_bits + skip + i % per] & 1;
+    if(i < total - 32){
+      bool const top = (crc >> 31) != b;
+      crc <<= 1;
+      if(top)
+        crc ^= 0x04c11db7;
+    } else
+      sent = (sent << 1) | b;
+  }
+  return (crc ^ 0xffffffff) == sent;
 }
 
 int p25_pdu_block(struct p25_pdu *p,struct p25_block *b,uint8_t const bits[P25_BLOCK_BITS],
@@ -417,6 +446,7 @@ int p25_pdu_block(struct p25_pdu *p,struct p25_block *b,uint8_t const bits[P25_B
   if(p->nblocks < p->blocks_to_follow)
     return 0;
   p->pending = false;
+  p->crc = packet_crc_ok(p);
   return 1;
 }
 

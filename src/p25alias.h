@@ -28,8 +28,10 @@ struct p25_mot_alias {
 // The caller's, one per channel or timeslot. Zero it with p25_alias_init().
 struct p25_alias {
   struct p25_mot_alias lc, mac;
-  uint8_t harris[4][7];        // L3Harris link control blocks 1-4, blanks and NULs trimmed
-  uint8_t harris_len[4];
+  uint8_t harris[7];           // L3Harris: the first half of an alias (link control block 1 or 3)
+  uint8_t harris_len;          // its octets, NULs off the end
+  uint8_t harris_first;        // which block that was (1 or 3), 0 when none is held
+  uint32_t harris_src;         // the talker it belongs to, 0 when not known
   uint32_t crc_failures;       // Motorola aliases dropped for a bad CRC (or no text)
 };
 
@@ -47,6 +49,9 @@ void p25_alias_init(struct p25_alias *a);
 // Feed a decoded link control word (any; others are ignored). True when it completes an
 // alias, which is then in *out
 bool p25_alias_lc(struct p25_alias *a, struct p25_msg const *lc, struct p25_alias_result *out);
+// A transmission began or ended (header, terminator, timeout): an L3Harris block held is
+// another transmission's and is dropped
+void p25_alias_end(struct p25_alias *a);
 // Feed a decoded MAC structure (any; others are ignored)
 bool p25_alias_mac(struct p25_alias *a, struct p25_mac_struct const *s, struct p25_alias_result *out);
 // Decode an assembled Motorola alias: WACN, system and unit (56 bits), the obfuscated
