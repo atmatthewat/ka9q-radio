@@ -52,8 +52,13 @@
 // other. What the threads share is the log (Output_mutex: one whole line at a time), the radiod
 // command handles (Ctl_mutex) and the sites of the trunked systems (see "Call following" below).
 //
-// Sessions and formats. A session is one {SSRC, sender address}: status and data come from
-// different ports of the same sender, so only the address is compared. radiod's payload types are
+// Sessions and formats. A session is one {SSRC, sender address and port}: radiod sends a
+// channel's status from the socket it sends the channel's data from, so the two have one source
+// address and port, and the port is what tells two radiods on one host apart (pcmrecord compares
+// both too: same_socket()). A voice channel is tied to its site by something else, the radiod
+// command address both name in their status (link_voice()): radiod has one socket for channels
+// with a TTL of zero and another for the rest, so a voice channel made from [global] can come
+// from a different port than its control channel. radiod's payload types are
 // dynamic, so a data packet means nothing until a status from its sender has said which sample
 // rate, channel count and encoding its payload type stands for. So a session is made by its first
 // status, data before that is dropped, and data whose type is not (yet) known to be two-channel
@@ -260,7 +265,8 @@ struct decoder {
 struct session {
   struct session *prev;
   struct session *next;
-  struct sockaddr_storage sender; // radiod's address; the port differs between status and data
+  struct sockaddr_storage sender; // radiod's address and port, the same for status and data
+  struct sockaddr_storage radio;  // radiod's command address, from the status (Ctl_mutex)
   uint32_t ssrc;
 
   // From the status stream. Written and read only by the input thread
@@ -350,7 +356,7 @@ struct vchan {
 // Lock order: Sites_mutex, then a site's lock, then Ctl_mutex. Output_mutex is taken alone
 struct site {
   struct site *next;         // in Sites (Sites_mutex)
-  struct sockaddr_storage sender; // the control channel: radiod's address and the SSRC (fixed)
+  struct sockaddr_storage sender; // the control channel: radiod's address and port, and the SSRC (fixed)
   uint32_t ssrc;
 
   pthread_mutex_t lock;      // everything from here to 'ctl'
@@ -369,7 +375,9 @@ struct site {
   int nevents;
   uint64_t lost_events;
 
-  // Under Ctl_mutex: radiod's command handle and the control channel's format, from its status
+  // Under Ctl_mutex: radiod's command address and handle and the control channel's format, from
+  // its status
+  struct sockaddr_storage radio;
   struct chanctl *ctl;
   struct chanctl_format format;
   bool have_format;
@@ -1045,12 +1053,17 @@ static void scan_sessions(int64_t now){
   }
 }
 
+// The same address and port
+static bool same_socket(struct sockaddr_storage const *a,struct sockaddr_storage const *b){
+  return address_match(a,b) == 1 && getportnumber(a) == getportnumber(b);
+}
+
 // Find existing session, move it to the top of the list to speed later lookups
-// Sessions are defined by {ssrc, sender IP address}; status and data come from different source ports
+// Sessions are defined by {ssrc, sender address and port}
 static struct session *lookup_session(struct sockaddr_storage const *sender,uint32_t ssrc){
   struct session *sp;
   for(sp = Sessions; sp != NULL; sp = sp->next){
-    if(sp->ssrc == ssrc && address_match(&sp->sender,sender))
+    if(sp->ssrc == ssrc && same_socket(&sp->sender,sender))
       break;
   }
   if(sp != NULL && sp->prev != NULL){
@@ -1630,10 +1643,12 @@ static void observe_status(struct session *sp){
 	fprintf(stderr,"%s: radiod commands to %s\n",App_path,formatsock(radio,false));
     }
   }
+  sp->radio = *radio;
   if(ctl != NULL){
     chanctl_observe(ctl,&sp->frontend,&sp->chan);
     struct site * const site = atomic_load(&sp->site);
     if(site != NULL){
+      site->radio = *radio;
       site->ctl = ctl;
       site->have_format = chanctl_format(&site->format,&sp->frontend,&sp->chan) == 0;
     }
@@ -1657,7 +1672,7 @@ static struct site *get_site(struct session const *sp){
   pthread_mutex_lock(&Sites_mutex);
   struct site *site;
   for(site = Sites; site != NULL; site = site->next)
-    if(site->ssrc == sp->ssrc && address_match(&site->sender,&sp->sender) == 1)
+    if(site->ssrc == sp->ssrc && same_socket(&site->sender,&sp->sender))
       break;
   if(site == NULL && (site = calloc(1,sizeof *site)) != NULL){
     site->sender = sp->sender;
@@ -2288,12 +2303,16 @@ static void control_lost(struct decoder *dp){
 }
 
 // A voice channel p25d asked for? If some site's call has this SSRC, it is that site's. True
-// when this call found it
+// when this call found it. The site must be on the same radiod, which is known by the command
+// address in the two channels' status: SSRCs are only unique within a radiod
 static bool link_voice(struct decoder *dp){
   struct session const * const sp = dp->sp;
   pthread_mutex_lock(&Sites_mutex);
   for(struct site *site = Sites; site != NULL && !dp->voice; site = site->next){
-    if(address_match(&site->sender,&sp->sender) != 1)
+    pthread_mutex_lock(&Ctl_mutex);
+    bool const same_radio = site->ctl != NULL && same_socket(&site->radio,&sp->radio);
+    pthread_mutex_unlock(&Ctl_mutex);
+    if(!same_radio)
       continue; // another radiod's
     pthread_mutex_lock(&site->lock);
     // Every channel a call asked for has an entry, as has one kept after its last call
