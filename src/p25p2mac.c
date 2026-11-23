@@ -8,6 +8,77 @@
 #include "p25p1msg.h"
 #include "p25p2mac.h"
 
+// Theory of operation
+//
+// The PDU. A MAC PDU is what one SACCH, FACCH or LCCH burst carries once p25p2unit.c has
+// corrected it and checked its CRC: 180 bits (22.5 octets) from a SACCH or an LCCH, 156 (19.5
+// octets) from a FACCH. Every PDU starts with an 8-bit MAC PDU header: a 3-bit opcode (the PDU
+// type; elsewhere in this file "opcode" means a structure's), a 3-bit offset, a reserved bit
+// and the protected bit P (TIA-102.BBAD-A 2.1); P is not read here. A SACCH or FACCH PDU ends
+// in a CRC-12, g(x) = x^12 + x^11 + x^7 + x^4 + x^2 + x + 1, sent inverted, over everything
+// before it from the header on (TIA-102.BBAC 8.4.5): from bit 168 or bit 144. An outbound
+// LCCH PDU ends instead in a 28-bit trailer, the site's 12-bit color code (its NAC, bits
+// 152-163) and a CRC-16 over everything before it, G(x) = x^16 + x^12 + x^5 + 1, inverted
+// (TIA-102.BBAD-A 2.1, 2.2, 4.7). The PDU types are 0 MAC_SIGNAL (the only LCCH PDU,
+// TIA-102.BBAD-A 2.2.3), 1 MAC_PTT, 2 MAC_END_PTT, 3 MAC_IDLE, 4 MAC_ACTIVE and 6
+// MAC_HANGTIME, with 5 and 7 reserved (TIA-102.BBAD-A 4.1). The offset counts the non-SACCH
+// bursts on this timeslot before the first 4V burst of the next voice sequence (outbound, 0 to
+// 5), 7 meaning no voice framing or none known (TIA-102.BBAD-A 4.2); it is logged, not used.
+//
+// PTT and END PTT have fixed layouts (TIA-102.BBAD-A 2.3.3.1, 2.3.3.2; positions in
+// p25p2mac.h) and carry no structures. SIGNAL, IDLE, ACTIVE and HANGTIME carry MAC structures
+// from bit 8 up to the CRC or the color code (max_index(); TIA-102.BBAD-A 2.2.3, 2.3.3.3);
+// types 5 and 7 are taken no further. A PDU with no PTT reads as clear (ALGID 0x80); a PTT's
+// ALGID 0x00 is an algorithm like any other, not clear.
+//
+// Walking the structures. A structure is an opcode octet and its fields, and nothing in the PDU
+// marks where one ends. TIA-102.BBAD-A 3 gives four ways to find a structure's length: fixed
+// by the opcode (its Table 4); from the structure's own fields (the two paging messages, by
+// their LEN field, 3.37 and 3.38); the rest of the PDU (Null Information, 3.1); or a length
+// octet, the low six bits of the octet after the opcode, which every message added after the
+// first edition of the MAC specification carries so that a receiver can step over opcodes it
+// does not know. A length counts every octet of the structure in this PDU, the opcode and the
+// length octet included (4.11). A manufacturer's structure has its MFID in octet 1 and its
+// length in the low six bits of octet 2 (3.36). struct_len() follows that with the tables
+// below for the fixed lengths and for the vendors, LEN for paging, the length octet for null
+// avoid zero bias and multi-fragment continuation, and for the manufacturer partition the
+// length in octet 2 when that is plausible (not every one sets it). An opcode no table knows
+// is taken to fill the rest of the PDU: a wrong guess at its length would misread every
+// structure after it, while taking the rest loses only those. TIA-102.BBAD-A 3 puts a
+// manufacturer's structures after the standard ones and Null Information (or Null Avoid Zero
+// Bias Information) last, filling what is left, so a receiver that cannot size a structure
+// loses nothing standard after it; on the LCCH more than one octet of fill is Null
+// Information if the burst is scrambled and Null Avoid Zero Bias if not (2.2.3). The standard
+// puts as many structures in a PDU as fit (2.2.3, 2.3.3.3); this walk keeps up to three. A
+// NULL INFORMATION opcode (0x00) after the first, or a length of 0, ends it, and a PDU whose
+// first opcode is 0x00 has that one null structure.
+//
+// Partitions. The opcode's top two bits, B1 and B2, choose one of four sets (TIA-102.BBAD-A 3,
+// Table 3), so the same 6-bit opcode means different things in each. 00 (0x00-0x3f):
+// structures made for TDMA with no TSBK counterpart (voice channel user, the multiple grant
+// updates, paging, power control, MAC release). 01 (0x40-0x7f): the abbreviated forms of the
+// Phase 1 TSBKs, whose low six bits are the TSBK's opcode. 10 (0x80-0xbf): manufacturers'
+// structures (TIA-102.BBAD-A 3.36), except 0x88 and 0x90, which are standard structures in
+// that range. 11 (0xc0-0xff): the explicit and extended forms, with a separate uplink channel
+// or a full SUID for a roaming unit: 20-bit WACN ID, 12-bit system ID and 24-bit unit ID,
+// seven octets (TIA-102.BBAD-A 4.13, suid() below).
+//
+// Decoding. An abbreviated structure is a TSBK with its MFID, its CRC (the PDU's CRC covers it)
+// and some reserved fields taken out, under the TSBK's own opcode (TIA-102.BBAD-A 2.2.3,
+// 2.3.3.3, 3). One that keeps the TSBK's field order is rebuilt as that TSBK (as_tsbk(),
+// positions in P1_at[]) and read by the Phase 1 decoder, so the structure becomes exactly the
+// message the TSBK would, with the same kind, fields and log line. The rest are read here,
+// field by field, into the same struct p25_msg (family P25_FAMILY_MAC, opcode the whole 8-bit
+// MAC opcode), and what p25_msg has no place for (SUID, NAC, more than two grants, paging
+// lists, aliases) goes in struct p25_mac_struct. Structures known by length only are
+// P25_MAC_OTHER and logged raw.
+//
+// To the trunking logic. p25_mac_trunk_msgs() turns a structure into the messages the Phase 1
+// path takes: a structure with a p25msg kind as it is (an explicit grant is the grant, with its
+// uplink channel in ch_b), and the multiple group grant updates 0x05 and 0x25, which no TSBK
+// has, as one single update per call. So the call tracking has no Phase 2 cases of its own.
+// The other P25_MAC_ kinds (paging, power control, release, aliases ...) are for the log.
+
 // The PDU: octets MSB first, nbits of them valid. Bits past nbits read as zero.
 struct pdu_bits {
   uint8_t const *p;
@@ -41,6 +112,8 @@ static uint32_t get_field(struct pdu_bits const *b, int off, int len){
 // extended function command is 0x84, as OP25 has it and sdrtrunk names it (its value, 0x85,
 // disagrees with its name). Multi-fragment base structures (0x71, 0xc7 ...) are 18 octets,
 // the fragment an LCCH PDU holds; OP25 lists the whole message's length there instead.
+// The standard's list of lengths is TIA-102.BBAD-A 3, Table 4. An outbound LCCH PDU holds
+// octets 1-18 of structures (TIA-102.BBAD-A 2.2.1), the 18 above.
 #define VAR 0xff
 #define REST 0xfe
 static const uint8_t Std_len[256] = {
@@ -230,6 +303,11 @@ static void harris_alias(struct ctx const *c){
   s->alias[n - start] = '\0';
 }
 
+// The standard structures (every partition but the manufacturers'). An abbreviated one with a
+// TSBK's layout goes through as_tsbk(); 0x7b (network status) adds the NAC the TSBK has no room
+// for, and 0x42 (grant update) also fills the grant list so that all grant updates read alike.
+// An abbreviated opcode in neither table is still read as its TSBK, which is the best guess
+// there is. The rest are laid out here, at the bit positions within the structure, opcode at 0
 static void decode_standard(struct ctx const *c){
   struct p25_mac_struct *s = c->s;
   struct p25_msg *m = &s->msg;
@@ -347,7 +425,9 @@ static void decode_standard(struct ctx const *c){
     m->data_access = F(c, 16, 16);
     m->tgt = F(c, 32, 24);
     break;
-  case 0x75: // validity flags 8-10, local time offset 11-23, date 24-45, time 48-64
+  // TIA-102.BBAD-A 3.23: validity flags VD, VT, VL 8-10, reserved 11, local time offset
+  // 12-23, date 24-47, time 48-71 (bits from the opcode's first)
+  case 0x75: // month, day and year from bit 24; hour, minute and second from bit 48
     m->kind = P25_TIME_DATE_ANN;
     m->month = F(c, 24, 4);
     m->day = F(c, 28, 5);
@@ -518,6 +598,8 @@ static void fragment(struct ctx const *c, int off, int n){
   s->frag_bits = n;
 }
 
+// Motorola structures (MFID 0x90): opcode, MFID, length, then the fields from bit 24. Several
+// are a Motorola TSBK after those three octets and go through as_tsbk() with Motorola's MFID
 static void decode_motorola(struct ctx const *c){
   struct p25_mac_struct *s = c->s;
   struct p25_msg *m = &s->msg;
@@ -654,6 +736,10 @@ static void decode_struct(struct pdu_bits const *b, struct p25_mac_struct *s){
   memcpy(m->raw, s->raw, m->raw_len);
 }
 
+// The PDU header, then PTT and END PTT from their fixed positions, or the walk over the
+// structures. algid starts as clear so that only a PTT can say a transmission is encrypted.
+// Each structure keeps its raw octets (up to P25_MAC_MAX_RAW, and only those inside the PDU)
+// for the log of kinds that are not decoded
 int p25_mac_decode(struct p25_mac_pdu *pdu, enum p25_mac_chan chan, uint8_t const *octets, int nbits){
   if(pdu == NULL)
     return -1;
@@ -716,6 +802,10 @@ int p25_mac_decode(struct p25_mac_pdu *pdu, enum p25_mac_chan chan, uint8_t cons
   return pdu->nstruct;
 }
 
+// A structure with a p25msg kind goes as it is, whatever the kind (P25_UNKNOWN included: the
+// trunking logic ignores kinds it does not act on). A multiple grant update becomes one
+// GRP_V_CH_GRANT_UPDT (or _EXP, uplink in ch_b) per grant grant() kept: the first always, a
+// later one not if it names group 0 or the first grant's group (0x05: any earlier one's)
 int p25_mac_trunk_msgs(struct p25_mac_struct const *s, struct p25_msg out[3]){
   if(s == NULL || out == NULL)
     return 0;

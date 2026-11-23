@@ -5,6 +5,35 @@
 #include <string.h>
 #include "p25alias.h"
 
+// Theory of operation
+//
+// A talker alias is a name for the radio that is talking, sent during its call in manufacturer
+// specific messages. Two manufacturers' formats are decoded.
+//
+// Motorola. An alias header gives a sequence number and how many data blocks follow; each data
+// block gives the sequence number and its own block number (1 up). In Phase 1 they are link
+// control words, and each data block carries 44 bits (link control bits 28-71) while the header
+// carries none of the alias. In Phase 2 they are MAC structures, whose header carries the
+// first 64 bits and each data block 100 more. The blocks of one sequence are held as they come,
+// in any order, and the alias is assembled once the header and every block it announced are
+// held (mot_assemble()); a block of a different sequence starts a new alias, since the old one
+// can no longer be completed. The assembled bits are the talker's WACN (20 bits), system (12)
+// and unit (24), then the text, then a CRC-16 (x^16+x^12+x^5+1, zero preset, inverted) over all
+// that went before it. Blocks are padded with zeros at the end, so the length is found from the
+// last nonzero octet. The text is obfuscated: each octet goes through a substitution table, then
+// has a running value taken off and is multiplied by the inverse of another (odd) running value
+// mod 256; both come from a multiplier that starts from the text's length and moves on with each
+// encoded octet. What comes out is UTF-16, two octets a character, written out as UTF-8. An
+// alias whose CRC fails (or that has no text) is dropped and counted.
+//
+// L3Harris. In Phase 1, link control blocks 1 to 4 each carry seven octets of text (octets 2-8
+// of the word), with no check of their own beyond the link control's. The alias is blocks 1 and 2,
+// then 3 and 4 unless their text is already there, since on the air 3 and 4 often repeat 1 and
+// 2. A Phase 2 MAC structure carries the whole alias, decoded in p25p2mac.c.
+//
+// Each caller holds one struct p25_alias per channel or timeslot, so aliases on different
+// channels or slots never mix.
+
 static int get_bit(uint8_t const *p, int i){
   return (p[i >> 3] >> (7 - (i & 7))) & 1;
 }

@@ -19,6 +19,61 @@
 #include "radio.h"
 #include "chanctl.h"
 
+// Theory of operation
+//
+// radiod's terms. radiod has no separate create, keepalive or delete command. Any command packet
+// names an SSRC; if no channel has that SSRC, radiod makes one from its [global] template and then
+// applies the packet's fields to it, in packet order (radio_status.c). Every command packet,
+// a bare poll (tag and SSRC only) included, reloads the channel's lifetime from its last LIFETIME
+// setting, and the channel counts its lifetime down one per block, going at 0 (radio.c). A
+// lifetime of 0 never runs down: that is a permanent channel, and it is also the template's
+// default (defaults.h DEFAULT_LIFETIME). So here:
+// - a request is one FULL command: every field of the format, the frequency and LIFETIME;
+// - a keepalive is a command carrying only LIFETIME;
+// - a release is LIFETIME 1, so the channel goes at its next block.
+// The lifetime is given in seconds and sent in blocks (frames()), using the block time learned
+// from status. A channel asked for with a lifetime goes by itself if the client stops, so a
+// client that dies leaves nothing behind for longer than that.
+//
+// Why a keepalive is never a bare poll. If radiod has lost the channel (it ran out, radiod
+// restarted, someone else released it), a poll makes a new channel from the template, with the
+// template's frequency, format and lifetime 0: a permanent channel nobody will ever release. A
+// keepalive's LIFETIME means such a channel at worst lives one lifetime. Status then shows it in
+// the wrong form, and the entry goes back to PENDING and asks for it in full (chanctl_observe()).
+// Polls are sent only to someone else's channel (SHARED below), where setting the lifetime would
+// override its owner's choice, and only while its status shows it surely still there.
+//
+// Pacing. radiod queues at most two commands per channel and executes one per block, dropping
+// the rest, so commands for one SSRC go at most every Min_gap. Refreshes go every third of the
+// lifetime (refresh_interval()), so one can be lost and the next still comes in time.
+//
+// What status tells us. A caller that decodes radiod's status passes each packet to
+// chanctl_observe(). That gives the front end's tuning, so a frequency it does not cover can be
+// refused (ERANGE) rather than asked for: radiod would retune the front end for it and move every
+// other channel. It gives radiod's block time. It confirms a request: the entry is UP once a
+// status shows the SSRC on the frequency and in the form asked for (same_form()). And it keeps a
+// table of every SSRC seen (struct seen), so a request for an SSRC that is someone else's channel
+// is either refused (EEXIST: another frequency or form, which a request would change under its
+// owner) or shared (the same frequency and form: use it as it is). Without status nothing is
+// confirmed: a request is resent with backoff and taken as up after Max_retry.
+//
+// The kinds and states of an entry.
+// - OWN: made by us. PENDING after a request, resent at First_retry doubling to Max_retry until
+//   status confirms it; UP once confirmed, kept alive by keepalives; back to PENDING if status
+//   shows it changed or recreated from the template; RELEASING after a release, the release
+//   resent while status still shows it running, forgotten after Release_hold.
+// - SHARED: someone else's channel with a lifetime, in our form. Polled to keep it, never
+//   released; if it may have gone, it becomes OWN and is asked for in full.
+// - STATIC: someone else's permanent channel in our form. Nothing is ever sent for it.
+// An entry nobody has asked for or refreshed within its lifetime is forgotten (maintain()),
+// since radiod has let the channel go by then.
+//
+// The template's payload type. radiod skips the payload type update on a command that also
+// restarts the demodulator, as a new channel's first command does when its sample rate differs
+// from the template's, so the stream keeps the template's payload type. A PENDING entry whose
+// status shows the wrong type sends two encoding changes, which make radiod recompute it, at most
+// twice (see chanctl_observe()).
+
 // radiod's block time until its status tells us (defaults.h DEFAULT_BLOCKTIME)
 static double const Default_blocktime = 0.020;
 // At most one command per SSRC this often. radiod queues two commands per channel and executes one

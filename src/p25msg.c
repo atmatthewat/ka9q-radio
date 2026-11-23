@@ -8,6 +8,37 @@
 #include <string.h>
 #include "p25msg.h"
 
+// Theory of operation
+//
+// One message model for both phases. Every decoder (TSBK, link control, multi-block trunking,
+// packet data header, HDU and encryption sync in p25p1msg.c; MAC structures in p25p2mac.c)
+// zeroes a struct p25_msg and fills it. family says what carried the message and kind what it
+// is, so a group voice grant is P25_GRP_V_CH_GRANT whether it came in a TSBK, an AMBTC or a
+// MAC structure, and the call tracking (p25trunk.c) and the formatter below handle each kind
+// once, not once per carrier. The struct is one flat set of fields rather than a layout per
+// kind: a kind uses the fields p25_format() prints for it, and the rest stay zero, so a field
+// a kind does not set reads 0, never something left from another message. The kind comes from
+// the opcode and the MFID together: both standard MFIDs (0x00, 0x01) have the TIA-102 tables,
+// Motorola (0x90) and L3Harris (0xa4) their own, and another manufacturer's message is
+// P25_UNKNOWN, logged with its raw octets.
+//
+// The band plan. A channel is sent as a 4-bit identifier and a 12-bit number. The site's
+// identifier updates (IDEN_UP, IDEN_UP_VU, IDEN_UP_TDMA) give each identifier a base
+// frequency, a channel spacing, a transmit offset and, for TDMA, the timeslots per carrier.
+// The downlink frequency is base + spacing x carrier, where the carrier is the channel number,
+// or on a TDMA identifier the number divided by the slots per carrier, the remainder being the
+// timeslot: a TDMA channel number counts timeslots. Until the site has sent an identifier,
+// channels on it have no frequency (p25_chan_freq() is false), and the call tracking does not
+// take a grant on it. An update is kept only within the limits p25_bandplan_update() checks,
+// so that a single implausible update cannot move every later grant on that identifier to a
+// frequency no receiver could tune.
+//
+// The log line. One line per message: family, kind, then key=value fields, with channels as
+// identifier-number and, once the plan has the identifier, frequencies in MHz (and the slot).
+// Each kind's case prints the fields its decoders set, which differ a little between families
+// (a TSBK unit-to-unit grant has no service options, a multi-block message no LRA): the checks
+// on family in the cases below are those differences.
+
 // Band plan
 
 void p25_bandplan_init(struct p25_bandplan *plan){
@@ -21,6 +52,8 @@ bool p25_bandplan_update(struct p25_bandplan *plan, struct p25_msg const *msg){
   if(msg->base_hz < 100000000 || msg->base_hz > 1000000000 || msg->spacing_hz == 0
      || msg->spacing_hz > 1000000 || off > 100000000)
     return false;
+  // Only IDEN_UP_TDMA can make an identifier TDMA, and only with a TDMA channel type; an
+  // IDEN_UP_TDMA of an FDMA type is a one-slot channel like the others
   struct p25_band b = {
     .valid = true,
     .tdma = msg->kind == P25_IDEN_UP_TDMA && msg->iden_tdma,
@@ -47,6 +80,7 @@ bool p25_chan_freq(struct p25_bandplan const *plan, struct p25_chan ch, uint64_t
   uint64_t const dl = b->base_hz + (uint64_t)b->spacing_hz * (ch.num / slots);
   if(downlink_hz)
     *downlink_hz = dl;
+  // A negative offset (the usual one below the downlink) wraps through uint64_t to the right sum
   if(uplink_hz)
     *uplink_hz = b->tx_offset_hz == 0 ? 0 : dl + (uint64_t)b->tx_offset_hz;
   if(slot)

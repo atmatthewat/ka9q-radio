@@ -21,7 +21,7 @@ enum p25_mac_chan {
   P25_MAC_LCCH,
 };
 
-// MAC PDU types, bits 0-2
+// MAC PDU types, bits 0-2 (TIA-102.BBAD-A 4.1)
 #define P25_MAC_SIGNAL 0
 #define P25_MAC_PTT 1
 #define P25_MAC_END_PTT 2
@@ -59,6 +59,9 @@ struct p25_mac_grant {
 
 #define P25_MAC_MAX_RAW 24
 
+// One MAC structure. msg holds what the Phase 1 messages also have, so the trunking logic and
+// p25_format() take it as they take a TSBK; the fields after it are those only Phase 2 has, for
+// the log (and the grant list for p25_mac_trunk_msgs()).
 struct p25_mac_struct {
   uint8_t opcode;              // 8 bits: partition (B1 B2) and opcode
   uint8_t vendor;              // manufacturer of a vendor-partition structure, else 0
@@ -90,14 +93,16 @@ struct p25_mac_struct {
   int raw_len;
 };
 
+// One PDU: the header fields, PTT or END PTT fields, or the structures (SIGNAL, IDLE, ACTIVE,
+// HANGTIME). At most three structures are kept, as p25_mac_decode() walks them.
 struct p25_mac_pdu {
   enum p25_mac_chan chan;
   uint8_t type;                // P25_MAC_PTT ...
-  uint8_t offset_4v;           // offset to the next 4V burst, bits 3-5
-  uint16_t lcch_nac;           // LCCH: color code, bits 152-163
+  uint8_t offset_4v;           // offset to the next 4V burst, bits 3-5 (TIA-102.BBAD-A 4.2)
+  uint16_t lcch_nac;           // LCCH: color code, bits 152-163 (TIA-102.BBAD-A 2.1)
 
   // PTT: MI 8-79, ALGID 80-87, KID 88-103, source 104-127, group 128-143
-  // END PTT: color code 12-23, source, group
+  // END PTT: color code 12-23, source, group (TIA-102.BBAD-A 2.3.3.1, 2.3.3.2)
   uint8_t mi[9];
   uint8_t algid;               // P25_ALGID_CLEAR unless a PTT says otherwise
   uint16_t kid;

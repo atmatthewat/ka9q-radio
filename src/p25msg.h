@@ -26,6 +26,7 @@
 #define P25_SVC_PACKET 0x10
 #define P25_SVC_PRIORITY 0x07
 
+// What carried a message, and so which decoder and layout it came from (the kind says what it is)
 enum p25_family {
   P25_FAMILY_TSBK,
   P25_FAMILY_LC,     // link control from an LDU1
@@ -143,6 +144,8 @@ enum p25_kind {
   P25_KIND_COUNT
 };
 
+// A channel as messages send it. On a TDMA identifier the number counts timeslots, not carriers:
+// p25_chan_freq() gives the carrier and the slot
 struct p25_chan {
   uint8_t iden;      // band plan identifier, 0-15
   uint16_t num;      // channel number, 0-4095

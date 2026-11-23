@@ -11,6 +11,116 @@
 #include "digital.h"
 #include "p25p2.h"
 
+// Theory of operation
+//
+// The signal. A Phase 2 carrier holds two TDMA channels (timeslots 0 and 1) at 6000 symbols/s,
+// 12 kbit/s. This receiver takes the outbound direction, from the site, which is a continuous
+// carrier in H-DQPSK; the subscribers' inbound bursts are H-CPM and are not decoded here
+// (TSB-102.BBAA 6). H-DQPSK puts the information in the phase change from one symbol to the next,
+// +-45 or +-135 degrees, as Phase 1's linear simulcast modulation does, so the same one-symbol
+// differential detector and the same soft dibit (dsync.c) serve both. The receive filter is a
+// root raised cosine of rolloff 0.2 (Rrc_alpha), taken to be the transmitter's shaping, for which
+// the signal occupies +-3600 Hz.
+//
+// The chain. p25p2_samples() takes each block (split at Max_block_time) through, in order: level
+// control to unity RMS; the frequency estimate and the correction of this same block by it
+// (below); the matched filter, the transmitter's root raised cosine again, so that the two
+// together are a raised cosine, with no intersymbol interference at the symbol instants and the
+// best signal to noise ratio there; and the timing loop (interpolator, Gardner detector, two
+// outputs per symbol), which calls sync_output() for each. There the phase change over one
+// symbol, z = y[k] conj(y[k-1]), becomes a soft dibit and adds to the block's frequency error
+// sums. After the block the frequency loop is closed from those sums and the soft dibits go to
+// the framer one at a time. The loops want 4 samples per symbol, so the receiver needs at least
+// 24 kHz: create_p25p2() refuses less.
+//
+// Frequency. Each block is corrected by an estimate that already includes that block's own
+// measurement (feed-forward, shift_freqtrack()), so a carrier's first timeslot, decoded before
+// any sync has been seen, is corrected too. The measurement is the lag-one residual of a copy of
+// the block rotated by the current estimate and lowpassed (Measure_cutoff), smoothed with a 20 Hz
+// corner while searching. Once frame sync is held that estimate is frozen and the decisions move
+// it instead (dd_mode): by default the fourth power of each differential symbol, which takes
+// the modulation off (the fourth power of an ideal +-45 or +-135 degree step is -1), weighted by
+// power; a quarter of its angle is the residual turn per symbol, unambiguous to +-750 Hz. Each
+// block moves the estimate by Dd_gain of its residual, from the next block. When sync is lost
+// the estimate is held for Afc_hold_time before the block estimate runs again, since a carrier
+// does not move between transmissions; a held seed (the control channel's offset, given when a
+// voice channel is granted) is kept the same way, until frame sync or Afc_hold_time without it.
+//
+// Quadrant errors. The fourth power is blind to an error of a whole quadrant per symbol, 1500 Hz
+// (or two, 3000 Hz): every differential symbol is then turned by 90 (180) degrees, every
+// decision is wrong, and the residual is still zero; a frozen or held estimate does not move by
+// itself either. So the framer also looks for the sync pattern with every dibit turned by one,
+// two or three quadrants (hunt_rotated()). When the same turn is found again one fragment later
+// the estimate is moved by that many quadrants, and moved back unless frame sync follows within
+// four fragments (Rotation_revert, 0.48 s).
+//
+// Timing. The loop is very wide while searching (Acquire_bw, a time constant of about 2.5
+// symbols) so that the first timeslot of a carrier decodes whatever the starting phase, and
+// narrow at frame sync (Track_bw, about 83 symbols, 14 ms). A second, narrower stage after
+// Settle_time can be set (p25p2_set_loop_bandwidths()) but is off by default. When sync is lost
+// the loop widens again and forgets the symbol rate estimate, which noise would otherwise walk.
+//
+// The TDMA structure. A superframe is 12 timeslots of 30 ms, 360 ms (TIA-102.BBAC 3.2.1). Each
+// timeslot is a 20-dibit ISCH (inter-slot signalling channel) followed by a 160-dibit (320-bit)
+// burst; strictly the ISCH straddles two slots, half at the end of one and half at the start of
+// the next, and a superframe begins halfway through the ISCH before its slot 0 (TIA-102.BBAC 3.3.4,
+// 3.4.2). This file works in fragments of four timeslots, 720 dibits or 120 ms, three to a
+// superframe. In dibits:
+//
+//   0 I-ISCH, 20 burst A, 180 I-ISCH, 200 burst B, 360 S-ISCH, 380 burst C, 540 S-ISCH, 560 burst D
+//
+// The ISCHs go in pairs, two I-ISCHs then two S-ISCHs, so those before slots 0, 1, 4, 5, 8 and 9
+// are I-ISCHs and those before 2, 3, 6, 7, 10 and 11 are S-ISCHs (TIA-102.BBAC 3.3.4, figure 5-3).
+// An S-ISCH is the fixed 40-bit sync pattern (TIA-102.BBAC 5.1, the voice channel's). An I-ISCH is
+// a (40,9) codeword (p25p2unit.c) whose fields include the channel of the burst after it and the
+// fragment's position in the superframe, its ISCH location 0, 1 or 2 (TIA-102.BBAC 5.5). Bursts A,
+// B, C, D belong to channels 0, 1, 0, 1, except in a superframe's last fragment, where C belongs
+// to 1 and D to 0: slots 10 and 11 are swapped so that a subscriber has time to turn round between
+// sending and listening on its SACCH (TIA-102.BBAC 3.2.1). So each channel has six bursts in a
+// superframe: five voice positions, then its SACCH (slot 10 for channel 1, 11 for channel 0).
+// Each burst says what it is in its DUID (4 bits in an (8,4,4) code spread over the burst, never
+// scrambled): 4V and 2V voice, SACCH, FACCH and LCCH signalling, scrambled or not, and DATCH data
+// (not decoded). Their layouts and codes are in p25p2unit.c.
+//
+// Sync search (hunt()). Each new dibit, the last 20 are compared with the S-ISCH pattern in bit
+// errors. A close match may be either S-ISCH of a fragment, so acquisition waits for the other one
+// too, 180 dibits before or after. The fragment found is delivered at once.
+//
+// Tracking (process_fragment()). With sync, a fragment is taken every 720 dibits. Both syncs clean
+// where expected: it is aligned. Otherwise offsets of one and two dibits either way are tried too
+// (best_offset()), and the fragment is moved to the best: the timing loop can slip a symbol, and
+// this follows it. A fragment with no sync near is dropped, since noise decodes as plausible
+// DUIDs; it still takes its place in the superframe, and MISSES of them in a row lose sync.
+//
+// Position (fragment_position()). Each I-ISCH that decodes gives the fragment's position in the
+// superframe, which fixes the channel of bursts C and D, the scrambling segment of every burst,
+// and the voice positions the ESS is assembled by. With neither I-ISCH decoded the position
+// carries on from the last fragment; until one decodes after acquisition it is a guess (0), and
+// bursts say so (position_known).
+//
+// Scrambling (TIA-102.BBAC 7.2.5). Its purpose is that a receiver does not take the voice or
+// messages of another P25 TDMA system on the same frequency for its own. Voice bursts are always
+// scrambled; signalling bursts are too, except those carrying a network status broadcast (which
+// gives the parameters) or a MAC_END_PTT (whose color code identifies an interfering system).
+// The DUID says which (p25p2_duid_scrambled()); the ISCH, the DUID and sync sequences are never
+// scrambled. The sequence comes from a 44-bit shift register seeded with the WACN, system ID and
+// color code (the NAC), restarted every superframe: 4320 bits, one 360-bit stretch per timeslot,
+// starting halfway through the ISCH before slot 0, of which a burst uses the 320 bits under it.
+// So the segment is chosen by the burst's superframe slot. The parameters come from outside
+// (p25d: the control channel's network status and NAC) and are taken up at the start of a
+// fragment. Until they are set, scrambled bursts are delivered with 'descrambled'
+// false and nothing decoded from them, rather than decoded with a guessed sequence. Unscrambled
+// bursts are decoded regardless, so a handler may learn the parameters from one (a network status
+// broadcast on this channel): set during a fragment's delivery, they cause its scrambled bursts
+// to be delivered again, descrambled and marked 'reparsed'.
+//
+// What is delivered. For each timeslot of each synced fragment, one struct p25p2_burst (p25p2.h):
+// its place, DUID, sync and ISCH quality, the (descrambled) bits and confidences, and what was
+// decoded from them: a signalling burst's MAC PDU, a voice burst's AMBE+2 frames, and with a 2V
+// the ESS assembled from the timeslot's 4Vs before it. Each timeslot's ESS collector is emptied
+// at a MAC PTT, END PTT, IDLE or HANGTIME and when sync is lost, so that no ESS is assembled from
+// two transmissions. A burst whose DUID did not decode is delivered with nothing decoded.
+
 // Timing loop bandwidths (normalized, per symbol). Acquisition is wide so that the first
 // timeslot of a carrier (dibits 20-179, before its first S-ISCH) decodes whatever the initial
 // timing phase; with frame sync the loop narrows. One stage by default
@@ -18,6 +128,9 @@ static float const Acquire_bw = 0.4f;
 static float const Track_bw = 0.012f;
 static float const Settle_time = 0.5f; // seconds of held sync before an optional second stage
 static float const Loop_damping = 1.0f;
+// The timing detector's slope, error per input sample (set_gains() in dsync.c): Phase 1's
+// tuning constant (p25p1.c), which there is for 4 samples per symbol, as 24 kHz is here. It is
+// not scaled for other sample rates as Phase 1's is
 static float const Error_gain = 0.42f;
 // Symbol rate error the timing loop may integrate: transmitter plus receiver clock errors are tens of ppm
 static float const Rate_limit = 0.0003f;
@@ -46,10 +159,18 @@ static double const Level_time = 1.0 / 12.0; // seconds
 // four fragments
 static float const Quadrant_hz = P25P2_SYMRATE / 4.0f;
 static int const Rotation_revert = 4 * P25P2_FRAGMENT_DIBITS;
-// Longest block processed at once
+// Longest block processed at once: the block's buffers, and its dibit list (with room for the
+// timing loop running fast), are sized from it
 static double const Max_block_time = 0.1; // seconds
 
 // Framing (fragment layout and sync thresholds, in bit errors of the 40-bit S-ISCH sync)
+// A one-dibit slip shifts the pattern against itself: its 7 changes between 01 and 11 cost a bit
+// each, and the dibit shifted in, a DUID dibit of the burst beside it, 0 to 2 more. So at offset
+// 0 a slipped sync can pass TRACK, and best_offset() takes the offset with the fewest errors
+// rather than the first that passes. While searching the framer needs a pair's partner 180
+// dibits back and a fragment start up to 540 back: it trims its history to two fragments when it
+// holds four (SEARCH_TRIM, SEARCH_KEEP). Synced, it keeps one fragment before the next one's
+// start, for the negative offsets
 enum {
   SYNC_DIBITS = 20,
   FRAGMENT = P25P2_FRAGMENT_DIBITS,
@@ -60,7 +181,7 @@ enum {
   ISCH2 = 180,
   HUNT = 4,                // acquire on a sync this close ...
   HUNT_PARTNER = 6,        // ... with the other one 180 dibits away this close
-  TRACK = 7,               // a fragment keeps sync with either sync this close (a one-dibit slip scores 8 or 9)
+  TRACK = 7,               // a fragment keeps sync with either sync this close (a one-dibit slip scores 7 to 9)
   CLEAN = 4,               // both this close: aligned, no slip search
   SLIP1 = 6,               // both syncs this close at +-1 dibit
   SLIP2 = 5,               // ... at +-2
@@ -74,9 +195,12 @@ enum {
   SEARCH_KEEP = 2 * FRAGMENT,
 };
 static uint64_t const NONE = ~(uint64_t)0;
+// First dibit of bursts A-D in the fragment, each after its 20-dibit ISCH
 static int const Burst_offset[4] = { 20, 200, 380, 560 };
-// S-ISCH sync, as dibits (01 = 1, 11 = 3)
+// S-ISCH sync, as dibits (01 = 1, 11 = 3): the voice channel's pattern of TIA-102.BBAC 5.1,
+// +3 and -3 symbols
 static uint8_t const Sync_pattern[SYNC_DIBITS] = { 1,1,1,3, 1,1,3,1, 1,1,1,3, 3,3,1,3, 3,3,3,3 };
+// The ideal phase change of each dibit, as make_softdibit() decides them (digital.h)
 static float const Nominal_phase[4] = { M_PI_4, 3 * M_PI_4, -M_PI_4, -3 * M_PI_4 };
 
 struct slot {
@@ -166,12 +290,18 @@ static void frame_dibit(struct p25p2 *p,struct softdibit const *sd);
 
 // ---------------- scrambling ----------------
 
+// The seed: WACN * 2^24 + system ID * 2^12 + color code, 20 + 12 + 12 bits, the shift register's
+// length (TIA-102.BBAC 7.2.5; the color code is the NAC of the Phase 1 control channel)
 static uint64_t scr_seed(uint32_t wacn,uint16_t sysid,uint16_t nac){
   return (uint64_t)(wacn & 0xfffff) << 24 | (uint64_t)(sysid & 0xfff) << 12 | (nac & 0xfff);
 }
 // 44-bit register shifting left, output its bit 43, feedback 43 ^ 33 ^ 19 ^ 14 ^ 8 ^ 3; a zero
 // seed is all ones. Superframe timeslot k is xored with stream bits 20 + 360 k on: the stream
 // starts halfway through the superframe's first ISCH, and each timeslot is 320 of every 360
+// That feedback is the external form of G(x) = x^44 + x^40 + x^35 + x^29 + x^24 + x^10 + 1, and a
+// zero seed is replaced by 2^44 - 1 (TIA-102.BBAC 7.2.5). Every burst bit but the DUID's is xored,
+// including the 42-bit sync in the middle of a scrambled FACCH (bits 138-179), which the standard
+// leaves unscrambled; nothing decodes those bits
 static void sequence_from_seed(uint8_t seq[P25P2_SUPERFRAME_SLOTS][P25P2_BURST_BITS],uint64_t seed){
   uint64_t const mask = ((uint64_t)1 << 44) - 1;
   uint64_t reg = seed & mask;
@@ -205,6 +335,10 @@ static void refresh_scrambling(struct p25p2 *p){
   p->scr_valid = p->scr_pending_valid;
   p->scr_seed = p->scr_pending_seed;
 }
+// Only the pending copy changes here, so all the bursts of a fragment are taken with one sequence.
+// Set during a fragment's delivery with new parameters, it has the fragment's scrambled bursts
+// that went out undescrambled delivered again (process_fragment()); bursts already descrambled
+// with other parameters are not
 void p25p2_set_scrambling(struct p25p2 *p,uint32_t wacn,uint16_t sysid,uint16_t nac){
   uint64_t const seed = scr_seed(wacn,sysid,nac);
   if(p->delivering && (!p->scr_valid || seed != p->scr_seed))
@@ -343,6 +477,12 @@ static int fragment_position(struct p25p2 *p,uint64_t fs){
 
 // A timeslot's running voice position, five per superframe, or -1 when the superframe
 // position is not known (the sixth burst of a timeslot in a superframe is its SACCH)
+// The superframe is numbered by its first dibit's stream index over 2160, rounded. The stream
+// index is not aligned to superframes, so this counts them one apart as long as slips do not move
+// a superframe's start across a rounding point (1080 mod 2160). The only use is the ESS decode,
+// which matches a 2V with the four 4Vs before it in this count. Those may be partly in the
+// superframe before: voice bursts repeat four 4Vs and a 2V from the start of the transmission,
+// wherever that falls among the voice positions (TIA-102.BBAC 6.1)
 static int64_t voice_position(struct p25p2_burst const *b){
   if(!b->position_known)
     return -1;
@@ -632,6 +772,8 @@ static void sync_output(void *arg,float complex y,bool is_symbol){
     p->dibits[p->ndibits++] = sd;
 }
 
+// One block through the chain (see the top of the file). A seed can be given at any time, even
+// from a burst handler running inside this function, so it waits for the start of the next block
 static void run_block(struct p25p2 *p,float complex const *iq,int count){
   if(!p->primed){
     // From its default the level estimate would take a tenth of a second to reach a weak stream's level
@@ -740,6 +882,7 @@ struct p25p2 *create_p25p2(double samprate){
   p->settled_bw = Track_bw;
   p->settle_dibits = (uint64_t)(Settle_time * P25P2_SYMRATE);
   p->max_block = (int)ceil(Max_block_time * samprate);
+  // A block's symbols at the nominal rate, with a tenth and 16 more to spare
   p->max_dibits = (int)(p->max_block * 1.1 * P25P2_SYMRATE / samprate) + 16;
   p->block = calloc((size_t)p->max_block,sizeof *p->block);
   p->copy = calloc((size_t)p->max_block,sizeof *p->copy);

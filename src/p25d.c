@@ -42,6 +42,88 @@
 #include "p25alias.h"
 #include "p25audio.h"
 
+// Theory of operation
+//
+// Threads. One input thread (main(), input_loop()) reads every status and data packet of every
+// input group, so the session table and each session's RTP state are its alone and need no lock.
+// Each channel (SSRC) gets a decode thread at its first usable data packet (start_decoder()); that
+// thread alone runs the channel's receivers and owns its struct decoder, so the receivers'
+// callbacks keep state and log without locking, and a channel that decodes slowly holds up no
+// other. What the threads share is the log (Output_mutex: one whole line at a time), the radiod
+// command handles (Ctl_mutex) and the sites of the trunked systems (see "Call following" below).
+//
+// Sessions and formats. A session is one {SSRC, sender address}: status and data come from
+// different ports of the same sender, so only the address is compared. radiod's payload types are
+// dynamic, so a data packet means nothing until a status from its sender has said which sample
+// rate, channel count and encoding its payload type stands for. So a session is made by its first
+// status, data before that is dropped, and data whose type is not (yet) known to be two-channel
+// I/Q in an encoding convert_iq() reads is counted as unusable. Each block carries the sample rate
+// and channel frequency it arrived with; a change of rate restarts the channel's receivers. The
+// status also gives the stream's clock reference (GPS time against an RTP timestamp), from which
+// each event is stamped with the time of the signal, not of its decoding (session_time(),
+// decoder_time(); the time now until the reference has arrived).
+//
+// The queue. Packets are put back in sequence order in a window of RESEQ packets and passed on
+// as soon as nothing is missing before them; a missing one is waited for until a packet RESEQ
+// later arrives, then given up for lost. A gap in the timestamps up to Max_fill is filled with
+// zeroes, because the receivers measure time in samples: symbol timing, the count of voice units
+// lost on the air and the conventional channels' timeout all go by it, and closing a gap up would
+// look to them like a jump in the middle of a symbol. A longer gap is not filled (a resync), nor
+// is one before a packet with the RTP marker; event times stay right either way, since each block
+// has its own time from the clock reference. Between the input thread and a decode thread the
+// blocks go through a list under the session's qmutex, bounded at Max_queue of samples: a decoder
+// that falls that far behind loses whole blocks (overruns) rather than letting the queue grow.
+// A session closes after Timeout without data (without status, if no decode thread was started
+// for it); its decode thread first decodes what is queued.
+//
+// Which receiver. A voice channel p25d asked for runs the receiver its grant names: Phase 2 for
+// a TDMA channel, else Phase 1. Any other channel's modulation is not known. Below P2_samprate
+// only the Phase 1 receiver can run; at P2_samprate or more both run on the same samples
+// (choosing) until one of them decodes something that passes its own check: for Phase 1 a
+// trunking block's CRC, the code of a header, link control or encryption sync, or a packet header
+// (decoder_frame()); for Phase 2 a MAC PDU's CRC (p2_burst()). That one stays and the other is
+// deleted (choose()). A channel's modulation does not change, so the choice stands until the
+// sample rate does. This is how a TDMA control channel is recognised: it needs nothing configured
+// but its 24 kHz rate, and a Phase 1 channel at that rate is found to be Phase 1 the same way.
+//
+// What a channel is. One on which a trunking message decodes (a TSBK or a multi-block trunking
+// PDU, or an LCCH MAC PDU) and that is not a voice channel p25d asked for is a control channel,
+// from then on (become_control()). One p25d asked for is a voice channel (link_voice()). Any other
+// is conventional: its transmissions get start and end lines (conv_unit()) and its voice is sent
+// under the voice output's own rule only. There are no Phase 2 conventional channels: a TDMA
+// carrier that is neither control nor voice channel is decoded and its MAC messages logged, but
+// no voice comes from it (its scrambling parameters come only from a site, and its calls are
+// known only to one).
+//
+// The gates on voice. Speech (-R) and vocoder frames (-F) pass two gates. The first is the voice
+// output's own rule (p25audio.c), the same on every channel: a transmission's voice is sent once
+// its header or encryption sync (Phase 2: MAC PTT or ESS) has said unencrypted, until it ends, and
+// not once anything says encrypted; voice before that is held. The second is on trunked channels
+// only: the site's trunking logic labels each voice unit clear, encrypted, hold (not known yet)
+// or none (no call there), and p25d makes the label none for any call it does not follow
+// (fc->requested; fc->local on the control carrier). So a call found on a channel by its voice
+// alone, or the other timeslot's call on a Phase 2 channel, is heard only if it would have been
+// followed from its grant (-g, -x, -e, -m). A unit labelled hold waits in the voice output until
+// the logic releases it, as clear or not (p25_audio_release()), or the call ends. A conventional
+// channel's units are unlabelled: the first gate alone. Before either, a data unit on a Phase 1
+// voice channel whose NAC is not the site's is dropped (voice_unit()).
+//
+// SSRCs. A channel radiod makes on request has its frequency in kHz as its SSRC (chanctl_ssrc():
+// rounded, and moved up past a number already taken), so p25d knows a voice channel by that
+// number, one per frequency; both timeslots of a TDMA carrier are one channel. The output
+// streams (speech and frames share each stream's SSRC): a trunked group call's have the
+// talkgroup as their SSRC, whichever channel carries it, so a listener sees one stream per
+// talkgroup; any other call's, and a conventional channel's, have the channel's SSRC, except on
+// timeslot 1 of a Phase 2 carrier, where they have the channel's plus one (link_voice(),
+// choose()), so the two timeslots' calls never share a stream.
+//
+// The control carrier's other timeslot. On a TDMA control channel whose LCCH is on one timeslot,
+// the other may carry calls. Its samples are already here, so a grant of it asks radiod for
+// nothing: the call is marked local (want_channel()), the control channel's own thread decodes
+// that timeslot as a voice channel's (p2_burst()), and the trunking logic knows it by the
+// carrier's frequency as the band plan names it (site->carrier_hz), so that the grant and the
+// voice heard there key the same call. Nothing is released when it ends; -m counts it.
+
 #define MAX_MCAST 20   // Maximum number of input groups
 #define RESEQ 32       // Resequencing queue, packets. radiod sends one to three packets per 20 ms block
 #define MAX_TALKGROUPS 4096 // In the allow and deny lists together
@@ -803,6 +885,11 @@ static void process_data(int fd){
 
 // Resequence, then pass samples to the decoder in RTP timestamp order
 // Modelled on pcmrecord's process_data() and send_wav_queue()
+// A packet older than the next one expected is a duplicate or came too late, and is dropped.
+// But if the next packet to arrive is the one after it in sequence, the sender has restarted with
+// new sequence numbers: what is queued goes out and reception starts again from there. A packet
+// RESEQ or more ahead gives up on the missing ones; how far the timestamps then jump decides
+// between filling and resynchronizing (send_queue())
 static void receive_packet(struct session *sp,struct rtp_header const *rtp,uint8_t const *data,int frames,enum encoding encoding){
   if(sp->rtp.odd_seq_set){
     if(rtp->seq == sp->rtp.odd_seq){
@@ -1065,6 +1152,15 @@ static void cleanup(void){
 }
 
 // One per channel: take blocks off the queue and run the receiver over them
+// For each block, in order: is this channel now a voice channel p25d asked for, or one asked for
+// again in the other form (link_voice(), voice_moved())? If its receivers no longer fit (first
+// block, a change of sample rate, or a grant needing another receiver) they are made again from
+// what is known (see "Which receiver" above), on a voice channel seeded with the control
+// channel's carrier offset when the call has one. Then the samples go to each receiver, whose
+// callbacks do everything else; then the voice output's clock (block_done()) and, on a control
+// channel, the trunking logic's tick and the hang time (control_block()). The thread ends when
+// its session closes, once the queue is empty: a control channel's calls and channels are let go
+// (control_lost()), a conventional transmission ends
 static void *decode_task(void *arg){
   struct session * const sp = (struct session *)arg;
   assert(sp != NULL);
@@ -1415,6 +1511,46 @@ static void status_line(struct decoder const *dp){
 // (bookkeeping under the site's lock, then log lines and commands to radiod after letting it go),
 // so no lock is held while writing the log or sending, and the site lock is never taken while
 // holding Ctl_mutex.
+//
+// Sites. A site is one control channel: its trunking logic, the calls the logic reported as p25d
+// acts on them (struct fcall: whether a channel was asked for, its SSRC, the counts for the end
+// line), the voice channels it has in radiod (struct vchan) and the frequencies radiod refused.
+// It is keyed by the control channel's sender and SSRC, made the first time trunking decodes
+// there (get_site()) and found again if the channel comes back, with new trunking logic
+// (control_lost() deleted the old). Sites are never freed before exit, so a decode thread keeps a
+// pointer to one without counting references. Each is on its own: a voice channel belongs to the
+// site whose call asked for it, and two control channels of one system are two sites.
+//
+// The lock. The trunking logic is not thread safe, and the control channel's thread (every block)
+// and each of its voice channels' threads (every data unit or burst) call into it, so every call
+// into it, and the bookkeeping of calls and channels, is under the site's lock. With no lock held
+// while writing the log or sending to radiod, a slow log or a blocked send stalls only the thread
+// doing it, not the others waiting for the site's lock. Ctl_mutex nests inside the site's lock
+// (want_channel() takes an SSRC from chanctl while deciding), never the other way round.
+//
+// The work list. Events wait in the site (MAX_EVENTS; more are counted and logged as lost) rather
+// than being acted on inside the logic's call, since acting on one may call back into the logic
+// (p25_trunk_set_heard()). Log lines and commands wait in the decode thread's work list (MAX_WORK)
+// for site_unlock(). Done as a batch, a release is dropped when the same batch asks for that SSRC
+// again (its frequency granted to the next call at once), so radiod's channel is not torn down
+// and built again. A refusal (ERANGE: outside the front end's coverage; EEXIST: that SSRC is
+// another channel) is known only after the lock is let go, so it is taken again to record it: the
+// frequency is not asked for again, the call is marked refused, and no quiet time follows it.
+//
+// Asking for a voice channel and linking it. For a followed call, want_channel() takes in turn:
+// the control carrier's other timeslot (nothing to ask for), a frequency radiod refused (not
+// followed), the -m limit, a channel the site already has on that frequency (in use by the other
+// timeslot, or kept: used as it is), else a new channel: an SSRC from chanctl_ssrc() and an entry
+// in the site's vchans. The entry is made before the request goes out, so the decode thread that
+// starts when radiod's stream arrives finds it by SSRC on its first block (link_voice()), and
+// with it the site, the receiver (vc->tdma), the frequency the trunking logic knows the channel by
+// (the grant's: radiod's status may report it rounded) and the carrier offset to seed it with. The
+// request (ask_channel(), chanctl_request()) is in the control channel's form (call_format())
+// with a Lifetime, so a channel p25d no longer asks for goes away by itself; grant updates ask
+// again and voice refreshes it, both cheap since chanctl sends only when one is due. link_voice()
+// is tried on every block of every channel that is neither control nor voice channel yet, since
+// any of them may be granted at any time; one already running when it is granted starts afresh
+// with the receiver its grant needs (decode_task()).
 //
 // Voice channels and the hang time.
 //
@@ -2781,6 +2917,12 @@ static void p2_status_line(struct decoder const *dp){
 // Conventional channels: one line when a transmission starts, once its talkgroup (or unit) and
 // source are known or after four voice units without them, and one when it ends, as the trunked
 // call lines do
+// A transmission, for these lines, is decided here much as the voice output decides it, but
+// apart from it: a header starts one, and so does a voice unit with none in progress (late
+// entry); link control naming another talkgroup, unit or source ends one and starts the next; a
+// terminator ends it, and so does a voice unit overdue by half a second (block_done()). Four
+// voice units are 0.72 s: two LDU1s, two chances at the link control. Only a Phase 1 channel is
+// ever conventional, and one on which a trunking message decodes is a control channel from then on
 
 static void conv_start_line(struct decoder *dp){
   struct conv * const c = &dp->conv;

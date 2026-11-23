@@ -14,6 +14,19 @@
 // every message and the time (nanoseconds, any epoch, never decreasing), and is told what
 // happened through one handler. One struct p25_trunk per control channel (site); it is not
 // thread safe.
+//
+// How a caller uses it. Every control channel message goes to p25_trunk_control() (an LCCH's to
+// p25_trunk_lcch()). A CALL_START with P25_TRUNK_F_FOLLOW asks for its voice channel; from then
+// on each data unit received there goes in, word first, and the label returned says what to do
+// with its voice frames: decode, do not, or hold until a CALL_UPDATE with P25_TRUNK_F_RELEASE
+// says what the held ones were. A CALL_UPDATE without F_FOLLOW means stop receiving the call (it
+// turned encrypted, say), and with it again that the call may now be received. CALL_END means
+// the call is over and its channel no longer needed for it. Calls time out in any entry point,
+// but control loss is noticed only in p25_trunk_tick(), and with no messages arriving only it
+// ends calls: call it a few times a second. The times are the caller's to choose; p25d gives
+// the sender's time of each sample, so the timeouts are judged on the signal's own time, however
+// far behind it each decoding thread runs. The top of p25trunk.c describes a call's life and how
+// its voice is labelled.
 
 // Table sizes. When one is full:
 enum {
@@ -132,7 +145,8 @@ struct p25_trunk_event {
   uint32_t flags;            // P25_TRUNK_F_*
   enum p25_trunk_why why_not;
   uint8_t svc;               // service options
-  uint8_t algid;             // 0x80 clear; 0 unknown
+  uint8_t algid;             // 0x80 clear; 0 unknown, unless F_ENC_KNOWN: then as a header or
+                             // sync sent it (0x00 is an encrypted algorithm there)
   uint16_t keyid;
   enum p25_trunk_end end_reason;
   int held_units;            // RELEASE: units released (they returned P25_TRUNK_VOICE_HOLD)

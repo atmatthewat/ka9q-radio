@@ -16,6 +16,8 @@
 //           each, 18 for a confirmed packet's blocks); AMBTC is a PDU   TIA-102.BAAA, .AABC
 //   HDU     15 octets (MI, MFID, ALGID, KID, TGID)                    TIA-102.BAAA
 //   ES      12 octets (LDU2 encryption sync: MI, ALGID, KID)
+// The decoders check nothing: they are given only what has passed its error correction and,
+// where it has one, its CRC.
 // Nothing allocates and nothing is global: a decoded message and a band plan are the
 // caller's, so channels can be decoded on separate threads.
 

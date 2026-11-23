@@ -27,8 +27,9 @@ enum {
   P25P2_ESS_SEGMENTS = 8,      // ESS-B segments an ESS collector keeps
 };
 
-// The four information bits of the DUID (TIA-102.BBAC), sent as an (8,4,4) codeword at burst
-// bits 0, 1, 74, 75, 244, 245, 318 and 319, never scrambled
+// The four information bits of the DUID (TIA-102.BBAC 5.4), sent as an (8,4,4) codeword at burst
+// bits 0, 1, 74, 75, 244, 245, 318 and 319, never scrambled. The original TIA-102.BBAC (5.4.1)
+// defines 0, 3, 6, 9, 12 and 15, the voice channel's bursts; DATCH and LCCH are not in it
 enum p25p2_duid {
   P25P2_DUID_UNKNOWN = -1,
   P25P2_DUID_4V = 0,         // four voice frames and ESS-B
@@ -51,11 +52,14 @@ bool p25p2_duid_voice(int duid);
 int p25p2_duid_mac_chan(int duid);      // enum p25_mac_chan of a signalling burst, else -1
 char const *p25p2_duid_name(int duid);
 
-// Phase 2 ISCH (I-ISCH): (40,9) code, minimum distance 8, nearest codeword up to 7 errors
+// Phase 2 ISCH (I-ISCH): (40,9) code, minimum distance 16, nearest codeword up to 7 errors
 // Only codewords whose channel field is this timeslot (0 or 1) and whose ISCH location is
 // not the reserved value 3 are candidates; a tie goes to the lowest info value.
 // *info gets the 9 info bits, msb first: LCH type (2), channel (2), ISCH location (2),
 // LCH flag (1), superframe sequence (2). Returns bits corrected (0-7) or -1
+// (The original TIA-102.BBAC, 5.5, names those fields reserved, channel number, ISCH location,
+// FR (the next inbound SACCH is free for listeners) and ultraframe count, and adds an offset
+// vector to every codeword, as here)
 int isch_decode(uint8_t const bits[40],int timeslot,int *info);
 int isch_decode_word(uint64_t word,int timeslot,int *info); // word bit 39 = first bit sent
 
@@ -93,7 +97,8 @@ struct p25p2_ess {
   int erasures;        // ESS-B hexbits missing (4 per segment)
   int rs_fixed;        // hexbits Reed-Solomon changed, erasures included
 };
-// One timeslot's ESS-B segments until its next 2V
+// One timeslot's ESS-B segments until its next 2V. A 2V decode, or a reset, empties it; if a 2V
+// is missed the segments go on collecting, the oldest dropped once P25P2_ESS_SEGMENTS are held
 struct p25p2_ess_collector {
   struct {
     uint8_t sym[4];

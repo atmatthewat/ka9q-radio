@@ -1,6 +1,7 @@
 // Ask radiod to create, keep alive and release receiver channels on behalf of a client program
 // A channel is requested in the format (demod, sample rate, channels, encoding, filter, gain, destination)
 // of an existing channel, learned from its status, on a new frequency
+// How requests, keepalives and releases map onto radiod's commands, and why: see chanctl.c
 // Copyright 2026, Matthew Kaufman, KA6SQG
 
 #ifndef _CHANCTL_H

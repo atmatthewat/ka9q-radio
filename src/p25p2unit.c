@@ -10,6 +10,66 @@
 #include "rs63.h"
 #include "p25p2unit.h"
 
+// Theory of operation
+//
+// A burst is the 320 bits of one outbound timeslot, descrambled by p25p2.c where it is scrambled.
+// Its type, the DUID, is sent in eight bits that are never scrambled, at 0-1, 74-75, 244-245 and
+// 318-319; everything else depends on the type (TIA-102.BBAC 4.2, 4.3 and the bit tables of
+// Annex E):
+//
+//   4V     AMBE+2 frames at 2, 76, 172 and 246 (72 bits each), ESS-B (24 bits) at 148-171
+//   2V     AMBE+2 frames at 2 and 76, ESS-A (168 bits) at 148-243 and 246-317
+//   SACCH  the outbound signalling burst without sync (I-OEMI): a 180-bit MAC PDU as 30 hexbits,
+//          and 22 parity hexbits, in all the other 312 bits
+//   FACCH  the outbound signalling burst with sync (S-OEMI): a 156-bit MAC PDU as 26 hexbits, and
+//          19 parity hexbits, around a 42-bit sync sequence at 138-179
+//   LCCH   the TDMA control channel's signalling burst without sync (OECI): a 180-bit MAC PDU
+//          ending in a 12-bit color code and a CRC-16 (TIA-102.BBAD-A 2.1, 2.2.1), the same size
+//          as a SACCH's and taken here in its layout; it is not in the original TIA-102.BBAC
+//
+// The DUID. Four information bits in an (8,4,4) code, minimum distance 4 (TIA-102.BBAC 5.4; the
+// parity rows below are its generator matrix, 5.4.1): one error is corrected with certainty, two
+// leave candidates at an equal distance, among which the dibit confidences choose only when they
+// say clearly which. The original standard defines six values (4V, 2V, and SACCH and FACCH each
+// scrambled or not, 5.4.1); this code also takes 10 (DATCH, scrambled) and 13 (LCCH). A decode to
+// any other value, like a decode that fails, is P25P2_DUID_UNKNOWN.
+//
+// The ISCH. Nine information bits in a (40,9,16) code with a fixed offset added to every codeword,
+// so that a coset of the code is sent (TIA-102.BBAC 5.5: Isch_generator and Isch_offset are its
+// generator matrix and offset). It is decoded by comparing the received word with each candidate
+// codeword: only those whose channel field is the timeslot the I-ISCH stands before, and whose
+// ISCH location is not the reserved value, 96 of 512, so up to 7 errors are corrected. The table
+// is built on first use, once for all threads.
+//
+// AMBE+2 frames. Each 72-bit frame holds four vectors: u0 (12 bits) in c0, an extended Golay
+// (24,12) codeword; u1 (12) in c1, a Golay (23,12) codeword; u2 (11) and u3 (14) as they are.
+// The frame is sent column by column (ambe_bit(); the order of TIA-102.BBAC Annex E), which
+// spreads a run of bit errors over the vectors. c1 is masked by a sequence seeded from u0, so a
+// wrongly corrected u0 also shows as errors in c1. The errors found in c0 and c1 go with the
+// frame, for the vocoder.
+//
+// The encryption sync (TIA-102.BBAC 5.6.2). ALGID (8 bits), KID (16) and MI (72), 16 hexbits, in
+// a Reed-Solomon (44,16,29) code: the (63,35,29) mother code of rs63.c shortened by 19 symbols,
+// none punctured. A timeslot's voice bursts repeat four 4Vs then a 2V, counted from the start of
+// the transmission and so not tied to the superframe (TIA-102.BBAC 6.1). Each 4V carries four of
+// the information hexbits (ESS-B 1 to 4: the first has the ALGID and KID, the other three the MI,
+// Annex E), the 2V the 28 parity hexbits (ESS-A), so the ESS is decoded at the 2V from it and the
+// four 4Vs before (struct p25p2_ess_collector, matched by voice position where p25p2.c knows it,
+// else by arrival). A missing ESS-B is four erasures: with all present the code corrects 14
+// errors, with none (ESS-A alone) 6.
+//
+// Signalling. A MAC PDU is protected by a Reed-Solomon code made from the same mother code
+// (TIA-102.BBAC 5.6): shortened by taking its most significant information hexbits as zero, and
+// punctured by not sending its least significant parity hexbits, which are decoded as erasures.
+// The SACCH's code is (52,30,23), 5 shortened and 6 punctured (5.6.1.3), leaving 11 errors
+// correctable; the FACCH's is (45,26,20), 9 and 9 (5.6.1.2), leaving 9. When a decode fails, the
+// weakest received hexbits by dibit confidence are erased too, more each time, and it is tried
+// again. An erasure costs half what an unknown error does, so this gains when the weakest hexbits
+// are the wrong ones. The PDU's CRC decides: for SACCH and FACCH the CRC-12 that ends every MAC
+// PDU, generator x^12 + x^11 + x^7 + x^4 + x^2 + x + 1, sent inverted (TIA-102.BBAC 8.1, 8.4.5);
+// for LCCH a CRC-16 over the 164 bits before it (TIA-102.BBAD-A 2.2). An attempt whose
+// Reed-Solomon decode succeeds but whose CRC fails goes on to the next.
+
 // ---------------- DUID ----------------
 
 // Burst bits holding the DUID codeword, msb first, and the dibit each falls in
@@ -285,6 +345,8 @@ bool p25p2_ess_decode(struct p25p2_ess_collector *c,struct p25p2_ess *ess,uint8_
   memset(ess,0,sizeof *ess);
   ess->algid = P25_ALGID_CLEAR;
   // ESS-B k (1-4) is from the 4V k voice positions after the 2V before this one
+  // Without voice positions, the first four segments to arrive since the last 2V (or reset) are
+  // taken: after a missed 2V those are an earlier superframe's, whose MI may differ
   int b[4] = { -1, -1, -1, -1 };
   if(voice_index >= 0){
     for(int i=0; i < c->nseg; i++){
@@ -362,7 +424,7 @@ static int const Extra_erasures[] = { 4, 8, 12 };
 
 // Burst bit of bit k (0-5, msb first) of information hexbit j (INFO_1 = 0) or parity hexbit j
 // (PARITY_1 = 0); the hexbits fill the burst in order around the DUID (74-75, 244-245) and, in
-// a FACCH, the unused bits 138-179 (TIA-102.BBAC)
+// a FACCH, its 42-bit sync at 138-179 (TIA-102.BBAC 4.3)
 static int sacch_bit(bool parity,int j,int k){
   if(!parity)
     return j < 12 ? 2 + 6 * j + k : 76 + 6 * (j - 12) + k;

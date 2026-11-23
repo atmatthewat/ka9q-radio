@@ -19,7 +19,9 @@ enum {
 };
 
 // One burst, as delivered once per timeslot of every fragment while frame sync is held.
-// Valid only during the callback
+// Valid only during the callback. A scrambled burst may be delivered twice: first undecoded,
+// then with 'reparsed' set, if the scrambling parameters were set from a callback of its fragment
+// (see p25p2.c for the receiver, the TDMA structure and the scrambling)
 struct p25p2_burst {
   int timeslot;            // TDMA channel, 0 or 1
   int duid;                // enum p25p2_duid
@@ -94,6 +96,7 @@ void p25p2_dibit(struct p25p2 *p,struct softdibit const *sd);
 void p25p2_get_stats(struct p25p2 const *p,struct p25p2_stats *stats);
 // A known carrier offset, e.g. the control channel's when a voice channel is granted. With
 // 'hold' the offset is kept (not re-estimated) until frame sync gives its own
+// (or for 30 seconds without frame sync); once frame sync has given one, a held seed is ignored
 void p25p2_seed_frequency(struct p25p2 *p,float offset,bool hold);
 float p25p2_frequency_offset(struct p25p2 const *p); // Hz, estimated carrier offset
 
@@ -111,7 +114,7 @@ void p25p2_set_loop_bandwidths(struct p25p2 *p,float acquire,float track,float s
 void p25p2_set_matched_filter(struct p25p2 *p,bool enable); // false: no receive filter at all
 
 // The 12 scrambling segments of a superframe (320 bits each, DUID bits left clear) for these
-// parameters (TIA-102.BBAC): a 44-bit LFSR seeded with WACN << 24 | SYSID << 12 | NAC
+// parameters (TIA-102.BBAC 7.2.5): a 44-bit LFSR seeded with WACN << 24 | SYSID << 12 | NAC
 void p25p2_scrambling_sequence(uint8_t seq[P25P2_SUPERFRAME_SLOTS][P25P2_BURST_BITS],uint32_t wacn,
                                uint16_t sysid,uint16_t nac);
 #endif

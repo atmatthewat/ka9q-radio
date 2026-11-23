@@ -10,6 +10,111 @@
 #include "p25p1.h"
 #include "p25trunk.h"
 
+// Theory of operation
+//
+// The model. One site's calls, built from what its control channel broadcasts and what the voice
+// channels being received carry. Nothing here does I/O or keeps a clock (p25trunk.h). Every entry
+// point does the same three things: first the calls that have timed out end (begin(), expire());
+// then the message is taken in; then finish() reports what changed. A call started by a message
+// is reported only at the end, once the whole message has been taken in, so that its START has
+// every field the message gave and its follow decision is made on the call as it then stands.
+//
+// A call. One call on one voice channel: a frequency and, on a TDMA carrier, a timeslot (struct
+// key). A channel carries one call at a time, so the table holds at most one per channel
+// (find_call()). A call has its identity (type; talkgroup, or the called unit or subscriber; the
+// talker once known), its service options, its encryption as far as it is known, and its patch
+// if it is on a supergroup. Its id is a counter, unique while the struct p25_trunk lives, and is
+// how the caller keeps track of it. The comments below name the steps of its life: START, a
+// grant or update refreshing it, CONTINUE (each voice unit), and END.
+//
+// START (begin_call()). A grant or grant update for a channel with no call on it; voice on a
+// channel with no call, whose link control decodes and names one (late entry: the grant was
+// missed, or the voice is on a channel the caller was already receiving); or a header naming a
+// talkgroup other than the channel's call's (a header always starts a group call). A grant or
+// update naming the call already on the channel only refreshes it, and a grant naming another
+// talker there is a new talker in the same call. One naming another call ends the call on the
+// channel first (P25_TRUNK_END_NEW_CALL): the system has given the channel away. After a call the
+// caller received ends, the quiet time may keep an update from starting one (see begin_call()).
+//
+// Refreshes. A grant or grant update naming the call (last_grant); each voice unit
+// (last_activity); packet data, for a data call. A header, a terminator or a link control alone
+// is not activity: only the voice behind it is.
+//
+// END. A terminator (TDU, TDULC; a Phase 2 END PTT) once the call has had voice: one before any
+// voice belongs to the transmission before, which the system may still be ending on the channel
+// when the next grant comes. A grant, update or header naming another call on the channel. A link
+// control decoded without erasures naming another call: a terminator was missed, or the grant
+// was taken wrongly. Or P25_TRUNK_CALL_TIMEOUT (3 s) with neither voice nor a grant (expire()):
+// while a call goes on, the system keeps naming its channel in grant updates, so the call is held
+// through a fade or a few lost updates. An ended call is gone: the next call on its channel
+// starts from nothing (begin_call() clears the entry), so nothing of one call's encryption or
+// identity carries into the next.
+//
+// Phase 2. The caller gives a TDMA timeslot's signalling in Phase 1's terms (p25d.c): a MAC PTT
+// as a header, a MAC END PTT as a TDU, a voice channel user structure ahead of a voice burst as
+// an LDU1's link control, a 2V burst's ESS as an LDU2's encryption sync, and any other voice
+// burst as an LDU2 without one. Grants and updates in MAC structures come as the TSBKs they
+// abbreviate. So one set of rules serves both phases, and each timeslot is a channel of its own.
+//
+// Encryption. Three sources, in rising weight: the service options' encryption bit (in grants
+// and channel user link control), the encryption sync (LDU2, ESS) and the header (HDU, PTT). Any
+// ALGID but 0x80 counts as encrypted, 0x00 included; an all-zero Phase 1 encryption sync is
+// already given as 0x80 by its decoder (p25p1msg.c), so it is clear here. The header opens the
+// transmission and is Golay and Reed-Solomon protected, so it confirms the encryption
+// (c->confirmed), whatever it says. A sync confirms when it agrees with the service options or
+// repeats the sync before it (with no service options known, any sync agrees); one that
+// contradicts them waits (pending_ess) for a repeat, so a single miscorrected sync cannot turn
+// the label of a call whose service options are known either way (accept_sync()). Service options
+// that contradict a confirmation withdraw it (note_svc()), since a talker may key up encrypted in
+// a clear call, or the reverse; but one bit cannot make a call confirmed encrypted known clear:
+// it is marked contradicted and waits for a header or sync to say clear.
+//
+// Labels (voice_frames()). Each voice unit is labelled for the caller CLEAR, ENCRYPTED, or HOLD
+// where the encryption is not known well enough to say: not confirmed, and the service options
+// say encrypted or are not known, or a protected link control was seen, or a confirmation was
+// contradicted. The caller keeps held units until a RELEASE says what they were (release()):
+// when a header or sync confirms, when the service options say clear and nothing confirmed says
+// otherwise, when another talker keys up, when the call ends, or after P25_TRUNK_HOLD_UNITS
+// units, by what is known then (encrypted if the service options say so or a confirmation was
+// contradicted; otherwise clear, even with the service options not known). Holding costs only
+// delay, while a unit wrongly labelled clear would be decoded as speech, so doubt holds. On
+// Phase 1 four units are two LDU2s, two chances at an encryption sync; on Phase 2, where a 2V
+// comes after every four 4V bursts, four bursts may hold none. This label is one of two gates:
+// the voice output (p25audio.c) decodes a transmission only once its own header or sync has said
+// unencrypted, and holds units itself until then, so a unit labelled clear here on the service
+// options alone is still not decoded before that. A new talker does not withdraw a confirmation
+// here; the voice output starts a new transmission for one, which waits for its own word.
+//
+// Who the call is (voice_ldu1()). A link control that needed erasures to decode may name a wrong
+// talkgroup or unit and still pass its Reed-Solomon code, so only one decoded without erasures
+// may end the call or name a new talker. Even then a link control does not replace the grant's
+// talkgroup in a call it names (through a patch, say): the grant came through a CRC. A group
+// link control naming talkgroup 0 or 0xff00 and up (taken here as no one and as supergroups)
+// never ends a call.
+//
+// Patches. See the section below: the calls of a supergroup carry its members' talkgroups, and
+// the allow list is matched against all of them.
+//
+// Site and control channel. RFSS, network and adjacent site status, secondary control channels
+// and the band plan are kept as broadcast; a grant is turned into a frequency through the band
+// plan, so one on a band not yet announced is only logged. Control is up once a message only a
+// control channel sends arrives, and lost after P25_TRUNK_CONTROL_LOSS (15 s) without one
+// (p25_trunk_tick()), or at once when an LDU1 or TDULC is heard on the control channel's
+// frequency: control has moved, and that frequency is now a voice channel.
+//
+// Following (decide()). Made again for every call at the end of every entry point, so it tracks
+// the call as it changes: the talkgroup lists, private calls, encryption (the service options'
+// bit or a confirmed encryption), the limit on calls followed at once. A call already followed is
+// not dropped for the limit, so a later call cannot take the channel from one under way. Unless
+// encrypted calls are followed, a followed call that turns encrypted is no longer followed, and
+// one that turns clear again is followed again; the caller hears of either as a CALL_UPDATE.
+//
+// Events. CALL_START when a call starts, followed or not (with F_FOLLOW if it should be
+// received); CALL_UPDATE when the attributes reported or the decision change (signature()), when
+// a grant refreshes the call (F_GRANT), and when held units are released (F_RELEASE);
+// CALL_TALKER when the talker becomes known or changes; CALL_END with its reason. SITE, CONTROL,
+// PATCH and OTHER are for the log.
+
 #define ALG_UNKNOWN 0x00   // ALGID not known yet (a grant said encrypted)
 #define ALG_CLEAR 0x80     // ALGID of an unencrypted call
 #define FAR_PAST INT64_MIN
@@ -183,7 +288,9 @@ static int followed_count(struct p25_trunk const *t, struct call const *except){
   return n;
 }
 
-// The caller's policy for one call
+// The caller's policy for one call. Only a call not yet followed is held to the limit, so one
+// under way keeps its place. The allow list is matched against any talkgroup of a patched call,
+// the deny list only against the call's own
 static enum p25_trunk_why decide(struct p25_trunk const *t, struct call const *c){
   struct p25_trunk_config const *cf = &t->config;
   if(c->type == P25_TRUNK_GROUP){
@@ -356,6 +463,19 @@ static void other(struct p25_trunk *t, char const *fmt, ...){
 // A Motorola supergroup (group regroup) or L3Harris regroup carries the calls of its member
 // talkgroups. Members are listed by regroup add commands (TSBK, link control) and leave by
 // deletes; grants and voice name the supergroup.
+//
+// What a patch does for a call. A call on a supergroup is marked patched (mark_patched()) and
+// takes a snapshot of the patch's talkgroups, the supergroup among them (files[]): the allow list
+// is matched against all of them (decide()), a grant or link control naming any of them names
+// the same call (same_call()), and they are reported with the call and in its voice labels. The
+// snapshot is taken again only while the members are not yet known.
+//
+// Lifetimes. A talkgroup joins once adds have named it twice within P25_TRUNK_MEMBER_CONFIRM
+// (30 s; patch_add()). A member leaves when a delete names it, or when adds that go on naming the
+// patch have not named it for P25_TRUNK_MEMBER_STALE (300 s; patch_prune()); a patch that is no
+// longer announced at all keeps its members. The whole patch is over on a delete naming no
+// member or leaving it with none, or after P25_TRUNK_PATCH_FRESH (30 s) with neither a grant
+// nor an add for it (control_activity(), so only while control channel broadcasts arrive).
 
 static struct patch *patch_find(struct p25_trunk *t, uint16_t sg){
   for(int i = 0; i < P25_TRUNK_MAX_PATCHES; i++)
@@ -674,6 +794,8 @@ static void mark_harris(struct p25_trunk *t, struct call *c){
 }
 
 // ---- Calls ----
+// A call's life is described at the top of the file. Calls are found by channel (frequency and
+// timeslot: find_call()) and recognised by type, talkgroup and unit (same_call()).
 
 static struct call *find_call(struct p25_trunk *t, uint64_t freq, int slot){
   for(int i = 0; i < P25_TRUNK_MAX_CALLS; i++)
@@ -1025,6 +1147,10 @@ static void expire(struct p25_trunk *t){
 }
 
 // ---- Site and control channel ----
+// What the site broadcasts is kept as broadcast, and reported (SITE, CONTROL) when it is new or
+// changes. Frequencies come from the band plan: this site's RFSS status heard before its band's
+// identifier update is reported again once the band is known, a secondary control channel is
+// recorded only then, and an adjacent site's is reported without a frequency.
 
 static uint64_t chan_hz(struct p25_trunk *t, struct p25_chan ch){
   uint64_t dl = 0;
@@ -1244,6 +1370,11 @@ void delete_p25_trunk(struct p25_trunk *t){
   free(t);
 }
 
+// Each entry point sets the time, ends the calls that have timed out (begin()), takes its message
+// in, then reports (finish()). A voice data unit comes in two calls (p25trunk.h): its word, kept
+// as pending, then the unit, which takes the word only if it came from the same channel and is
+// the kind that unit carries (an LDU1's or TDULC's link control, an LDU2's sync, a header's);
+// any other pending word is dropped, so a word is never taken for another unit's
 static void begin(struct p25_trunk *t, int64_t now){
   t->now = now;
   t->site.last_message = now;
@@ -1259,7 +1390,10 @@ static void control_msg(struct p25_trunk *t, struct p25_msg const *m, uint16_t n
   if(lcch)
     control_activity(t); // an LCCH is only ever sent on a control channel
   else if(m->family == P25_FAMILY_TSBK){
-    // These opcodes are sent only by a control channel (any manufacturer's table)
+    // These opcodes are sent only by a control channel (any manufacturer's table): standard 0x00
+    // and 0x02 group voice grant and grant update, 0x38 system service, 0x3a to 0x3d RFSS,
+    // network and adjacent status and identifier update; Motorola 0x00 and 0x02 are regroup add
+    // and supergroup grant
     switch(m->opcode){
     case 0x00: case 0x02: case 0x38: case 0x3a: case 0x3b: case 0x3c: case 0x3d:
       control_activity(t);

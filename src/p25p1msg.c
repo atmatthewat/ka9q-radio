@@ -7,6 +7,42 @@
 #include "p25msg.h"
 #include "p25p1msg.h"
 
+// Theory of operation
+//
+// What arrives. Each decoder takes a payload p25p1unit.c has already error corrected and, where
+// the payload has one, checked by its CRC; nothing here checks anything. Each zeroes the
+// message, sets the family, takes the opcode and MFID, keeps the first octets raw for the log,
+// chooses the kind from the opcode table of that MFID, and reads that kind's fields by bit
+// position. Positions count from the most significant bit of octet 0, as the standards number
+// them, and field() reads any run of up to 32 bits.
+//
+// Trunking signalling blocks. A TSBK is 12 octets: last block flag, protected flag and 6-bit
+// opcode, the MFID, eight octets of arguments and the CRC-16. A trunking data unit carries one
+// to three; each is decoded on its own, and last_block is passed on. The protected flag is
+// reported, but the fields are read as for a clear block. Many opcodes share a layout: two
+// grant updates in one block (two_grants()), the response layout (response()), and the three
+// identifier update layouts.
+//
+// Link control. The 72-bit word of an LDU1 or a TDULC: protected flag, standard format flag
+// and opcode, then the MFID in octet 1 unless the standard format flag says the MFID is
+// implicit. A protected word is encrypted past those, so only they are read.
+// Where link control carries a message a TSBK also carries (grant updates, status and site
+// broadcasts) it gets the TSBK's kind, in link control's own layout, so the call tracking acts
+// on it the same way; what only link control carries (the voice channel user, which says who
+// holds the channel now, and call termination) has its own P25_LC_ kinds.
+//
+// Packet data. Every packet starts with a 12-octet header whose format field says what follows.
+// An alternate multi-block trunking control (AMBTC, format 0x17) on the trunking SAP is a
+// trunking message too long for one TSBK, its fields spread over the header and the first data
+// block, decoded here into the same kinds as the TSBK forms. Confirmed and unconfirmed data
+// on the trunking SAPs (UMBTC) is logged from the header only. Other data is counted (user
+// octets, with pad and CRC-32 removed) and, for SNDCP context control, its first octets
+// decoded. A response packet gives its class, type and status as one octet.
+//
+// Voice headers. The HDU and an LDU2's encryption sync carry the message indicator, the
+// algorithm and the key ID. Only the all-zero encryption sync is excused (p25_decode_es());
+// an ALGID of 0x00 anywhere else is an algorithm, and so encrypted.
+
 // Bits [off, off+len) of an MSB-first octet string, len <= 32
 static uint32_t field(uint8_t const *p, int off, int len){
   uint32_t v = 0;
@@ -48,6 +84,8 @@ static void iden_13bit(struct p25_msg *msg, uint8_t const *p){
   msg->base_hz = (uint64_t)field(p, 48, 32) * 5;
 }
 // TDMA channel types: slots per channel and bandwidth
+// Types 0-2 are FDMA, 3-5 TDMA (iden_tdma() below); a type not listed reads as one slot with
+// no bandwidth, and is not TDMA
 static const struct { uint8_t slots; uint16_t bw; } Tdma_type[16] = {
   [0] = { 1, 12500 }, [1] = { 1, 12500 }, [2] = { 1, 6250 }, [3] = { 2, 12500 },
   [4] = { 4, 25000 }, [5] = { 2, 12500 },
@@ -83,6 +121,9 @@ static void response(struct p25_msg *msg, uint8_t const *p){
   msg->tgt = field(p, 56, 24);
 }
 
+// The standard opcodes (both standard MFIDs). Bit positions are the TSBK's, opcode at 2 and
+// arguments from 16. Opcodes that are only named (data announcements, the data paging request,
+// authentication, roaming address update, the uncoordinated adjacent status) are logged raw
 static void tsbk_standard(struct p25_msg *msg, uint8_t const *p){
   switch(msg->opcode){
   case 0x00:
@@ -385,6 +426,9 @@ static void cwid(char *out, uint8_t const *p){
   out[n] = '\0';
 }
 
+// Motorola's opcodes (MFID 0x90): regroups (patches and supergroups) and their grants,
+// responses, alarms and site information. The layouts follow the standard ones where
+// Motorola's message has a standard counterpart (the grant, the grant update, the responses)
 static void tsbk_motorola(struct p25_msg *msg, uint8_t const *p){
   switch(msg->opcode){
   case 0x00:
@@ -839,6 +883,8 @@ static void sndcp_control(struct p25_msg *msg, uint8_t const *d, int n){
 
 // Alternate multi-block trunking control (TIA-102.AABC): opcode 58-63 and service options
 // 64-71 of the header; LLID is the source (or the unit); data block 0 from octet 12
+// Only the opcodes below (standard, and Motorola's group regroup grant) are decoded; another
+// keeps family MBT, kind P25_UNKNOWN, and is logged with its header
 static void mbt(struct p25_msg *msg, uint8_t const *h){
   uint8_t const *b0 = h + 12;
   msg->opcode = field(h, 58, 6);
@@ -910,6 +956,8 @@ static void mbt(struct p25_msg *msg, uint8_t const *h){
   }
 }
 
+// The header first, whatever the format; then by format. An AMBTC is decoded only on the
+// trunking SAP and with its first data block present (len 24 or more)
 int p25_decode_pdu(struct p25_msg *msg, uint8_t const *pdu, int len){
   memset(msg, 0, sizeof *msg);
   if(pdu == NULL || len < 12)
