@@ -124,7 +124,7 @@ endif
 
 CFLAGS += $(DOPTS) $(ARCHOPTS) $(COPTS) $(INCLUDES)
 
-DAEMONS = aprs aprsfeed cwd p25d packetd radiod wait-for-lan
+DAEMONS = aprs aprsfeed cwd dmrd p25d packetd radiod wait-for-lan
 EXECS = ctcss control fft-gen jt-decoded metadump monitor opussend pcmrecord pcmsend powers tune wd-record
 
 ## library elements
