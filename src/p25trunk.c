@@ -1381,15 +1381,20 @@ static void begin(struct p25_trunk *t, int64_t now){
   expire(t);
 }
 
-static void control_msg(struct p25_trunk *t, struct p25_msg const *m, uint16_t nac, int64_t now, bool lcch){
+// Where a trunking message was heard: the control channel (Phase 1 blocks), an LCCH, or a voice
+// channel. One heard on a voice channel is acted on like any other (a grant is a grant), but
+// it says nothing about whether the control channel is being received
+enum heard { ON_CONTROL, ON_LCCH, ON_VOICE };
+
+static void control_msg(struct p25_trunk *t, struct p25_msg const *m, uint16_t nac, int64_t now, enum heard heard){
   if(t == NULL || m == NULL)
     return;
   if(t->config.nac != 0 && nac != t->config.nac)
     return; // another system's
   begin(t, now);
-  if(lcch)
+  if(heard == ON_LCCH)
     control_activity(t); // an LCCH is only ever sent on a control channel
-  else if(m->family == P25_FAMILY_TSBK){
+  else if(heard == ON_CONTROL && m->family == P25_FAMILY_TSBK){
     // These opcodes are sent only by a control channel (any manufacturer's table): standard 0x00
     // and 0x02 group voice grant and grant update, 0x38 system service, 0x3a to 0x3d RFSS,
     // network and adjacent status and identifier update; Motorola 0x00 and 0x02 are regroup add
@@ -1405,7 +1410,9 @@ static void control_msg(struct p25_trunk *t, struct p25_msg const *m, uint16_t n
   bool const mbt = m->family == P25_FAMILY_MBT;
   // MAC structures: the same messages, read as the TSBKs they abbreviate (those that carry service
   // options do so in both forms). A voice channel's are not control channel activity; an LCCH's are
-  if(m->family != P25_FAMILY_TSBK && !mbt && m->family != P25_FAMILY_MAC){
+  // A protected block is encrypted past its opcode and manufacturer: it shows the control channel
+  // is there (above) and its fields mean nothing
+  if((m->family != P25_FAMILY_TSBK && !mbt && m->family != P25_FAMILY_MAC) || m->protect){
     finish(t);
     return;
   }
@@ -1507,11 +1514,11 @@ static void control_msg(struct p25_trunk *t, struct p25_msg const *m, uint16_t n
 }
 
 void p25_trunk_control(struct p25_trunk *t, struct p25_msg const *m, uint16_t nac, int64_t now){
-  control_msg(t, m, nac, now, false);
+  control_msg(t, m, nac, now, ON_CONTROL);
 }
 
 void p25_trunk_lcch(struct p25_trunk *t, struct p25_msg const *m, uint16_t nac, int64_t now){
-  control_msg(t, m, nac, now, true);
+  control_msg(t, m, nac, now, ON_LCCH);
 }
 
 // Link control (LDU1 or TDULC) about the site, patches and alarms, not this channel's call
@@ -1789,7 +1796,7 @@ void p25_trunk_voice_word(struct p25_trunk *t, uint64_t freq_hz, int slot, struc
   if(t == NULL || msg == NULL)
     return;
   if(msg->family == P25_FAMILY_TSBK || msg->family == P25_FAMILY_MBT){
-    p25_trunk_control(t, msg, t->config.nac, now);
+    control_msg(t, msg, t->config.nac, now, ON_VOICE); // the caller has checked the unit's NAC
     return;
   }
   t->pending = true;
