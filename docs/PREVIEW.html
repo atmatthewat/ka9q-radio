@@ -1798,21 +1798,21 @@ journalctl -u radiod@hf -f</pre>
   <dd>Keep a voice channel, and its receiver, this long after the last call on
       it ends, so that a call granted there again finds it running. Default 30;
       fractions are allowed; 0 releases the channel as soon as its last call
-      ends. The clock starts at the end of the last call on the channel; for 3 s
-      after a call it followed (or the hang time, if shorter) a grant update
-      naming the same call there starts no new call, while a grant, voice, or an
-      update naming another talkgroup does: a reply announced only by updates is
-      followed from its own voice. The default comes from a survey of four
-      trunked sites: 3 s catches every deliberate reuse (systems' own hang and
-      replies) and saves about half of all channel requests for the least load;
-      30 s saves 64 to 84% on busy systems for two to three idle receivers per
-      site on average, the peak being bounded by the site's voice carriers.
-      Quiet systems gain nothing past 3 s. A Phase 2 channel is kept only when
-      neither timeslot has a call. -m counts calls, not kept channels; there is
-      at most one kept channel per voice frequency granted in the hang time, and
-      at most 64 voice channels per control channel in all. Kept channels are
-      released at once when p25d exits or the control channel goes away. With
-      -v, keeping, reusing and releasing a channel are logged.</dd>
+      ends; at most 86400. The clock starts at the end of the last call on the
+      channel; for 3 s after a call it followed (or the hang time, if shorter) a
+      grant update naming the same call there starts no new call, while a grant,
+      voice, or an update naming another talkgroup does: a reply announced only
+      by updates is followed from its own voice. The default comes from a survey
+      of four trunked sites: 3 s catches every deliberate reuse (systems' own
+      hang and replies) and saves about half of all channel requests for the
+      least load; 30 s saves 64 to 84% on busy systems for two to three idle
+      receivers per site on average, the peak being bounded by the site's voice
+      carriers. Quiet systems gain nothing past 3 s. A Phase 2 channel is kept
+      only when neither timeslot has a call. -m counts calls, not kept channels;
+      there is at most one kept channel per voice frequency granted in the hang
+      time, and at most 64 voice channels per control channel in all. Kept
+      channels are released at once when p25d exits or the control channel goes
+      away. With -v, keeping, reusing and releasing a channel are logged.</dd>
   <dt id="S"><a class="permalink" href="#S"><b>-S ssrc, --ssrc ssrc</b></a></dt>
   <dd>Decode only this channel. Turns call following off.</dd>
   <dt id="o"><a class="permalink" href="#o"><b>-o source, --source
@@ -1869,8 +1869,21 @@ freq = &quot;857m98125&quot;</pre>
     that a Phase 2 voice channel is always asked for at 24 kHz, and a Phase 1
     voice channel granted on a Phase 2 control channel at 19.2 kHz. They need no
     configuration, except that radiod builds them from its [global] section: see
-    NOTES. A voice channel is released when the hang time (-H) after its last
-    call has passed, or at once when p25d exits.</p>
+    NOTES. A voice channel is asked for with a lifetime of 5 seconds, so one
+    p25d stops asking for goes away by itself. While a call uses it, and while
+    it is kept after one, p25d refreshes it every half second (a command goes to
+    radiod only when a third of the lifetime has passed). It is released when
+    the hang time (-H) after its last call has passed, or at once when p25d
+    exits; no release is sent for a channel whose lifetime has already run out.
+    A trunking block heard on a voice channel is acted on but is not taken as a
+    sign that the control channel is being received; a protected block's fields
+    are not used; a multi-block trunking packet whose data blocks fail their CRC
+    is ignored.</p>
+<p class="Pp">p25d knows a channel by its SSRC and the address and port it comes
+    from, and ties a voice channel to its control channel by the radiod command
+    address both name in their status. When two systems served by one radiod use
+    the same voice frequency, the channel belongs to the site that asked for it
+    last.</p>
 </section>
 <section class="Sh">
 <h1 class="Sh" id="INPUT_AND_OUTPUT"><a class="permalink" href="#INPUT_AND_OUTPUT">INPUT
@@ -1881,9 +1894,19 @@ freq = &quot;857m98125&quot;</pre>
 <p class="Pp">The voice stream (-R) is 8 kHz mono 16-bit audio, one RTP packet
     per 20 ms, with status packets as radiod sends them. A trunked group call's
     stream has the talkgroup number as its SSRC; any other call, and a
-    conventional channel, uses the voice channel's SSRC. The frame stream (-F)
-    has the same SSRC, timestamps and marker bits, one packet per vocoder
-  frame.</p>
+    conventional channel, uses the voice channel's SSRC (on timeslot 1 of a
+    Phase 2 channel, that plus one). The frame stream (-F) has the same SSRC,
+    timestamps and marker bits, one packet per vocoder frame.</p>
+<p class="Pp">The status of both streams carries the voice frequency, a
+    description such as &quot;P25 TG 2501 src 1118028 &quot;ENGINE 5&quot; NAC
+    443&quot; (a unit call says &quot;P25 unit&quot;, a telephone interconnect
+    call &quot;P25 telephone&quot; and the radio in it), and radiod's signal
+    power, noise density and filter edges for the voice channel. pcmrecord puts
+    the description in its messages, in each file's attributes and in the $d of
+    an --exec command. monitor shows the stream's SSRC (for a group call, the
+    talkgroup), the frequency and, from the signal figures, the carrier's SNR;
+    it does not show the description, so it shows neither talker nor alias. The
+    SNR measures the radio signal, not the decoding.</p>
 <p class="Pp">Encrypted voice is not decoded: a transmission's voice is decoded
     only after a header or encryption sync of that transmission has said it is
     unencrypted, and on a trunked channel only when the call tracking agrees.
@@ -1893,10 +1916,24 @@ freq = &quot;857m98125&quot;</pre>
     during the fade can be decoded before its own encryption sync stops it.</p>
 </section>
 <section class="Sh">
+<h1 class="Sh" id="SIGNALS"><a class="permalink" href="#SIGNALS">SIGNALS</a></h1>
+<p class="Pp">SIGUSR1 increases verbosity; SIGUSR2 decreases it, as in radiod.
+    SIGINT, SIGTERM and SIGQUIT stop p25d, and its voice channels are
+  released.</p>
+</section>
+<section class="Sh">
 <h1 class="Sh" id="NOTES"><a class="permalink" href="#NOTES">NOTES</a></h1>
 <dl class="Bl-tag">
-  <dt id="The"><a class="permalink" href="#The"><b>The vocoder is not a complete
-    one.</b></a></dt>
+  <dt id="What"><a class="permalink" href="#What"><b>What has been
+    tested.</b></a></dt>
+  <dd>Phase 1 was tested on the air on a VHF L3Harris linear simulcast trunked
+      system at a weak signal, with only the control channel configured in
+      radiod. Phase 2 has not been tested on the air: Phase 2 voice and the
+      Phase 2 control channel have been tested only from a recording of a real
+      Phase 2 voice channel and from generated signals, both through a real
+      radiod.</dd>
+  <dt id="The"><a class="permalink" href="#The"><b>The vocoder is optional, and
+    not a complete one.</b></a></dt>
   <dd>Speech decoding uses mbelib, which is optional when p25d is built. mbelib
       decodes the vocoder parameters, enhances the spectral amplitudes and
       synthesises voiced speech as the standards describe, but it takes
@@ -1909,7 +1946,18 @@ freq = &quot;857m98125&quot;</pre>
       vocoder is called through a small interface, so a complete implementation
       can take its place, and -F gives the frames to a vocoder of your own.
       mbelib's README says it is for educational purposes only and that the
-      algorithms may be covered by patents.</dd>
+      algorithms may be covered by patents, so packagers may prefer to build
+      without it.</dd>
+  <dt id="At"><a class="permalink" href="#At"><b>At a weak signal a damaged word
+    can pass its error correction.</b></a></dt>
+  <dd>On the air about 0.7% of the encryption syncs that decoded carried values
+      the system never sends; a few of those, and two voice headers, said
+      unencrypted. The Reed-Solomon stage accepts whatever it can complete,
+      erasures included, as the codes allow. The effects are a wrong line in the
+      log, now and then a call record with no voice, and a moment of an
+      encrypted transmission decoded as noise, or of a clear one held back,
+      until the next sync. This is left so on purpose, to keep the rule simple
+      and the decoder as sensitive as the codes permit.</dd>
   <dt id="More"><a class="permalink" href="#More"><b>More than one
     system.</b></a></dt>
   <dd>A trunked group call's stream has the talkgroup number as its SSRC, and
@@ -1928,6 +1976,12 @@ freq = &quot;857m98125&quot;</pre>
       &quot;ttl = 0&quot; a p25d on another host sees the control channel but
       none of the voice channels. p25d's own voice and frame output has TTL 0
       unless -T says otherwise.</dd>
+  <dt id="A~2"><a class="permalink" href="#A~2"><b>A radiod defect this runs
+    into.</b></a></dt>
+  <dd>A channel created by a command that also changes its sample rate from the
+      template's sends its first packets with the template's payload type. p25d
+      does not decode those packets, and asks radiod to correct the payload
+      type; decoding is not affected.</dd>
 </dl>
 </section>
 <section class="Sh">
