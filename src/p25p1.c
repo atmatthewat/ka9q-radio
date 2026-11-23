@@ -48,7 +48,8 @@
 // first 24 with the pattern's: the sum of cos(received - ideal), 24 for a perfect match, and
 // independent of amplitude. A window is accepted only when its NID also decodes:
 // a strong correlation (above 17) sets the channel's NAC, a weak one (above 10) is taken only
-// for that NAC, once a strong one has set it. Where the NID of a data unit following the last
+// for that NAC, once a strong one has set it or the NAC was given (p25p1_seed_nac(): a voice
+// channel granted on a control channel). Where the NID of a data unit following the last
 // one directly would end, a NID decoding to that NAC is taken whatever the correlation. The
 // correlator keeps running while a data unit is assembled, and a sync whose NID decodes there
 // ends the unit in progress.
@@ -245,6 +246,7 @@ struct p25p1 {
   int trailing;              // status symbols still to skip after the data unit
   int searched;              // dibits since the last sync, while searching
   uint16_t nac;
+  bool nac_set;              // nac is the channel's: set by a strong sync, or given
   bool frame_weak,frame_recovered;
   float frame_correlation;
   int tsbk_block;
@@ -458,9 +460,10 @@ static bool evaluate_window(struct p25p1 *p,bool is_searching){
   if(corr > Strong_sync){
     p->stats.syncs++;
     p->nac = (uint16_t)nac;
-  } else if((corr > Weak_sync || (expected && !recovered)) && p->stats.syncs != 0 && nac == p->nac){
-    // p->nac means something only once a strong sync has set it: before that it is 0, which
-    // would let a weak sync whose NID decodes to NAC 0 through
+    p->nac_set = true;
+  } else if((corr > Weak_sync || (expected && !recovered)) && p->nac_set && nac == p->nac){
+    // p->nac means something only once a strong sync has set it or it was given: before that
+    // it is 0, which would let a weak sync whose NID decodes to NAC 0 through
     p->stats.weak_syncs++;
     weak = true;
   } else
@@ -498,11 +501,11 @@ static bool evaluate_window(struct p25p1 *p,bool is_searching){
 }
 // While searching: offer a window (oldest first), e.g. the span just evaluated sampled at other
 // timing, in place of the sync window just evaluated. It must be at least a weak sync whose NID
-// decodes plainly to the channel's NAC, established by a strong sync of its own: a timing search
+// decodes plainly to the channel's NAC, established by a strong sync or given: a timing search
 // maximizes the correlation over many timings, so on noise it reaches the strong threshold far
 // more often than one window does. If it is taken, a data unit starts with the next dibit
 static bool evaluate_replacement(struct p25p1 *p,struct softdibit const *window){
-  if(!searching(p) || p->stats.syncs == 0)
+  if(!searching(p) || !p->nac_set)
     return false;
   struct wdibit w[WINDOW];
   for(int i=0; i < WINDOW; i++){
@@ -983,6 +986,14 @@ void p25p1_set_rxfilter(struct p25p1 *p,enum p25_rxfilter mode){
 }
 void p25p1_seed_frequency(struct p25p1 *p,float offset){
   seed_freqtrack(&p->afc,offset);
+}
+// A transmission's header is the first thing on its carrier, and its frame sync is over before
+// the loops have pulled in from the noise before it (on a clean signal its correlation never
+// reached 17 in 100 trials). With the NAC known, it passes as a weak sync or through the timing
+// search, as it does on a channel that has already decoded something
+void p25p1_seed_nac(struct p25p1 *p,uint16_t nac){
+  p->nac = nac & 0xfff;
+  p->nac_set = true;
 }
 float p25p1_frequency_offset(struct p25p1 const *p){
   return p->afc.estimate;

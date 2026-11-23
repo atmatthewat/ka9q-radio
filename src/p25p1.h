@@ -97,6 +97,9 @@ void p25p1_dibit(struct p25p1 *p,struct softdibit const *sd);
 void p25p1_get_stats(struct p25p1 const *p,struct p25p1_stats *stats);
 // A known carrier offset, e.g. the control channel's when a voice channel is granted
 void p25p1_seed_frequency(struct p25p1 *p,float offset);
+// A known NAC, e.g. the control channel's when a voice channel is granted: weak frame syncs and
+// the timing search may take it before a strong sync of the channel's own has set it
+void p25p1_seed_nac(struct p25p1 *p,uint16_t nac);
 // Options, mainly for measurement; the defaults are what a decoder should use
 void p25p1_set_decision_directed(struct p25p1 *p,bool enable); // frequency from decided symbols while locked
 void p25p1_set_crc_correction(struct p25p1 *p,bool enable);    // single-bit correction of trunking blocks

@@ -161,6 +161,7 @@ struct decoder {
   uint32_t call_id;        // voice: call of the last voice unit
   bool seed;               // voice: seed the receiver's frequency with seed_hz when it is created
   float seed_hz;
+  uint16_t voice_nac;      // voice: the site's NAC, given to the Phase 1 receiver as the channel's
   struct p25_alias alias;  // talker aliases from link control
   struct work *work;       // to act on after a site's lock is let go
   uint16_t site_nac;       // control: NAC of the last trunking message
@@ -1153,6 +1154,10 @@ static void *decode_task(void *arg){
 	  // is off by about what the control channel's is
 	  if(dec.voice && dec.seed)
 	    p25p1_seed_frequency(dec.p25,dec.seed_hz);
+	  // and with the site's NAC, so the first transmission's header need not have a strong
+	  // frame sync: it comes before the loops have pulled in from the noise
+	  if(dec.voice)
+	    p25p1_seed_nac(dec.p25,dec.voice_nac);
 	}
       }
       p25_bandplan_init(&dec.plan);
@@ -2153,6 +2158,7 @@ static bool link_voice(struct decoder *dp){
       dp->trunk_freq = vc->freq_hz;
       dp->seed = vc->seed;
       dp->seed_hz = vc->seed_hz;
+      dp->voice_nac = site->nac;
       dp->rx = vc->tdma ? RX_PHASE2 : RX_PHASE1;
     }
     pthread_mutex_unlock(&site->lock);
