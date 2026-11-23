@@ -349,7 +349,7 @@ struct vchan {
   bool seed;                 // the control channel's carrier offset, for that receiver
   float seed_hz;
   int64_t kept;              // site time its last call ended; 0 while a call needs it
-  int64_t refreshed;         // site time it was last kept alive while kept
+  int64_t refreshed;         // site time hang_tick() last asked for it to be kept alive
   bool said;                 // the "kept" line is out (-v)
   bool ended[2];             // a call on it (timeslot 0 or 1; FDMA 0) ended while the channel
 			     // stays: its thread ends the voice output's call before the next unit
@@ -1587,7 +1587,8 @@ static void status_line(struct decoder const *dp){
 // (the grant's: radiod's status may report it rounded) and the carrier offset to seed it with. The
 // request (ask_channel(), chanctl_request()) is in the control channel's form (call_format())
 // with a Lifetime, so a channel p25d no longer asks for goes away by itself; grant updates ask
-// again and voice refreshes it, both cheap since chanctl sends only when one is due. link_voice()
+// again, voice refreshes it and so does hang_tick() every half second, all cheap since chanctl
+// sends only when one is due. link_voice()
 // is tried on every block of every channel that is neither control nor voice channel yet, since
 // any of them may be granted at any time; one already running when it is granted starts afresh
 // with the receiver its grant needs (decode_task()).
@@ -1598,7 +1599,7 @@ static void status_line(struct decoder const *dp){
 // the voice frequency (want_channel(), ask_channel()); radiod starts sending its I/Q, and a decode
 // thread starts for it like any other stream and finds its entry (struct vchan, link_voice()).
 // While any call needs it (both timeslots of a Phase 2 carrier share it) it is kept alive by
-// grant updates and voice. When the last call on it ends it is not released but kept (let_go()),
+// grant updates, voice and hang_tick(). When the last call on it ends it is not released but kept (let_go()),
 // still asked for and its receiver still running, for the hang time (-H). A call granted there,
 // or voice heard there, in that time uses it as it is; with none, hang_tick() releases it as a
 // channel used to be released at once.
@@ -1839,28 +1840,38 @@ static struct vchan *new_vchan(struct decoder *dp,int *nwork,struct site *site){
   return oldest;
 }
 
-// Once per control channel block: each voice channel kept after its last call is kept alive, and
-// let go when the hang time has passed with no call on it. Under the site's lock
+// Once per control channel block: every voice channel, in use or kept after its last call, is
+// kept alive, and a kept one is let go when the hang time has passed with no call on it. Under
+// the site's lock
 static void hang_tick(struct decoder *dp,int *nwork,struct site *site){
   int64_t const hang = llrint(Hangtime * BILLION);
   for(int i=0; i < MAX_VCHANS; i++){
     struct vchan * const vc = &site->vchans[i];
-    if(!vc->used || vc->kept == 0)
+    if(!vc->used)
       continue;
-    if(Verbose && !vc->said){
-      // Said here, a block after it was kept, not in let_go(): a channel granted to the next call
-      // in the same batch of events (a grant naming another call ends the last) gets no line
-      add_log(dp,nwork,vc->kept,"NAC %03x voice channel %.6lf MHz ssrc %u kept for %g s",site->nac,vc->freq_hz * 1e-6,vc->ssrc,Hangtime);
-      vc->said = true;
+    if(vc->kept != 0){
+      if(Verbose && !vc->said){
+	// Said here, a block after it was kept, not in let_go(): a channel granted to the next call
+	// in the same batch of events (a grant naming another call ends the last) gets no line
+	add_log(dp,nwork,vc->kept,"NAC %03x voice channel %.6lf MHz ssrc %u kept for %g s",site->nac,vc->freq_hz * 1e-6,vc->ssrc,Hangtime);
+	vc->said = true;
+      }
+      if(site->now - vc->kept >= hang){
+	char why[64];
+	snprintf(why,sizeof why,"no call for %g s",Hangtime);
+	drop_vchan(dp,nwork,site,vc,why);
+	continue;
+      }
     }
-    if(site->now - vc->kept >= hang){
-      char why[64];
-      snprintf(why,sizeof why,"no call for %g s",Hangtime);
-      drop_vchan(dp,nwork,site,vc,why);
-    } else if(site->now - vc->refreshed >= BILLION / 2){
-      // Nothing else keeps it alive now (no grants, no voice): radiod lets a channel go a Lifetime
-      // after the last request. Every half second is often enough to be well inside that and
-      // cheap: chanctl sends a keepalive only when one is due (a third of the Lifetime)
+    if(site->now - vc->refreshed >= BILLION / 2){
+      // radiod lets a channel go a Lifetime after the last request. A kept channel has nothing
+      // else to keep it alive (no grants, no voice). A channel in use has grant updates and voice,
+      // but not at its end: the call is ended P25_TRUNK_CALL_TIMEOUT after its last update, and
+      // chanctl sends for an update only when a third of the Lifetime has passed since it last
+      // sent, so the release could come up to 4.8 s after the last keepalive, against a Lifetime
+      // of 5 s; a late thread then found the channel gone and made it again. Every half second
+      // is often enough to be well inside the Lifetime and cheap: chanctl sends a keepalive only
+      // when one is due
       struct work * const w = add_work(dp,nwork,WORK_REFRESH);
       if(w != NULL)
 	w->ssrc = vc->ssrc;

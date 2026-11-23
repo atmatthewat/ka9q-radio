@@ -30,7 +30,8 @@
 // default (defaults.h DEFAULT_LIFETIME). So here:
 // - a request is one FULL command: every field of the format, the frequency and LIFETIME;
 // - a keepalive is a command carrying only LIFETIME;
-// - a release is LIFETIME 1, so the channel goes at its next block.
+// - a release is LIFETIME 1, so the channel goes at its next block. None is sent for a channel
+//   whose lifetime has run out since our last command: radiod has let that one go already.
 // The lifetime is given in seconds and sent in blocks (frames()), using the block time learned
 // from status. A channel asked for with a lifetime goes by itself if the client stops, so a
 // client that dies leaves nothing behind for longer than that.
@@ -49,8 +50,9 @@
 //
 // What status tells us. A caller that decodes radiod's status passes each packet to
 // chanctl_observe(). That gives the front end's tuning, so a frequency it does not cover can be
-// refused (ERANGE) rather than asked for: radiod would retune the front end for it and move every
-// other channel. It gives radiod's block time. It confirms a request: the entry is UP once a
+// refused (ERANGE) rather than asked for: a radiod whose front end is not locked would retune it
+// for the channel, and every channel left outside the new coverage would go quiet. It gives
+// radiod's block time. It confirms a request: the entry is UP once a
 // status shows the SSRC on the frequency and in the form asked for (same_form()). And it keeps a
 // table of every SSRC seen (struct seen), so a request for an SSRC that is someone else's channel
 // is either refused (EEXIST: another frequency or form, which a request would change under its
@@ -460,6 +462,12 @@ int chanctl_release(struct chanctl *ctl,uint32_t ssrc){
   }
   if(e->state == CHANCTL_RELEASING)
     return 0;
+  if(e->lifetime > 0 && now - e->last_send > (int64_t)(e->lifetime * 1e9)){
+    // radiod has let it go by now (as in keep_alive()): a release would only make radiod create
+    // a channel from its template, to delete it again
+    remove_entry(ctl,e);
+    return 0;
+  }
   struct seen * const s = find_seen(ctl,ssrc,0);
   if(s != NULL)
     s->gone = true;
