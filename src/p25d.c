@@ -1216,12 +1216,18 @@ static void *decode_task(void *arg){
       break; // Told to terminate, and nothing left
 
     dec.frequency = bp->frequency;
-    if(dec.voice && voice_moved(&dec))
-      dec.voice = false; // asked for again in the other form: linked anew just below, which starts
-			 // the receiver and streams that form needs as for a new channel
+    bool const moved = dec.voice && voice_moved(&dec);
+    struct site * const was = dec.site;
+    if(moved)
+      dec.voice = false; // asked for again in the other form, or by another site: linked anew just
+			 // below, which starts the receiver and streams that form needs as for a new channel
     if(Follow && !dec.voice && !dec.control && link_voice(&dec) && dec.samprate != 0
-       && (dec.choosing || (dec.rx == RX_PHASE2) != (dec.p2 != NULL)))
-      dec.samprate = 0; // a channel already running, now granted: start the receiver its grant says
+       && ((moved && dec.site != was) || dec.choosing || (dec.rx == RX_PHASE2) != (dec.p2 != NULL)))
+      dec.samprate = 0; // a channel already running, now granted: start the receiver its grant says.
+			// Another site's now: afresh too, with that site's NAC, carrier offset and
+			// (Phase 2) scrambling parameters
+    if(moved && dec.site != was)
+      p25_alias_init(&dec.alias); // nor does the other site's talker alias carry over
     if(bp->samprate != dec.samprate){
       // First block, or the sample rate changed
       p25_audio_call_end(dec.audio);
@@ -1618,6 +1624,18 @@ static void status_line(struct decoder const *dp){
 // and the confirmation that a transmission is clear belong to a call. When a call on a kept
 // channel ends, let_go() marks the channel (ended[]), and its thread ends the voice output's call
 // (p25_audio_call_end()) before the next unit is handed on (voice_unit(), p2_burst()).
+//
+// Two systems, one frequency. One radiod may serve the control channels of two systems that use
+// the same frequency, and radiod's SSRC is per frequency, so both sites name the same channel.
+// (One system's control channels never grant overlapping channels.) The channel belongs to the
+// site that asked for it last: when a site asks for it (site_unlock(), take_over()), another site
+// on that radiod that only keeps it for the hang time forgets it, sending radiod nothing, since
+// the channel is in use; the channel's thread finds its site's entry gone and another site's
+// there, and is linked anew to that site as a new channel would be (voice_moved()). So the old
+// site never releases it under the new one's call. If the other site has a call on it at that
+// moment (co-channel sites, both heard), nothing changes: the thread stays with that site, and
+// the second call gets no voice and ends by timeout (or, once the first call has ended and its
+// site only keeps the channel, the second site's next request for it takes it over as above).
 
 // Find or create the chanctl handle for the radiod that sent this status, and show it the status.
 // For a control channel, also keep its site's handle and channel format current. Input thread
@@ -2145,6 +2163,35 @@ static int take_events(struct decoder *dp,struct site *site,int nwork){
   return nwork;
 }
 
+// This site is asking for the channel 'ssrc': another site on the same radiod that only keeps it
+// for the hang time forgets it, without releasing it (see "Two systems, one frequency"). Without
+// any site's lock held: Sites_mutex, then each other site's lock in turn
+static void take_over(struct site const *site,uint32_t ssrc){
+  pthread_mutex_lock(&Sites_mutex);
+  for(struct site *s = Sites; s != NULL; s = s->next){
+    if(s == site)
+      continue;
+    pthread_mutex_lock(&Ctl_mutex);
+    bool const same_radio = s->ctl != NULL && s->ctl == site->ctl;
+    pthread_mutex_unlock(&Ctl_mutex);
+    if(!same_radio)
+      continue;
+    pthread_mutex_lock(&s->lock);
+    struct vchan * const vc = vchan_ssrc(s,ssrc);
+    bool const said = vc != NULL && vc->kept != 0 && vc->said;
+    uint64_t const freq_hz = vc != NULL ? vc->freq_hz : 0;
+    uint16_t const nac = s->nac;
+    double const freq = s->freq;
+    if(vc != NULL && vc->kept != 0)
+      vc->used = false; // kept, so no call of this site needs it
+    pthread_mutex_unlock(&s->lock);
+    if(said)
+      log_line(s->ssrc,freq,0,"NAC %03x voice channel %.6lf MHz ssrc %u let go, not released: asked for by the site on ssrc %u",
+	       nac,freq_hz * 1e-6,ssrc,site->ssrc);
+  }
+  pthread_mutex_unlock(&Sites_mutex);
+}
+
 // Let go of the site's lock, then do what its events (and 'nwork' items already queued) called for
 static void site_unlock(struct site *site,struct decoder *dp,int nwork){
   nwork = take_events(dp,site,nwork);
@@ -2161,6 +2208,7 @@ static void site_unlock(struct site *site,struct decoder *dp,int nwork){
       break;
     case WORK_REQUEST:
       {
+	take_over(site,w->ssrc);
 	pthread_mutex_lock(&Ctl_mutex);
 	int r = -1;
 	errno = ENOENT;
@@ -2303,17 +2351,22 @@ static void control_lost(struct decoder *dp){
   site_unlock(site,dp,nwork);
 }
 
-// A voice channel p25d asked for? If some site's call has this SSRC, it is that site's. True
-// when this call found it. The site must be on the same radiod, which is known by the command
-// address in the two channels' status: SSRCs are only unique within a radiod
+// Is the site on the radiod this channel came from? Known by the command address in the two
+// channels' status: SSRCs are only unique within a radiod
+static bool same_radio(struct site const *site,struct session const *sp){
+  pthread_mutex_lock(&Ctl_mutex);
+  bool const same = site->ctl != NULL && same_socket(&site->radio,&sp->radio);
+  pthread_mutex_unlock(&Ctl_mutex);
+  return same;
+}
+
+// A voice channel p25d asked for? If some site on its radiod has an entry for this SSRC, it is
+// that site's. True when this call found it
 static bool link_voice(struct decoder *dp){
   struct session const * const sp = dp->sp;
   pthread_mutex_lock(&Sites_mutex);
   for(struct site *site = Sites; site != NULL && !dp->voice; site = site->next){
-    pthread_mutex_lock(&Ctl_mutex);
-    bool const same_radio = site->ctl != NULL && same_socket(&site->radio,&sp->radio);
-    pthread_mutex_unlock(&Ctl_mutex);
-    if(!same_radio)
+    if(!same_radio(site,sp))
       continue; // another radiod's
     pthread_mutex_lock(&site->lock);
     // Every channel a call asked for has an entry, as has one kept after its last call
@@ -2355,14 +2408,31 @@ static bool link_voice(struct decoder *dp){
 }
 
 // Once per block of a voice channel: has its channel been asked for again in the other form (a
-// channel kept after a Phase 1 call granted as Phase 2, or the reverse)? Then the caller links it
-// anew, and decode_task() starts the receiver that form needs
+// channel kept after a Phase 1 call granted as Phase 2, or the reverse), or by another site on the
+// same radiod (see "Two systems, one frequency": its own site's entry is gone, the other's is
+// there)? Then the caller links it anew, and decode_task() starts the receiver that form or site
+// needs
 static bool voice_moved(struct decoder *dp){
-  pthread_mutex_lock(&dp->site->lock);
-  struct vchan const * const vc = vchan_ssrc(dp->site,dp->sp->ssrc);
+  struct site * const site = dp->site;
+  uint32_t const ssrc = dp->sp->ssrc;
+  pthread_mutex_lock(&site->lock);
+  struct vchan const * const vc = vchan_ssrc(site,ssrc);
   bool const moved = vc != NULL && vc->tdma != (dp->rx == RX_PHASE2);
-  pthread_mutex_unlock(&dp->site->lock);
-  return moved;
+  pthread_mutex_unlock(&site->lock);
+  if(vc != NULL)
+    return moved;
+  // Its own lock let go first: one site's lock at a time, after Sites_mutex
+  bool other = false;
+  pthread_mutex_lock(&Sites_mutex);
+  for(struct site *s = Sites; s != NULL && !other; s = s->next){
+    if(s == site || !same_radio(s,dp->sp))
+      continue;
+    pthread_mutex_lock(&s->lock);
+    other = vchan_ssrc(s,ssrc) != NULL;
+    pthread_mutex_unlock(&s->lock);
+  }
+  pthread_mutex_unlock(&Sites_mutex);
+  return other;
 }
 
 // What the trunking logic's label says for the voice output. A held unit whose own label says
