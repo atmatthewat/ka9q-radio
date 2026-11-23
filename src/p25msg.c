@@ -49,7 +49,10 @@ bool p25_bandplan_update(struct p25_bandplan *plan, struct p25_msg const *msg){
   if(msg->kind != P25_IDEN_UP && msg->kind != P25_IDEN_UP_TDMA && msg->kind != P25_IDEN_UP_VU)
     return false;
   int64_t const off = msg->tx_offset_hz < 0 ? -msg->tx_offset_hz : msg->tx_offset_hz;
-  if(msg->base_hz < 100000000 || msg->base_hz > 1000000000 || msg->spacing_hz == 0
+  // A plan that makes no sense is not taken: a base outside 25 MHz to 1 GHz (the land mobile
+  // bands, VHF low band included), no channel spacing or more than 1 MHz, or a transmit offset
+  // of more than 100 MHz
+  if(msg->base_hz < 25000000 || msg->base_hz > 1000000000 || msg->spacing_hz == 0
      || msg->spacing_hz > 1000000 || off > 100000000)
     return false;
   // Only IDEN_UP_TDMA can make an identifier TDMA, and only with a TDMA channel type; an
