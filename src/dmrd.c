@@ -34,6 +34,7 @@
 #include "dmr.h"
 #include "dmrchan.h"
 #include "dmraudio.h"
+#include "dmrvote.h"
 
 // Theory of operation
 //
@@ -55,13 +56,13 @@
 // it, as p25d's trunked group calls do, so a listener sees one stream per talkgroup. That matters
 // for DMR more than for P25: a wide-area call on a multi-site system (Capacity Plus, IP Site
 // Connect) is carried at the same moment by every repeater of the call's sites, and a listener
-// monitoring them all would otherwise hear it once per repeater. So a talkgroup's stream belongs to
-// the first channel and slot that sends it a frame (the Streams table) until that transmission
-// ends or falls silent for Stream_hold; the same call on the other repeaters meanwhile is decoded,
-// logged and not sent. A unit-to-unit call, and voice whose destination is not known yet, goes out
-// under the channel's SSRC times ten plus the slot (e.g. 4534251), which no talkgroup reaches only
-// for talkgroups below 1,342,177 (a DMR talkgroup has 24 bits; on a system using larger ones two
-// streams could meet: a later change maps them explicitly).
+// monitoring them all would otherwise hear it once per repeater. So every channel's clear frames go
+// to one voter (dmrvote.c), which lines the repeaters' copies of the call up and plays each frame
+// from the copy received with the fewest errors, falling back to whichever repeater is still
+// sending when copies do not line up. A unit-to-unit call, and voice whose destination is not known
+// yet, goes out under the channel's SSRC times ten plus the slot (e.g. 4534251); a talkgroup can
+// reach such a number only above 1,342,177 (a DMR talkgroup has 24 bits; on a system using larger
+// ones two streams could meet: a later change maps them explicitly).
 //
 // Site-level state is deliberately not here: one radiod and a fixed list of repeater channels for
 // now. Which radiod and SSRC serves a frequency, the channel map and grant following belong in a
@@ -70,7 +71,6 @@
 
 #define MAX_MCAST 20   // Maximum number of input groups
 #define RESEQ 32       // Resequencing queue, packets. radiod sends one to three packets per 20 ms block
-#define MAX_STREAMS 64 // Talkgroup streams sent at once, across all channels
 
 struct block {
   struct block *next;
@@ -85,13 +85,9 @@ struct block {
   float complex samples[]; // I in the real part, Q in the imaginary, as radiod sends them
 };
 
-// One timeslot's speech output and its transmission
+// One timeslot's transmission, as the voter knows it
 struct slot {
-  struct dmr_audio *audio; // NULL without --pcm-out or a vocoder
   uint32_t ssrc;           // SSRC of the stream its frames go to, 0 = none yet
-  bool sending;            // owns that stream (see Streams)
-  bool refused;            // the stream belongs to another channel: this transmission is not sent
-  int64_t last;            // time of the last frame
 };
 
 // Decode thread view of a channel
@@ -147,14 +143,6 @@ struct session {
   atomic_uint_fast64_t unusable;
 };
 
-// A talkgroup stream and the channel and slot sending it
-struct stream {
-  uint32_t ssrc;
-  uint32_t owner;          // channel SSRC
-  int slot;
-  int64_t last;            // time of its last frame
-};
-
 // Command line params
 const char *App_path;
 int Verbose;
@@ -176,7 +164,6 @@ static bool Mobile;                   // -M: also MS and direct mode syncs (simp
 // Tuning constants
 static double const Max_fill = 1.0;   // Fill gaps up to this many seconds with zeroes; resynchronize on longer ones
 static double const Max_queue = 5.0;  // Seconds of samples queued to a decoder before blocks are dropped
-static int64_t const Stream_hold = 2 * BILLION; // A talkgroup stream with no frame this long is free for another channel
 
 // Global variables
 static int Data_fd[MAX_MCAST];
@@ -186,8 +173,7 @@ static pthread_mutex_t Output_mutex = PTHREAD_MUTEX_INITIALIZER;
 static volatile sig_atomic_t Terminate;
 static volatile sig_atomic_t Signal;
 static struct p25_audio_group *Audio_group;
-static pthread_mutex_t Streams_mutex = PTHREAD_MUTEX_INITIALIZER;
-static struct stream Streams[MAX_STREAMS];
+static struct dmr_voter *Voter;       // NULL without --pcm-out or a vocoder
 
 static void closedown(int);
 static void verbosity(int);
@@ -216,6 +202,7 @@ static void voice_frame(void *arg,struct dmr_chan_frame const *f);
 static void voice_event(void *arg,struct dmr_chan_event const *e);
 static void voice_log(void *arg,int64_t when,char const *text);
 static void status_line(struct decoder const *dp);
+static void vote_end(void *arg,struct dmr_vote_result const *r);
 
 static struct option Options[] = {
   {"iface", required_argument, NULL, 'A'},
@@ -367,6 +354,8 @@ int main(int argc,char *argv[]){
   if(Output != NULL && p25_vocoder_name(P25_CODEC_AMBE2) != NULL){
     if((Audio_group = p25_audio_open(Output,Default_mcast_iface,Mcast_ttl,IP_tos,Name)) == NULL)
       exit(EX_TEMPFAIL);
+    Voter = dmr_voter_create(Audio_group,DMR_VOTE_DELAY_MS * 1000000LL);
+    dmr_voter_set_end_handler(Voter,vote_end,NULL);
     if(Verbose)
       fprintf(stderr,"%s: voice to %s (%s)\n",App_path,Output,p25_vocoder_name(P25_CODEC_AMBE2));
   }
@@ -379,6 +368,7 @@ int main(int argc,char *argv[]){
 
   input_loop();
   cleanup();
+  dmr_voter_destroy(Voter);
   p25_audio_close(Audio_group);
   if(Verbose)
     fprintf(stderr,"%s: caught signal %d: %s\n",App_path,(int)Signal,strsignal(Signal));
@@ -763,8 +753,6 @@ static void *decode_task(void *arg){
   struct decoder dec = {
     .sp = sp,
   };
-  for(int t=0; t < 2; t++)
-    dec.slot[t].audio = dmr_audio_create(Audio_group,sp->ssrc * 10 + t + 1); // NULL without --pcm-out
   struct dmr_chan_handlers const h = {
     .frame = voice_frame,
     .event = voice_event,
@@ -794,9 +782,7 @@ static void *decode_task(void *arg){
       break;
 
     if(bp->samprate != dec.samprate){
-      for(int t=0; t < 2; t++)
-        dmr_audio_end(dec.slot[t].audio);
-      dmr_chan_destroy(dec.chan);
+      dmr_chan_destroy(dec.chan); // ends what is in progress: voice_event() runs in here
       dec.samprate = bp->samprate;
       dec.samples = 0;
       dec.next_report = (uint64_t)(Update * dec.samprate);
@@ -810,13 +796,11 @@ static void *decode_task(void *arg){
     dec.n0 = bp->n0;
     dec.low = bp->low;
     dec.high = bp->high;
-    for(int t=0; t < 2; t++)
-      dmr_audio_set_signal(dec.slot[t].audio,dec.frequency,dec.bb_power,dec.n0,dec.low,dec.high);
+    dmr_voter_set_signal(Voter,sp->ssrc,dec.frequency,dec.bb_power,dec.n0,dec.low,dec.high);
     if(dec.chan != NULL)
       dmr_chan_samples(dec.chan,bp->samples,bp->count,bp->time); // voice_frame(), voice_event() run in here
     int64_t const end = bp->time != 0 ? bp->time + llrint(1e9 * bp->count / dec.samprate) : 0;
-    for(int t=0; t < 2; t++)
-      dmr_audio_poll(dec.slot[t].audio,end);
+    dmr_voter_poll(Voter,end); // frames now due are played
     dec.samples += bp->count;
     FREE(bp);
     if(Verbose && Update > 0 && dec.samples >= dec.next_report){
@@ -825,9 +809,6 @@ static void *decode_task(void *arg){
     }
   }
   dmr_chan_destroy(dec.chan); // ends what is in progress: voice_event() runs in here
-  for(int t=0; t < 2; t++){
-    dmr_audio_destroy(dec.slot[t].audio);
-  }
   return NULL;
 }
 
@@ -836,56 +817,6 @@ static uint32_t frame_ssrc(struct decoder const *dp,struct dmr_chan_frame const 
   if(f->group && f->destination != 0)
     return f->destination;
   return dp->sp->ssrc * 10 + f->slot;
-}
-
-// Claim a talkgroup stream for this channel and slot, or find it is another's
-static bool claim_stream(struct decoder const *dp,int slot,uint32_t ssrc,int64_t when){
-  if(when == 0)
-    when = gps_time_ns();
-  pthread_mutex_lock(&Streams_mutex);
-  struct stream *free_entry = NULL;
-  bool ours = false;
-  bool found = false;
-  for(int i=0; i < MAX_STREAMS; i++){
-    struct stream * const s = &Streams[i];
-    if(s->ssrc == 0 || when - s->last > Stream_hold){
-      if(free_entry == NULL)
-        free_entry = s;
-      if(s->ssrc != ssrc)
-        continue;
-    }
-    if(s->ssrc == ssrc){
-      found = true;
-      if((s->owner == dp->sp->ssrc && s->slot == slot) || when - s->last > Stream_hold){
-        s->owner = dp->sp->ssrc;
-        s->slot = slot;
-        s->last = when;
-        ours = true;
-      }
-      break;
-    }
-  }
-  if(!found && free_entry != NULL){
-    free_entry->ssrc = ssrc;
-    free_entry->owner = dp->sp->ssrc;
-    free_entry->slot = slot;
-    free_entry->last = when;
-    ours = true;
-  }
-  pthread_mutex_unlock(&Streams_mutex);
-  return ours;
-}
-
-static void release_stream(struct decoder const *dp,int slot,uint32_t ssrc){
-  pthread_mutex_lock(&Streams_mutex);
-  for(int i=0; i < MAX_STREAMS; i++){
-    struct stream * const s = &Streams[i];
-    if(s->ssrc == ssrc && s->owner == dp->sp->ssrc && s->slot == slot){
-      s->ssrc = 0;
-      break;
-    }
-  }
-  pthread_mutex_unlock(&Streams_mutex);
 }
 
 static void describe(char *buf,size_t size,struct decoder const *dp,struct dmr_chan_frame const *f){
@@ -897,49 +828,24 @@ static void describe(char *buf,size_t size,struct decoder const *dp,struct dmr_c
   if(n > 0 && (size_t)n < size && f->source != 0)
     n += snprintf(buf + n,size - n," src %u",f->source);
   if(n > 0 && (size_t)n < size && f->alias[0] != '\0')
-    n += snprintf(buf + n,size - n," \"%s\"",f->alias);
-  if(n > 0 && (size_t)n < size && f->destination != 0)
-    snprintf(buf + n,size - n," %.4f MHz slot %d",dp->frequency * 1e-6,f->slot);
+    snprintf(buf + n,size - n," \"%s\"",f->alias);
 }
 
-// A frame the call tracker released. Only clear frames are heard
+// A frame the call tracker released. Only clear frames are heard: they go to the voter
 static void voice_frame(void *arg,struct dmr_chan_frame const *f){
   struct decoder * const dp = arg;
-  if(f->slot < 1 || f->slot > 2 || f->label != DMR_CHAN_CLEAR)
+  if(f->slot < 1 || f->slot > 2 || f->label != DMR_CHAN_CLEAR || Voter == NULL)
     return;
   struct slot * const s = &dp->slot[f->slot - 1];
-  if(s->audio == NULL)
-    return;
   uint32_t const ssrc = frame_ssrc(dp,f);
   if(ssrc != s->ssrc){
-    if(s->sending)
-      release_stream(dp,f->slot,s->ssrc);
-    dmr_audio_end(s->audio);
+    if(s->ssrc != 0)
+      dmr_voter_source_end(Voter,s->ssrc,dp->sp->ssrc,f->slot); // the identity changed: a new stream
     s->ssrc = ssrc;
-    s->sending = false;
-    s->refused = false;
   }
-  if(s->refused)
-    return;
-  if(!claim_stream(dp,f->slot,ssrc,f->when)){
-    if(!s->sending){
-      s->refused = true;
-      if(Verbose)
-        decoder_event(dp,f->when,"slot %d: the same call is already being sent from another channel",f->slot);
-    } else {
-      s->sending = false;
-      dmr_audio_end(s->audio);
-    }
-    return;
-  }
-  if(!s->sending){
-    char desc[256];
-    describe(desc,sizeof desc,dp,f);
-    dmr_audio_set_stream(s->audio,ssrc,desc);
-    s->sending = true;
-  }
-  dmr_audio_frame(s->audio,f->bits,f->when);
-  s->last = f->when;
+  char desc[256];
+  describe(desc,sizeof desc,dp,f);
+  dmr_voter_frame(Voter,ssrc,desc,dp->sp->ssrc,f->slot,f->bits,f->when);
 }
 
 // A transmission started or ended on a slot
@@ -959,14 +865,27 @@ static void voice_event(void *arg,struct dmr_chan_event const *e){
                   e->frames,e->label != NULL ? e->label : "");
     if(e->slot >= 1 && e->slot <= 2){
       struct slot * const s = &dp->slot[e->slot - 1];
-      if(s->sending)
-        release_stream(dp,e->slot,s->ssrc);
-      dmr_audio_end(s->audio);
-      s->sending = false;
-      s->refused = false;
+      if(s->ssrc != 0)
+        dmr_voter_source_end(Voter,s->ssrc,dp->sp->ssrc,e->slot);
       s->ssrc = 0;
     }
   }
+}
+
+// A voted stream ended: how many frames each repeater supplied
+static void vote_end(void *arg,struct dmr_vote_result const *r){
+  (void)arg;
+  char text[512];
+  int n = snprintf(text,sizeof text,"stream %u ended: %d frames played, %d lost;",r->ssrc,r->frames,r->lost);
+  for(int i=0; i < r->sources && n > 0 && (size_t)n < sizeof text; i++)
+    n += snprintf(text + n,sizeof text - n," %u slot %d chose %d of %d (%d corrections)%s",r->source[i].channel,
+                  r->source[i].slot,r->source[i].chosen,r->source[i].frames,r->source[i].fec,
+                  r->source[i].aligned ? "" : " unaligned");
+  pthread_mutex_lock(&Output_mutex);
+  char timestring[100];
+  format_gpstime(timestring,sizeof(timestring),gps_time_ns());
+  fprintf(stdout,"%s %s\n",timestring,text);
+  pthread_mutex_unlock(&Output_mutex);
 }
 
 static void voice_log(void *arg,int64_t when,char const *text){
