@@ -64,7 +64,7 @@ enum {
   SEARCH_AHEAD = 10,    // ... and after (200 ms)
   ALIGN_RUN = 3,        // consecutive matching frames
   ALIGN_LIMIT = 50,     // frames a source has to align (1 s)
-  MAX_CHANNELS = 32,
+  MAX_CHANNELS = 256,   // channels whose signal measurements are kept
 };
 static int64_t const Frame_ns = 20000000;
 static int64_t const Idle_ns = 1000000000;
