@@ -120,7 +120,7 @@
 // Capacity Max voice channel updates, open mode (33, up to two talkgroups) and advantage mode (34, up to
 // four). The voice channel user and the updates repeat while the call lasts: activity_update says so.
 // Capacity Plus has no grants (its Site Status is an activity map) and Hytera Tier III uses the standard
-// ones. encrypted is the CSBK's PF, as sdrtrunk reads it.
+// ones. protect_flag is the CSBK's PF bit, which sdrtrunk reads as encryption; it never labels voice.
 //
 // The channel map: LCN -> frequency for one site, from the configuration (what the user says is true)
 // and from the air (a C_BCAST "announce channel frequency" with its CG_AP block; sdrtrunk parses it and
@@ -1838,7 +1838,7 @@ static void event_init(struct dmr_mbc_event *e){
 }
 
 void dmr_mbc_on_header(struct dmr_mbc_assembler *a,struct dmr_mbc_event *e,uint8_t const info96[96],uint8_t slot,
-                       uint8_t color_code,uint64_t timestamp_us){
+                       uint8_t color_code,uint64_t timestamp_us,bool mobile_sourced){
   assert(a != NULL && e != NULL && info96 != NULL);
   event_init(e);
   struct dmr_mbc_pending *p = pending(a,slot);
@@ -1854,6 +1854,7 @@ void dmr_mbc_on_header(struct dmr_mbc_assembler *a,struct dmr_mbc_event *e,uint8
   a->stats.headers++;
   p->active = true;
   p->header = header;
+  p->mobile_sourced = mobile_sourced;
   p->blocks = 0;
   p->last_timestamp_us = timestamp_us;
   e->status = DMR_MBC_HEADER_ACCEPTED;
@@ -1902,7 +1903,7 @@ void dmr_mbc_on_continuation(struct dmr_mbc_assembler *a,struct dmr_mbc_event *e
   struct dmr_csbk_message *m = &e->message;
   memset(m,0,sizeof *m);
   m->block = p->header;
-  dmr_csbk_parse_body(m,&p->header,false);
+  dmr_csbk_parse_body(m,&p->header,p->mobile_sourced); // a mobile's CSBKO 56 is not a data grant
   m->from_mbc = true;
   m->mbc_continuation_blocks = (uint8_t)p->blocks;
   memcpy(m->mbc_continuation_bits,p->bits,(size_t)total);
@@ -1921,9 +1922,10 @@ void dmr_mbc_on_other_burst(struct dmr_mbc_assembler *a,uint8_t slot){
 }
 
 void dmr_mbc_on_burst(struct dmr_mbc_assembler *a,struct dmr_mbc_event *e,enum dmr_data_type type,
-                      uint8_t const info96[96],uint8_t slot,uint8_t color_code,uint64_t timestamp_us){
+                      uint8_t const info96[96],uint8_t slot,uint8_t color_code,uint64_t timestamp_us,
+                      bool mobile_sourced){
   if(type == DMR_DT_MBC_HEADER){
-    dmr_mbc_on_header(a,e,info96,slot,color_code,timestamp_us);
+    dmr_mbc_on_header(a,e,info96,slot,color_code,timestamp_us,mobile_sourced);
     return;
   }
   if(type == DMR_DT_MBC_CONTINUATION){
@@ -1971,7 +1973,7 @@ static struct dmr_grant *add_grant(struct dmr_grant *grants,int *count,struct dm
   g->kind = kind;
   g->flavor = flavor;
   g->channel = dmr_chref_none();
-  g->encrypted = m->block.protect;
+  g->protect_flag = m->block.protect;
   g->opcode = m->block.opcode;
   g->fid = m->block.fid;
   g->control_slot = m->block.slot;
@@ -2073,8 +2075,8 @@ int dmr_grant_describe(char *buf,size_t size,struct dmr_grant const *g){
   append_chref(buf,size,&len,&g->channel);
   if(g->emergency)
     append(buf,size,&len," EMERGENCY");
-  if(g->encrypted)
-    append(buf,size,&len," ENCRYPTED");
+  if(g->protect_flag)
+    append(buf,size,&len," PF");
   if(g->duplex)
     append(buf,size,&len," duplex");
   if(g->activity_update)

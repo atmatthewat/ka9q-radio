@@ -1271,7 +1271,7 @@ static bool identity(struct dmr_site *s,enum dmr_tag_family family,uint32_t tag,
     return true;
   s->candidate_count = 0;
   __atomic_store_n(&s->system_tag,tag,__ATOMIC_RELAXED);
-  char buf[160],new_text[64],held_text[64];
+  char buf[DMR_SITE_LINE_MAX],new_text[64],held_text[64]; // two identities and a source fit
   dmr_system_tag_describe(new_text,sizeof new_text,tag);
   if(held == 0){
     format(buf,sizeof buf,"SITE identity %s, systemTag 0x%08X (from %s)",new_text,(unsigned)tag,source);
@@ -1403,7 +1403,7 @@ static void note_color_code(struct site_channel *ch,uint8_t color_code,struct ac
   if((ch->color_codes_logged & bit) != 0)
     return;
   ch->color_codes_logged |= bit;
-  char buf[200];
+  char buf[DMR_SITE_LINE_MAX]; // a channel id may be long
   format(buf,sizeof buf,"WARN colour code %u heard on %s (%s %d)",(unsigned)color_code,ch->channel_id,
            (ch->color_code >= 0 && ch->color_code <= 15) ? "configured" : "first seen",ch->expected_color_code);
   warn_text(a,buf);
@@ -2199,7 +2199,7 @@ static void control_plane(struct dmr_cplane *c,struct dmr_burst const *b,struct 
     if(b->kind != DMR_KIND_VOICE_A && b->emb_valid && b->emb_pi){
       c->counters.emb_pi_set++;
       if(first_in_transmission(slot,"EMBPI"))
-        line(c,slot_number,cc,"ENC","EMB PI=1 (encrypted, unconfirmed)");
+        line(c,slot_number,cc,"ENC","EMB PI=1 (the EMB's pre-emption and power control indicator; set by some systems on encrypted calls and by others on clear ones; unconfirmed)");
     }
     if(m->has_embedded_lc){
       struct dmr_lc const *lc = &m->embedded_lc.lc;
@@ -2251,13 +2251,14 @@ void dmr_cplane_burst(struct dmr_cplane *c,struct dmr_burst const *b,struct dmr_
   struct dmr_csbk_message const *csbk = NULL;
   bool crc_failed = false;
   bool const unchecked = m->has_data && m->data.status == DMR_DATA_UNCHECKED;
+  bool const mobile_sourced = b->mode == DMR_STATION_MS || b->mode == DMR_STATION_DIRECT;
   if(unchecked && m->data.data_type == DMR_DT_CSBK){
     dmr_mbc_on_other_burst(&c->mbc,b->slot);
-    dmr_csbk_parse(&e.message,m->data.info,b->slot,b->color_code,b->timestamp_us,c->o.csbk_crc_mask,b->mode == DMR_STATION_MS);
+    dmr_csbk_parse(&e.message,m->data.info,b->slot,b->color_code,b->timestamp_us,c->o.csbk_crc_mask,mobile_sourced);
     csbk = &e.message;
     crc_failed = !dmr_csbk_parsed(csbk);
   } else if(unchecked && (m->data.data_type == DMR_DT_MBC_HEADER || m->data.data_type == DMR_DT_MBC_CONTINUATION)){
-    dmr_mbc_on_burst(&c->mbc,&e,m->data.data_type,m->data.info,b->slot,b->color_code,b->timestamp_us);
+    dmr_mbc_on_burst(&c->mbc,&e,m->data.data_type,m->data.info,b->slot,b->color_code,b->timestamp_us,mobile_sourced);
     if(e.has_message)
       csbk = &e.message;
   } else

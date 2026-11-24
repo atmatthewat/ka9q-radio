@@ -663,6 +663,7 @@ struct dmr_mbc_stats {
 struct dmr_mbc_pending {
   bool active;
   struct dmr_csbk_block header;
+  bool mobile_sourced;          // the header came with an MS or direct mode sync
   int blocks;
   uint64_t last_timestamp_us;
   uint8_t bits[96 * DMR_MBC_MAX_CONTINUATION_BLOCKS];
@@ -677,11 +678,13 @@ void dmr_mbc_init(struct dmr_mbc_assembler *a,uint64_t max_block_gap_us);
 // The messages whose first continuation block is a CG_AP block
 bool dmr_mbc_carries_absolute(struct dmr_csbk_block const *header);
 // Feed every data burst of a carrier: headers and continuation blocks are assembled, any other data type
-// abandons a message in progress on that timeslot
+// abandons a message in progress on that timeslot. mobile_sourced: the burst carried an MS or direct
+// mode sync; a header's decides how the completed message is parsed (dmr_csbk_parse_body())
 void dmr_mbc_on_burst(struct dmr_mbc_assembler *a,struct dmr_mbc_event *e,enum dmr_data_type type,
-                      uint8_t const info96[96],uint8_t slot,uint8_t color_code,uint64_t timestamp_us);
+                      uint8_t const info96[96],uint8_t slot,uint8_t color_code,uint64_t timestamp_us,
+                      bool mobile_sourced);
 void dmr_mbc_on_header(struct dmr_mbc_assembler *a,struct dmr_mbc_event *e,uint8_t const info96[96],uint8_t slot,
-                       uint8_t color_code,uint64_t timestamp_us);
+                       uint8_t color_code,uint64_t timestamp_us,bool mobile_sourced);
 void dmr_mbc_on_continuation(struct dmr_mbc_assembler *a,struct dmr_mbc_event *e,uint8_t const info96[96],
                              uint8_t slot,uint64_t timestamp_us);
 void dmr_mbc_on_other_burst(struct dmr_mbc_assembler *a,uint8_t slot); // any other burst on the timeslot
@@ -705,7 +708,7 @@ struct dmr_grant {
   bool has_source;
   struct dmr_channel_ref channel; // NONE: the message named no usable channel (log it, do not tune)
   bool emergency;
-  bool encrypted;               // the CSBK's PF, as sdrtrunk reads it
+  bool protect_flag;            // the CSBK's PF bit (sdrtrunk calls it encrypted). Says nothing of the call's encryption
   bool duplex;                  // Tier III duplex private call
   bool activity_update;         // repeated while the call lasts: it confirms a call and does not start one
   uint8_t opcode;
