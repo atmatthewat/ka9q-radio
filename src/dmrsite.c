@@ -770,6 +770,7 @@ struct site_channel {
 
 struct dmr_site {
   struct dmr_site_options o;
+  int default_color_code;       // the setting a channel the configuration does not list gets: the site's, else the system's
   char system_name[DMR_SITE_NAME_MAX];
   char site_name[DMR_SITE_NAME_MAX];
   enum dmr_system_type type;
@@ -985,6 +986,7 @@ struct dmr_site *dmr_site_create(struct dmr_site_config const *config,struct dmr
   copy_string(s->system_name,sizeof s->system_name,config->system_name);
   copy_string(s->site_name,sizeof s->site_name,config->site_name);
   s->type = config->type;
+  s->default_color_code = dmr_site_color_code_for(config,NULL);
   s->compressed_talkgroups = config->compressed_talkgroups;
   s->family = dmr_tag_family_of(config->type);
   s->log = log;
@@ -1043,20 +1045,24 @@ static void forget(struct dmr_site *s,struct pending *p){
   s->announced_unconfirmed += p->count;
 }
 
+// An entry already attached for another live decoder is never taken over (two decoders can hold one
+// LCN at once, an old carrier still held while a new one is made for it): the second gets an entry, and
+// a handle, of its own, so that what is heard on each is routed to it and each detaches its own
 int dmr_site_attach(struct dmr_site *s,struct dmr_site_context const *channel){
   assert(s != NULL && channel != NULL);
   pthread_mutex_lock(&s->lock);
   int index = -1;
   for(int i=0; i < s->nchannels && index < 0; i++){
-    if(channel->channel_id[0] != '\0' && strcmp(s->channels[i].channel_id,channel->channel_id) == 0)
+    if(!s->channels[i].attached && channel->channel_id[0] != '\0' && strcmp(s->channels[i].channel_id,channel->channel_id) == 0)
       index = i;
   }
   for(int i=0; i < s->nchannels && index < 0; i++){
-    if(channel->lcn != 0 && s->channels[i].lcn == channel->lcn)
+    if(!s->channels[i].attached && channel->lcn != 0 && s->channels[i].lcn == channel->lcn)
       index = i;
   }
   for(int i=0; i < s->nchannels && index < 0; i++){
-    if(channel->frequency_hz != 0 && same_frequency(s,s->channels[i].frequency_hz,channel->frequency_hz))
+    if(!s->channels[i].attached && channel->frequency_hz != 0
+       && same_frequency(s,s->channels[i].frequency_hz,channel->frequency_hz))
       index = i;
   }
   if(index < 0){
@@ -1068,6 +1074,10 @@ int dmr_site_attach(struct dmr_site *s,struct dmr_site_context const *channel){
     copy_string(c->channel_id,sizeof c->channel_id,channel->channel_id);
     c->lcn = channel->lcn;
     c->frequency_hz = channel->frequency_hz;
+    // The site's colour code setting, not first-seen tracking: a pinned system stays pinned on it
+    c->color_code = s->default_color_code;
+    if(c->color_code >= 0 && c->color_code <= 15)
+      c->expected_color_code = c->color_code;
     index = s->nchannels - 1;
   }
   struct site_channel *c = &s->channels[index];
@@ -1075,6 +1085,21 @@ int dmr_site_attach(struct dmr_site *s,struct dmr_site_context const *channel){
   c->context = *channel;
   pthread_mutex_unlock(&s->lock);
   return index;
+}
+
+bool dmr_site_detach_handle(struct dmr_site *s,int handle){
+  if(s == NULL)
+    return false;
+  pthread_mutex_lock(&s->lock);
+  bool const ok = handle >= 0 && handle < s->nchannels && s->channels[handle].attached;
+  if(ok){
+    struct site_channel *c = &s->channels[handle];
+    c->attached = false;
+    for(int k=0; k < 3; k++)
+      forget(s,&c->slots[k].pending);
+  }
+  pthread_mutex_unlock(&s->lock);
+  return ok;
 }
 
 bool dmr_site_detach(struct dmr_site *s,char const *channel_id){

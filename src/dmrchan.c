@@ -531,9 +531,10 @@ void dmr_chan_destroy(struct dmr_chan *c){
     c->data = NULL;
   }
   if(c->cplane != NULL){
+    int const handle = dmr_cplane_handle(c->cplane);
     dmr_cplane_flush(c->cplane);
     dmr_cplane_destroy(c->cplane);
-    dmr_site_detach(c->site,c->channel_id); // what the site announces here is no longer monitored
+    dmr_site_detach_handle(c->site,handle); // what the site announces here is no longer monitored
   }
   dmr_msg_reset(&c->msg);
   dmr_call_free(&c->tracker);

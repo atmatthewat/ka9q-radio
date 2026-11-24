@@ -235,6 +235,8 @@ int dmr_site_attach(struct dmr_site *s,struct dmr_site_context const *channel);
 // Its decoder is gone: what the site announces there counts as not monitored. False if no attached
 // channel has the id
 bool dmr_site_detach(struct dmr_site *s,char const *channel_id);
+// The same, by the handle dmr_site_attach() returned: the one to use when two decoders may share an id
+bool dmr_site_detach_handle(struct dmr_site *s,int handle);
 
 // From the channels (any thread). dmr_cplane_burst() makes these calls; call them directly only
 // without a struct dmr_cplane
