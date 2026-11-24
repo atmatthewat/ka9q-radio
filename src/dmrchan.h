@@ -48,6 +48,7 @@ struct dmr_chan_handlers {
   void (*frame)(void *arg,struct dmr_chan_frame const *f);
   void (*event)(void *arg,struct dmr_chan_event const *e);
   void (*log)(void *arg,int64_t when,char const *text); // other decoded messages worth a line (-v)
+  void (*notice)(void *arg,int64_t when,char const *text); // a line always worth writing (a CRC mask learned)
   void *arg;
 };
 
@@ -56,6 +57,12 @@ struct dmr_chan_config {
   bool base_station;               // look for base station syncs (a repeater output; default)
   bool mobile_station;             // and MS syncs
   bool direct;                     // and direct mode syncs
+  bool learn_crc_masks;            // accept messages whose CRC fails with a residual seen twice (dmrmsg.h)
+  // Look for every family enabled above until one family's synced bursts lead each other's by more
+  // than 10, then for that one only, for the channel's life (sdrtrunk's automatic mode,
+  // DMRSyncModeMonitor.java, GPL-3, Dennis Sheirer). A notice says which
+  bool auto_stations;
+  bool compressed_talkgroups;      // the system's talkgroups in the dialable form (dmrcall.h)
   // The site this carrier belongs to, and the control log its lines go to (both the owner's, shared
   // by the site's channels, outliving the channel; either may be NULL: no CSBKs decoded then without
   // a site, no lines without a log). The channel attaches itself to the site as channel_id
@@ -86,6 +93,7 @@ struct dmr_chan_stats {
   uint64_t frames_encrypted;
   uint64_t frames_unconfirmed;
   int color_code;                  // tracked, -1 not yet
+  uint64_t learned[3];             // messages accepted with a learned CRC residual: CSBK, LC, embedded LC
   float frequency_offset;          // Hz, the receiver's correction
 };
 void dmr_chan_get_stats(struct dmr_chan const *c,struct dmr_chan_stats *s);

@@ -221,3 +221,15 @@ Description: P25 decoder for ka9q-radio
  messages and data units, and follows trunked calls by asking radiod for
  their voice channels. When built with mbelib it also sends the speech of
  unencrypted calls as an RTP stream that monitor plays and pcmrecord records.
+
+Package: ka9q-radio-dmr
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, systemd, ka9q-radio-common
+Description: DMR decoder for ka9q-radio
+ Decodes ETSI DMR (TS 102 361) repeater outputs, both timeslots, from radiod
+ I/Q multicast streams: conventional, Capacity Plus, Connect Plus, Capacity
+ Max, Tier III and Hytera systems. Logs transmissions, control signalling and
+ packet data, votes between repeaters that carry the same call, and follows
+ trunked calls by asking radiod for their repeaters. When built with mbelib
+ it also sends the speech of unencrypted calls as an RTP stream that monitor
+ plays and pcmrecord records.

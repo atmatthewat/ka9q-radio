@@ -532,6 +532,10 @@ float dmr_rx_frequency_offset(struct dmr_rx const *rx){
 uint64_t dmr_rx_symbol_count(struct dmr_rx const *rx){
   return rx->symbol_count;
 }
+void dmr_rx_restrict_family(struct dmr_rx *rx,enum dmr_station mode){
+  if(rx != NULL)
+    dmr_sink_restrict_family(rx->sink,mode);
+}
 struct dmr_sink const *dmr_rx_sink(struct dmr_rx const *rx){
   return rx->sink;
 }

@@ -51,6 +51,7 @@ struct dmr_site_config {
   enum dmr_system_type type;
   int system_color_code;        // DMR_SITE_CC_TRACK by default
   int site_color_code;          // DMR_SITE_CC_INHERIT by default
+  bool compressed_talkgroups;   // grants' talkgroups in the dialable form (dmrcall.h, compressed_talkgroups)
   int nchannels;
   struct dmr_site_channel_config const *channels; // copied by dmr_site_create()
 };
@@ -278,6 +279,9 @@ struct dmr_site_report {
   uint64_t foreign_identity_messages;
   int nneighbours;
   uint32_t neighbours[DMR_SITE_MAX_NEIGHBOURS]; // ascending
+  char neighbour_details[DMR_SITE_MAX_NEIGHBOURS][40]; // what the air says of each, index for index: its
+                                // control LCN and frequency (Tier III, Hytera), rest LSN (Capacity Plus), free
+                                // repeater (XPT); "" if nothing
   bool rest_known;
   uint8_t rest_lsn;
   uint16_t rest_lcn;
@@ -322,6 +326,12 @@ struct dmr_cplane_options {
   uint16_t csbk_crc_mask;       // DMR_CRC_MASK_CSBK; another only by the owner's decision (dmrcsbk.h)
   uint64_t mbc_max_block_gap_us; // DMR_MBC_MAX_BLOCK_GAP_US
   uint64_t slot_gap_dibits;     // a timeslot's transmission ends after this long silent (4800, 1 s)
+  // Accept a CSBK whose CRC fails with a residual seen twice for its (CSBKO, FID) within two minutes
+  // (dmrmsg.h, dmr_crc_learner; Motorola RAS and the like). Off by default
+  bool learn_crc_masks;
+  // Called the first time a residual is accepted (optional)
+  void (*learned)(void *arg,enum dmr_crc_check kind,uint8_t opcode,uint8_t fid,uint32_t residual);
+  void *learned_arg;
 };
 void dmr_cplane_options_init(struct dmr_cplane_options *o);
 
@@ -377,6 +387,7 @@ void dmr_cplane_flush(struct dmr_cplane *c);  // end of input: waiting lines wri
 // The channel as the site names it, with the system tag as of now
 void dmr_cplane_context(struct dmr_cplane *c,struct dmr_site_context *channel);
 int dmr_cplane_handle(struct dmr_cplane const *c); // in its site; -1 without one
+uint64_t dmr_cplane_learned_csbks(struct dmr_cplane const *c); // CSBKs accepted with a learned residual
 // A copy, from any thread
 void dmr_cplane_get_counters(struct dmr_cplane *c,struct dmr_cplane_counters *out);
 // The CRC masks seen on CSBKs that failed (a vendor mask shows as one entry with a large count); a copy

@@ -97,6 +97,7 @@ float dmr_rx_frequency_offset(struct dmr_rx const *rx); // Hz, after the last bl
 uint64_t dmr_rx_symbol_count(struct dmr_rx const *rx);  // symbols delivered (the next symbol's index)
 void dmr_rx_get_status(struct dmr_rx const *rx,struct dmr_rx_status *status);
 struct dmr_sink const *dmr_rx_sink(struct dmr_rx const *rx); // the sink's state, counters and summary (dmrsink.h)
+void dmr_rx_restrict_family(struct dmr_rx *rx,enum dmr_station mode); // dmr_sink_restrict_family(), on the rx's thread
 
 // The demodulator's symbol delay: a dibit on the air at input sample 4 i is symbol i + this
 // (receive lowpass 15 samples, matched filter 32, interpolator 4: 51 samples, 13 symbols at 19200 Hz)

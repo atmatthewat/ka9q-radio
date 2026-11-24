@@ -245,6 +245,59 @@ struct dmr_data_options {
 };
 void dmr_data_options_init(struct dmr_data_options *o); // true, true, 20, DMR_BPTC196_MAX_ERRORS
 
+// CRC mask learning (opt-in). Some systems send a check value other than the standard's (Motorola's
+// "RAS", restricted access to system, among them): every CSBK, voice LC header, terminator and embedded
+// LC of such a system fails its check with the same residual each time. sdrtrunk (GPL-3, Dennis Sheirer,
+// DMRCrcMaskManager.java) learns such a residual by observation; this is its rule: a message whose check
+// failed is accepted once its residual has been seen twice for the same key within 2 minutes (and within
+// 20 lookups of that key), and every later one with that residual too. Here the key is (check, opcode,
+// FID), not the opcode alone (Motorola's and Hytera's CSBKO 32 are different messages); a residual older
+// than the window is forgotten before the lookup, not after; the tables are bounded (64 keys, 8 residuals
+// a key, the stalest goes first). The residual, per check (exact: nothing is corrected towards one):
+//   CSBK     the CRC-CCITT mask the 96 bits would pass with (standard 0xA5A5); opcode = CSBKO
+//   RS129    the 96-bit LC's parity XOR the parity of its nine octets (0x969696 header, 0x999999
+//            terminator, 0 Hytera as standard); opcode = FLCO
+//   CRC5     the embedded LC's checksum as computed XOR as received; only for an LC whose BPTC(128,77)
+//            word arrived as a codeword (none corrected): 31 values are too few to tell noise from a mask
+// A message accepted this way passed BPTC and the CRC sdrtrunk would accept, and no more: the call
+// tracker takes identity from such an LC and lets it say encrypted, never clear. A CSBK so accepted is a
+// CSBK like any other. sdrtrunk's ignore_crc (accept everything) is not offered: it makes messages of noise
+enum dmr_crc_check { DMR_CRC_CHECK_CSBK = 0, DMR_CRC_CHECK_RS129, DMR_CRC_CHECK_CRC5 };
+char const *dmr_crc_check_name(enum dmr_crc_check k); // "csbk", "lc", "emblc"
+#define DMR_LEARN_MAX_KEYS 64
+#define DMR_LEARN_MAX_RESIDUALS 8
+struct dmr_learn_residual {
+  uint32_t value;
+  uint32_t sightings;
+  uint32_t staleness;           // lookups of the key since it was last seen
+  uint64_t last_us;
+  uint64_t accepted;
+};
+struct dmr_learn_key {
+  uint8_t kind,opcode,fid;
+  int nresiduals;
+  struct dmr_learn_residual residuals[DMR_LEARN_MAX_RESIDUALS];
+};
+struct dmr_crc_learner {
+  uint64_t window_us;           // 120 s
+  uint32_t stale_lookups;       // 20
+  uint32_t sightings;           // 2
+  int nkeys;
+  struct dmr_learn_key keys[DMR_LEARN_MAX_KEYS];
+  uint64_t lookups[3];          // failed checks offered, by kind
+  uint64_t accepted[3];         // ... accepted with a learned residual
+  uint64_t evicted;
+  // Called the first time a residual is accepted (optional)
+  void (*learned)(void *arg,enum dmr_crc_check kind,uint8_t opcode,uint8_t fid,uint32_t residual);
+  void *learned_arg;
+};
+void dmr_crc_learner_init(struct dmr_crc_learner *l);
+// A message whose standard check failed with 'residual' at now_us (signal time). True: accept it as it is
+bool dmr_crc_learner_check(struct dmr_crc_learner *l,enum dmr_crc_check kind,uint8_t opcode,uint8_t fid,
+                           uint32_t residual,uint64_t now_us);
+// "learned: csbk=3 lc=1 emblc=0 [csbk 62/0x10:0x1234 x5 ...]"
+int dmr_crc_learner_summary(char *buf,size_t size,struct dmr_crc_learner const *l);
+
 struct dmr_data_burst {
   enum dmr_data_type data_type;
   uint8_t color_code;
@@ -269,6 +322,7 @@ struct dmr_data_burst {
   bool lc_uncorrected;       // passed RS as BPTC delivered it: the stricter test for "clear"
   uint8_t rs_mask;           // the mask it passed with: 0x96, 0x99, or 0x00 (Hytera)
   uint32_t rs_observed_mask; // parity XOR recomputed parity, 0xAABBCC; set whenever bptc_ok
+  bool learned_mask;         // valid only through a learned residual (dmr_crc_learner): never says clear
 
   // PI header, when status == DMR_DATA_VALID
   bool has_pi;
@@ -286,6 +340,9 @@ static inline bool dmr_data_lc_usable(struct dmr_data_burst const *d){
 // b->kind must be DMR_KIND_DATA and its slot type valid, or the result is DMR_DATA_REFUSED.
 // options may be NULL (the defaults)
 void dmr_data_decode(struct dmr_data_burst *d,struct dmr_burst const *b,struct dmr_data_options const *options);
+// The same, offering an LC header or terminator that fails every standard RS mask to 'learner' (NULL: none)
+void dmr_data_decode_learning(struct dmr_data_burst *d,struct dmr_burst const *b,struct dmr_data_options const *options,
+                              struct dmr_crc_learner *learner);
 int dmr_data_describe(char *buf,size_t size,struct dmr_data_burst const *d);
 
 // ---------------- Voice frames ----------------
@@ -326,6 +383,8 @@ struct dmr_embedded_lc {
   int corrected;           // bits BPTC changed (0 = the 128 bits arrived as a codeword)
   float weighted_errors;   // those bits' confidences, in units of the mean confidence
   int inferred_fragments;  // fragments taken from bursts whose EMB did not decode, placed by timing
+  bool learned_mask;       // valid only through a learned checksum residual: never says clear
+  uint8_t checksum_residual;
 };
 // One per timeslot
 struct dmr_elc_assembler {
@@ -333,6 +392,8 @@ struct dmr_elc_assembler {
   int count;
   int inferred;
   uint64_t first_clock;
+  uint64_t timestamp_us;   // of the last fragment stored
+  struct dmr_crc_learner *learner; // NULL: none (the message decoder's, when it learns)
   bool present[4];
   uint8_t bits[128];
   float confidence[128];
@@ -518,6 +579,12 @@ struct dmr_ta_assembler {
   uint8_t blocks[3][56];
   bool have_reported;
   char reported[DMR_TALKER_ALIAS_TEXT];
+  // Capacity Max (FID 0x10 FLCO 0x14 first fragment, 0x15 continuation): joined, first then continuation,
+  // as sdrtrunk's DMRDecoderState does (GPL-3, Dennis Sheirer, :1196-1262); reported when both have come
+  // in the transmission, or the first alone when its length says it holds the whole alias. ISO 8859-1;
+  // the length's unit is not established, so it does not cut the text
+  bool have_cap_max_first,have_cap_max_continuation;
+  struct dmr_lc_cap_max_talker_alias cap_max_first,cap_max_continuation;
 };
 void dmr_ta_reset(struct dmr_ta_assembler *a);
 // Feed an LC that passed its check. True (and *alias) when it completes an alias not reported
@@ -531,6 +598,7 @@ struct dmr_msg_options {
   int hidden_iv_max_golay_errors; // a hidden IV is reported only within this many corrections in all
   float single_burst_max_corrected;
   uint64_t slot_gap_dibits; // a slot's assembly state is dropped after this long silent
+  bool learn_crc_masks;     // accept LCs with a learned CRC residual (dmr_crc_learner; default off)
 };
 void dmr_msg_options_init(struct dmr_msg_options *o); // data defaults, 3, 2, 4800
 
@@ -582,6 +650,7 @@ struct dmr_msg_slot {
 };
 struct dmr_msg_decoder {
   struct dmr_msg_options options;
+  struct dmr_crc_learner learner; // used when options.learn_crc_masks
   struct dmr_slc_assembler short_lc;
   struct dmr_msg_slot slots[3]; // 0 = slot not known, 1, 2
   struct dmr_msg_counters counters;

@@ -113,6 +113,7 @@ struct decoder {
   struct configured_site *configured; // the site from the sites file the carrier belongs to, else NULL
   char const *system_name; // "DMR", or the configured site's system
   uint64_t refresh_voice;  // voice bursts decoded when a followed channel was last kept alive
+  uint64_t refresh_bursts; // bursts, likewise
   int64_t next_refresh;    // signal time of the next check, ns
 };
 
@@ -129,10 +130,16 @@ struct configured_site {
   char system_name[DMR_SITE_NAME_MAX];
   char site_name[DMR_SITE_NAME_MAX];
   int color_code;
+  bool learn_crc_masks;
+  bool compressed_talkgroups;
   struct dmr_site *site;
   struct dmr_control_log *log;
   _Atomic int64_t latest;  // the latest signal time any of its channels has decoded, ns since the GPS epoch
   _Atomic uint64_t site_clock;
+  _Atomic int64_t last_heard;  // when (wall, ns) one of its channels last decoded a burst; 0 not yet
+  int64_t hunt_start;          // hunting (the input thread's): when the site was first seen dark
+  int probe_next;              // the next channel to probe
+  int64_t probe_until;
   int nchannels;
   struct configured_channel *channels;
 };
@@ -194,6 +201,8 @@ static int Mcast_ttl = DEFAULT_TTL;
 static int IP_tos = DEFAULT_IP_TOS;
 static int Color_code = -1;           // -c: pinned 0-15, -1 tracked, -2 any
 static bool Mobile;                   // -M: also MS and direct mode syncs (simplex, talkaround)
+static bool Stations_bs = true,Stations_ms,Stations_direct,Stations_auto; // -s
+static bool Learn_crc_masks;          // -L: accept messages whose CRC fails with a residual seen twice
 static enum dmr_system_type System_type = DMR_SYSTEM_CONVENTIONAL; // -y
 static char const *Sites_file;        // -f
 static struct configured_site *Sites;
@@ -221,6 +230,7 @@ static struct {
   int radio;                          // a followed channel, even once radiod has let it go
   int64_t logged;
   bool rest;                          // asked for as a site's rest channel, not for a call (not counted by -m)
+  bool probe;                         // asked for while hunting a dark site's control channel (ditto)
 } Asked[MAX_ASKED];
 static int Nasked;
 struct tg_range { uint32_t lo,hi; };
@@ -269,6 +279,7 @@ static void decoder_event(struct decoder const *dp,int64_t when,char const *fmt,
 static void voice_frame(void *arg,struct dmr_chan_frame const *f);
 static void voice_event(void *arg,struct dmr_chan_event const *e);
 static void voice_log(void *arg,int64_t when,char const *text);
+static void voice_notice(void *arg,int64_t when,char const *text);
 static void status_line(struct decoder const *dp);
 static void vote_end(void *arg,struct dmr_vote_result const *r);
 static void control_line(void *arg,struct dmr_control_line const *line);
@@ -276,6 +287,7 @@ static void control_clear(void *arg,struct dmr_site_context const *channel,uint8
 static int64_t control_wall_clock(void *arg);
 static uint64_t control_site_clock(void *arg);
 static void load_sites(char const *file);
+static void site_summaries(void);
 static void free_sites(void);
 static struct configured_site *find_site(uint64_t frequency_hz,struct configured_channel **channel);
 static void site_line(void *arg,struct dmr_control_line const *line);
@@ -285,12 +297,14 @@ static void observe_radio(struct session *sp);
 static void site_follow(void *arg,struct dmr_site *site,struct dmr_follow const *f);
 static void channel_follow(void *arg,struct dmr_site *site,struct dmr_follow const *f);
 static void keep_followed(struct decoder *dp,int64_t now);
+static void hunt(int64_t now);
 static int parse_ranges(struct tg_range *list,int n,char const *arg);
 
 static struct option Options[] = {
   {"iface", required_argument, NULL, 'A'},
   {"color-code", required_argument, NULL, 'c'},
   {"hold", required_argument, NULL, 'H'},
+  {"learn-crc-masks", no_argument, NULL, 'L'},
   {"talkgroups", required_argument, NULL, 'g'},
   {"exclude", required_argument, NULL, 'x'},
   {"max-calls", required_argument, NULL, 'm'},
@@ -299,6 +313,7 @@ static struct option Options[] = {
   {"input", required_argument, NULL, 'I'},
   {"locale", required_argument, NULL, 'l'},
   {"mobile", no_argument, NULL, 'M'},
+  {"stations", required_argument, NULL, 's'},
   {"name", required_argument, NULL, 'N'},
   {"source", required_argument, NULL, 'o'},
   {"tos", required_argument, NULL, 'p'},
@@ -312,10 +327,10 @@ static struct option Options[] = {
   {"system-type", required_argument, NULL, 'y'},
   {NULL, 0, NULL, 0},
 };
-static char const Optstring[] = "A:c:f:g:H:I:l:m:MnN:o:p:R:S:t:T:u:vVx:y:";
+static char const Optstring[] = "A:c:f:g:H:I:l:Lm:MnN:o:p:R:s:S:t:T:u:vVx:y:";
 
 static void usage(void){
-  fprintf(stderr,"Usage: %s [-v|--verbose] [-V|--version] [-l|--locale locale] [-A|--iface interface] [-o|--source <source-name-or-address>] [-S|--ssrc ssrc] [-t|--timeout seconds] [-u|--update seconds] [-c|--color-code n|any|track] [-M|--mobile] [-y|--system-type conventional|capacity_plus|...] [-f|--sites sites_file] [-n|--no-follow] [-H|--hold seconds] [-g|--talkgroups list] [-x|--exclude list] [-m|--max-calls n] [-R|--pcm-out audio_mcast_address] [-N|--name service_name] [-T|--ttl ttl] [-p|--tos tos] [-I|--input] iq_mcast_address [iq_mcast_address ...]\n",App_path);
+  fprintf(stderr,"Usage: %s [-v|--verbose] [-V|--version] [-l|--locale locale] [-A|--iface interface] [-o|--source <source-name-or-address>] [-S|--ssrc ssrc] [-t|--timeout seconds] [-u|--update seconds] [-c|--color-code n|any|track] [-M|--mobile] [-s|--stations bs|ms|direct|all|auto] [-L|--learn-crc-masks] [-y|--system-type conventional|capacity_plus|...] [-f|--sites sites_file] [-n|--no-follow] [-H|--hold seconds] [-g|--talkgroups list] [-x|--exclude list] [-m|--max-calls n] [-R|--pcm-out audio_mcast_address] [-N|--name service_name] [-T|--ttl ttl] [-p|--tos tos] [-I|--input] iq_mcast_address [iq_mcast_address ...]\n",App_path);
 }
 
 int main(int argc,char *argv[]){
@@ -364,6 +379,25 @@ int main(int argc,char *argv[]){
       break;
     case 'n':
       Follow = false;
+      break;
+    case 's':
+      Stations_bs = Stations_ms = Stations_direct = Stations_auto = false;
+      if(strcmp(optarg,"bs") == 0)
+        Stations_bs = true;
+      else if(strcmp(optarg,"ms") == 0)
+        Stations_ms = true;
+      else if(strcmp(optarg,"direct") == 0)
+        Stations_direct = true;
+      else if(strcmp(optarg,"all") == 0 || strcmp(optarg,"auto") == 0){
+        Stations_bs = Stations_ms = Stations_direct = true;
+        Stations_auto = strcmp(optarg,"auto") == 0;
+      } else {
+        fprintf(stderr,"Bad --stations \"%s\": bs, ms, direct, all or auto\n",optarg);
+        exit(EX_USAGE);
+      }
+      break;
+    case 'L':
+      Learn_crc_masks = true;
       break;
     case 'g':
       Nallow = parse_ranges(Allow,Nallow,optarg);
@@ -491,6 +525,7 @@ int main(int argc,char *argv[]){
 
   input_loop();
   cleanup();
+  site_summaries();
   free_sites(); // after every channel has gone: their pending counts are written here
   for(int i=0; i < Nradios; i++)
     chanctl_destroy(Radios[i].ctl); // the channels followed are released
@@ -766,7 +801,29 @@ static int64_t session_time(struct session const *sp,uint32_t timestamp){
 
 static bool was_asked(uint32_t ssrc);
 
+// Each configured site's summary (the -v status lines; at shutdown, always)
+static void site_summaries(void){
+  for(int i=0; i < Nsites; i++){
+    char summary[4096];
+    dmr_site_summary(summary,sizeof summary,Sites[i].site);
+    char ts[100];
+    int64_t const latest = atomic_load(&Sites[i].latest);
+    format_gpstime(ts,sizeof ts,latest != 0 ? latest : gps_time_ns());
+    pthread_mutex_lock(&Output_mutex);
+    fprintf(stdout,"%s %s\n",ts,summary); // the summary names the site
+    pthread_mutex_unlock(&Output_mutex);
+  }
+}
+
 static void scan_sessions(int64_t now){
+  static int64_t next_summary;
+  if(Verbose && Update > 0 && Nsites > 0 && now >= next_summary){
+    if(next_summary != 0)
+      site_summaries();
+    next_summary = now + (int64_t)Update * BILLION;
+  }
+  if(Follow && Nsites > 0)
+    hunt(now);
   struct session *next = NULL;
   for(struct session *sp = Sessions; sp != NULL; sp = next){
     next = sp->next;
@@ -892,6 +949,7 @@ static void *decode_task(void *arg){
     .frame = voice_frame,
     .event = voice_event,
     .log = voice_log,
+    .notice = voice_notice,
     .arg = &dec,
   };
   snprintf(dec.channel_id,sizeof dec.channel_id,"%u",sp->ssrc);
@@ -899,7 +957,11 @@ static void *decode_task(void *arg){
   struct dmr_chan_config config;
   dmr_chan_config_init(&config);
   config.color_code = Color_code;
-  config.mobile_station = config.direct = Mobile;
+  config.base_station = Stations_bs || Mobile;
+  config.mobile_station = Stations_ms || Mobile;
+  config.direct = Stations_direct || Mobile;
+  config.auto_stations = Stations_auto;
+  config.learn_crc_masks = Learn_crc_masks;
   config.channel_id = dec.channel_id;
   while(true){
     pthread_mutex_lock(&sp->qmutex);
@@ -932,6 +994,8 @@ static void *decode_task(void *arg){
         config.log = dec.configured->log;
         config.lcn = ch->lcn;
         config.color_code = dec.configured->color_code;
+        config.learn_crc_masks = dec.configured->learn_crc_masks;
+        config.compressed_talkgroups = dec.configured->compressed_talkgroups;
       }
     }
     if(dec.configured != NULL){
@@ -1139,7 +1203,7 @@ static uint64_t control_site_clock(void *arg){
 //   lcn = "1 2"             each one's logical channel number, in the same order (trunked systems)
 // A channel whose frequency the file lists joins that site; any other is a site of its own
 
-static char const *Site_keys[] = { "system", "site", "type", "color-code", "freq", "lcn", NULL };
+static char const *Site_keys[] = { "system", "site", "type", "color-code", "freq", "lcn", "learn-crc-masks", "compressed-talkgroups", NULL };
 
 static int parse_color_code(char const *s,int def){
   if(s == NULL)
@@ -1169,6 +1233,8 @@ static void load_sites(char const *file){
     strlcpy(cs->system_name,config_getstring(table,name,"system",name),sizeof cs->system_name);
     strlcpy(cs->site_name,config_getstring(table,name,"site",name),sizeof cs->site_name);
     cs->color_code = parse_color_code(config_getstring(table,name,"color-code",NULL),Color_code);
+    cs->learn_crc_masks = config_getboolean(table,name,"learn-crc-masks",Learn_crc_masks);
+    cs->compressed_talkgroups = config_getboolean(table,name,"compressed-talkgroups",false);
     enum dmr_system_type type = System_type;
     char const * const t = config_getstring(table,name,"type",NULL);
     if(cs->color_code < -2 || (t != NULL && !dmr_system_type_from_name(t,&type))){
@@ -1223,6 +1289,7 @@ static void load_sites(char const *file){
     strlcpy(sc.site_name,cs->site_name,sizeof sc.site_name);
     sc.type = type;
     sc.system_color_code = cs->color_code;
+    sc.compressed_talkgroups = cs->compressed_talkgroups;
     sc.nchannels = cs->nchannels;
     sc.channels = plan;
     struct dmr_site_options so;
@@ -1391,7 +1458,7 @@ static bool talkgroup_wanted(struct dmr_follow const *f){
 static int calls_followed(void){
   int n = 0;
   for(int j=0; j < Nasked; j++){
-    if(Asked[j].rest)
+    if(Asked[j].rest || Asked[j].probe)
       continue;
     enum chanctl_state const st = chanctl_state(Radios[Asked[j].radio].ctl,Asked[j].ssrc,NULL,NULL);
     n += st == CHANCTL_PENDING || st == CHANCTL_UP;
@@ -1482,8 +1549,11 @@ static void follow(char const *who,int64_t when,struct dmr_follow const *f){
       Asked[asked].radio = i;
       Asked[asked].logged = 0;
       Asked[asked].rest = f->rest;
-    } else if(asked >= 0 && !following)
+      Asked[asked].probe = false;
+    } else if(asked >= 0 && !following){
       Asked[asked].rest = f->rest; // asked for again: for what, now
+      Asked[asked].probe = false;
+    }
     // A line when the channel is asked for while no decoder is on it (at most every 2 s: the
     // announcements repeat until its I/Q arrives)
     int64_t const now_ns = gps_time_ns();
@@ -1569,23 +1639,115 @@ static bool was_asked(uint32_t ssrc){
 
 // A followed channel is kept while it carries voice, checked twice a second. Not any burst: a repeater
 // that is also a rest channel sends its beacons between calls
+// A probe (hunting) is kept while it carries any bursts: a control channel's beacons are what was sought.
+// Each channel of a configured site also says when the site was last heard, for hunting
 static void keep_followed(struct decoder *dp,int64_t now){
   if(now == 0 || now < dp->next_refresh)
     return;
   dp->next_refresh = now + BILLION / 2;
   struct dmr_chan_stats st;
   dmr_chan_get_stats(dp->chan,&st);
-  if(st.voice_bursts == dp->refresh_voice)
-    return;
+  bool const bursts = st.bursts != dp->refresh_bursts;
+  bool const voice = st.voice_bursts != dp->refresh_voice;
+  dp->refresh_bursts = st.bursts;
   dp->refresh_voice = st.voice_bursts;
+  if(bursts && dp->configured != NULL)
+    atomic_store(&dp->configured->last_heard,gps_time_ns());
+  if(!bursts)
+    return;
   pthread_mutex_lock(&Ctl_mutex);
-  for(int i=0; i < Nradios; i++){
-    if(chanctl_ours(Radios[i].ctl,dp->sp->ssrc)){
-      chanctl_refresh(Radios[i].ctl,dp->sp->ssrc);
-      break;
+  bool probe = false;
+  for(int j=0; j < Nasked; j++)
+    if(Asked[j].ssrc == dp->sp->ssrc)
+      probe = Asked[j].probe;
+  if(voice || probe){
+    for(int i=0; i < Nradios; i++){
+      if(chanctl_ours(Radios[i].ctl,dp->sp->ssrc)){
+        chanctl_refresh(Radios[i].ctl,dp->sp->ssrc);
+        break;
+      }
     }
   }
   pthread_mutex_unlock(&Ctl_mutex);
+}
+
+// Hunting (input thread, from scan_sessions()). A configured site of more than one repeater none of whose
+// channels has decoded a burst for Hunt_dark seconds (every repeater dmrd decodes there is dark: none is
+// the control or rest channel) has its other repeaters probed one at a time, each asked for Probe_time
+// seconds; one that carries bursts is kept while it does (keep_followed()), and its messages then name
+// the control or rest channel, which is followed as usual. A repeater a configured channel already
+// carries is not probed
+static double const Hunt_dark = 5.0;
+static double const Probe_time = 2.0;
+static bool live_session(uint32_t ssrc){
+  for(struct session *sp = Sessions; sp != NULL; sp = sp->next)
+    if(sp->ssrc == ssrc && sp->running)
+      return true;
+  return false;
+}
+static void hunt(int64_t now){
+  for(int i=0; i < Nsites; i++){
+    struct configured_site * const cs = &Sites[i];
+    if(cs->nchannels < 2)
+      continue;
+    int64_t const heard = atomic_load(&cs->last_heard);
+    if(heard != 0 && now - heard < (int64_t)(Hunt_dark * BILLION)){
+      cs->hunt_start = 0;
+      continue;
+    }
+    if(cs->hunt_start == 0)
+      cs->hunt_start = now; // dark (or not heard since the start): from now
+    if(now - cs->hunt_start < (int64_t)(Hunt_dark * BILLION) || now < cs->probe_until)
+      continue;
+    // The next repeater no live channel carries
+    pthread_mutex_lock(&Ctl_mutex);
+    for(int tries=0; tries < cs->nchannels; tries++){
+      struct configured_channel * const ch = &cs->channels[cs->probe_next];
+      cs->probe_next = (cs->probe_next + 1) % cs->nchannels;
+      bool done = false;
+      for(int r=0; r < Nradios && !done; r++){
+        struct radio * const rd = &Radios[r];
+        if(!rd->have_format)
+          continue;
+        uint32_t const ssrc = chanctl_ssrc(rd->ctl,(double)ch->frequency_hz,&rd->format);
+        if(live_session(ssrc)){
+          done = true; // carried already (it is dark too): the next
+          break;
+        }
+        errno = 0;
+        if(chanctl_request(rd->ctl,ssrc,(double)ch->frequency_hz,&rd->format,Probe_time) < 0){
+          if(errno == ERANGE)
+            continue; // the next radiod
+          break;
+        }
+        int asked = -1;
+        for(int j=0; j < Nasked && asked < 0; j++)
+          if(Asked[j].ssrc == ssrc)
+            asked = j;
+        if(asked < 0 && Nasked < MAX_ASKED){
+          asked = Nasked++;
+          Asked[asked].ssrc = ssrc;
+          Asked[asked].radio = r;
+          Asked[asked].logged = 0;
+          Asked[asked].rest = false;
+        }
+        if(asked >= 0)
+          Asked[asked].probe = true;
+        cs->probe_until = now + (int64_t)(Probe_time * BILLION);
+        if(Verbose){
+          char ts[100];
+          format_gpstime(ts,sizeof ts,gps_time_ns());
+          pthread_mutex_lock(&Output_mutex);
+          fprintf(stdout,"%s site %s/%s nothing heard for %.0f s: probing %.6lf MHz LCN %u ssrc %u\n",ts,cs->system_name,
+                  cs->site_name,(now - cs->hunt_start) * 1e-9,ch->frequency_hz * 1e-6,ch->lcn,ssrc);
+          pthread_mutex_unlock(&Output_mutex);
+        }
+        tries = cs->nchannels; // one probe at a time
+        done = true;
+      }
+    }
+    pthread_mutex_unlock(&Ctl_mutex);
+  }
 }
 
 static void vote_end(void *arg,struct dmr_vote_result const *r){
@@ -1608,6 +1770,9 @@ static void voice_log(void *arg,int64_t when,char const *text){
   if(Verbose)
     decoder_event(dp,when,"%s",text);
 }
+static void voice_notice(void *arg,int64_t when,char const *text){
+  decoder_event(arg,when,"%s",text);
+}
 
 static void status_line(struct decoder const *dp){
   struct dmr_chan_stats st;
@@ -1617,6 +1782,14 @@ static void status_line(struct decoder const *dp){
                 (unsigned long long)st.bursts,(unsigned long long)st.syncs,(unsigned long long)st.acquisitions,
                 (unsigned long long)st.voice_bursts,(unsigned long long)st.frames_clear,(unsigned long long)st.frames_encrypted,
                 (unsigned long long)st.frames_unconfirmed,st.color_code,st.frequency_offset);
+  if(dp->site != NULL){ // a site of its own: its summary with the channel's status
+    char summary[4096];
+    dmr_site_summary(summary,sizeof summary,dp->site);
+    decoder_event(dp,0,"%s",summary);
+  }
+  if(st.learned[0] + st.learned[1] + st.learned[2] != 0)
+    decoder_event(dp,0,"accepted with a learned CRC mask: csbk %'llu lc %'llu emblc %'llu",(unsigned long long)st.learned[0],
+                  (unsigned long long)st.learned[1],(unsigned long long)st.learned[2]);
 }
 
 // ---------------------------------------------------------------------------

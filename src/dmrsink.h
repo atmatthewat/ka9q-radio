@@ -167,6 +167,9 @@ uint32_t dmr_sink_color_code_observations(struct dmr_sink const *s,uint8_t cc); 
 uint64_t dmr_sink_color_code_changes(struct dmr_sink const *s); // times the tracked code changed
 struct dmr_sink_counters const *dmr_sink_counters(struct dmr_sink const *s);
 struct dmr_sink_config const *dmr_sink_config(struct dmr_sink const *s);
+// Look for one station family's syncs only from now on (DMR_STATION_BS, _MS, _DIRECT), or for every family
+// the configuration enabled (DMR_STATION_UNKNOWN). On the sink's thread, between bursts
+void dmr_sink_restrict_family(struct dmr_sink *s,enum dmr_station mode);
 // One line for a periodic summary (no newline); returns what snprintf() does
 int dmr_sink_summary(struct dmr_sink const *s,char *line,int size);
 

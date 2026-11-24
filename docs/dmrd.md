@@ -50,7 +50,9 @@ dmrd [options] dmr-iq.local [more groups ...]
 - **-T**, **--ttl** *ttl*: multicast TTL of the voice output (default 0: this host only)
 - **-p**, **--tos** *tos*: IP type of service of the voice output (default 184, expedited forwarding)
 - **-c**, **--color-code** *n*|**any**|**track**: the colour code to decode, 0-15; **track** (the default) takes each channel's from its first strong sync and follows it; **any** decodes every one
-- **-M**, **--mobile**: also look for mobile station and direct mode syncs (simplex, talkaround), not only repeater outputs
+- **-M**, **--mobile**: also look for mobile station and direct mode syncs (simplex, talkaround), not only repeater outputs (**-s all**)
+- **-s**, **--stations** **bs**|**ms**|**direct**|**all**|**auto**: which stations' syncs to look for: **bs** (the default) a repeater output, **ms** a repeater input or simplex, **direct** TDMA direct mode, **all** every family, **auto** every family until one family's synced bursts lead each other's by more than 10, then that one only (logged)
+- **-L**, **--learn-crc-masks**: accept messages whose check fails with a residual seen twice (see **CRC masks** below); also **learn-crc-masks** in a sites file
 - **-f**, **--sites** *file*: which repeaters make up each site, and the system each site belongs to (see **Sites** below)
 - **-n**, **--no-follow**: don't ask *radiod* for the repeaters calls are announced on
 - **-H**, **--hold** *seconds*: keep a followed repeater this long after the last sign of its call (default 5)
@@ -58,7 +60,7 @@ dmrd [options] dmr-iq.local [more groups ...]
 - **-x**, **--exclude** *list*: never follow group calls on these talkgroups (repeatable)
 - **-m**, **--max-calls** *n*: follow at most *n* calls at once (default: no limit; rest channels don't count)
 - **-y**, **--system-type** *type*: the kind of system the channels belong to, which says how its signalling is read: **conventional** (the default; amateur repeaters, IP Site Connect), **tier3**, **capacity_plus**, **linked_capacity_plus**, **connect_plus**, **capacity_max**, **hytera_xpt** or **hytera_tier3**
-- **-v**, **--verbose**: more messages; at -v each channel also logs a status line, and link control, talker aliases and re-anchored clocks are logged
+- **-v**, **--verbose**: more messages; at -v each channel also logs a status line and each site a summary, and link control, talker aliases, re-anchored clocks and probes of a dark site are logged
 - **-u**, **--update** *seconds*: interval between the -v status lines (default 10)
 - **-t**, **--timeout** *seconds*: close a channel after this long without data (default 20)
 - **-S**, **--ssrc** *ssrc*: decode only this channel
@@ -121,8 +123,20 @@ lcn = "1"
 - **color-code**: as **-c** (default: **-c**'s)
 - **freq**: the site's repeater outputs (the frequencies *radiod* sends them on)
 - **lcn**: each repeater's logical channel number, in the same order, as the system's signalling numbers them (Capacity Plus and Tier III name repeaters by LCN); none for a conventional site
+- **learn-crc-masks**: as **-L**, for this site (default: **-L**'s)
+- **compressed-talkgroups**: the system's talkgroups are in the dialable form of TS 102 361-2 annex C (Hytera Tier III systems use it): a group call's talkgroup is converted to the number a user dials before it is used for anything (streams, logs, **-g** and **-x**). Default no
 
-A channel joins the site that lists its frequency (to within 1 kHz), whichever *radiod* it comes from; one no site lists is a site of its own. The site's channels share its state and its control log, and their clocks are the signal's.
+A channel joins the site that lists its frequency (to within 1 kHz), whichever *radiod* it comes from; one no site lists is a site of its own. The site's channels share its state and its control log, and their clocks are the signal's. At **-v** each site's summary is written with the status lines, and every configured site's once more when *dmrd* stops: its type and identity, grants, how the calls it announced turned out, its channel map, its neighbours (with their control channel or rest channel where the air says) and each of its channels.
+
+**A dark site.** When none of the channels *dmrd* decodes for a site of more than one repeater has heard anything for 5 seconds (every one of them is dark, so none is the control or rest channel), *dmrd* probes the site's other repeaters one at a time, asking *radiod* for each for 2 seconds. One that carries bursts is kept while it does; what it sends then names the control or rest channel, which is followed as usual. A repeater a channel already carries is not probed. So a site can be configured with every repeater it has but only one or two in *radiod*, and still be found when those are not the rest channel.
+
+## CRC masks
+
+Some systems send a check value other than the standard's (Motorola's restricted access to system, "RAS", among them): every CSBK, voice header, terminator and embedded link control of such a system fails its check, always with the same residual, and without help *dmrd* hears nothing of it. With **-L** (or **learn-crc-masks** for a site) a message whose check fails is accepted once its residual has been seen twice for the same message type within two minutes, and every later one with that residual, as sdrtrunk does. The first time a residual is accepted a line says so:
+```
+... ssrc 453425 453.425000 MHz CRC mask learned: csbk CSBKO 62 FID 0x10 residual 0x1234, accepted from now on (an LC so accepted never says clear)
+```
+A message accepted this way has passed its error correction and nothing more, so a link control word accepted with a learned residual gives the call its talkgroup and source and may say it is encrypted, but never that it is clear: such a call is heard only when a properly checked word says clear. Off by default, since it lets more noise through as messages.
 
 ## Following calls
 
@@ -158,6 +172,6 @@ The instance name is the multicast group. All instances append to **/var/log/dmr
 
 ### Credits
 
-sdrtrunk (Dennis Sheirer, GPL-3) and OP25 (Max H. Parke KA1RBI, Graham J. Norbury and others, GPL-3) were used as references for DMR implementation details, along with ETSI TS 102 361. Taken from them, with a credit beside each in the source: the sync words, the Hamming generator matrices, the CACH bit positions, the block product code layouts and interleaves, the RS(12,9) field and octet order, the CRC masks, the link control, talker alias and burst layouts, and the CSBK opcode table, message layouts and channel numbering (sdrtrunk; OP25 for parts of Connect Plus). The decoders are not theirs, and several of sdrtrunk's known errors (its EMB table for colour codes 8-15, its inverted RS(12,9) check, its CRC residual rule) are not repeated. Speech decoding uses mbelib (https://github.com/szechyjs/mbelib) when it is installed.
+sdrtrunk (Dennis Sheirer, GPL-3) and OP25 (Max H. Parke KA1RBI, Graham J. Norbury and others, GPL-3) were used as references for DMR implementation details, along with ETSI TS 102 361. Taken from them, with a credit beside each in the source: the sync words, the Hamming generator matrices, the CACH bit positions, the block product code layouts and interleaves, the RS(12,9) field and octet order, the CRC masks, the link control, talker alias and burst layouts, the CSBK opcode table, message layouts and channel numbering (sdrtrunk; OP25 for parts of Connect Plus), and the rules for learning CRC masks and for choosing the station family automatically (sdrtrunk). The decoders are not theirs, and several of sdrtrunk's known errors (its EMB table for colour codes 8-15, its inverted RS(12,9) check, its CRC residual rule) are not repeated. Speech decoding uses mbelib (https://github.com/szechyjs/mbelib) when it is installed.
 
 Much of what is here was first worked out, prototyped and run in production by the author in the receivers behind scanrad.io. That is especially true of the front-end signal processing: the approach to receive filtering, carrier frequency tracking, symbol timing recovery and burst framing was originally written for those receivers and tuned there. Those receivers are not ka9q-radio code: what is here is that work, rewritten by the author in plain C for this tree with the assistance of Anthropic's Claude (the Fable and Opus models).

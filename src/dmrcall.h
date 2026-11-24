@@ -82,6 +82,11 @@ struct dmr_call_config {
   bool carry_encrypted;              // true: "encrypted" outlives an end that is no boundary
   bool carry_encrypted_across_sync_loss; // false: ... and a sync loss or a superframe resync
   bool record_unidentified;          // true: write the records of a transmission whose identity is not known
+  // The system's talkgroups are in the compressed (dialable) form, TS 102 361-2 C.2.1.2 (sdrtrunk's
+  // use_compressed_talkgroups, seen on Hytera Tier III): a group call's 24-bit destination is converted
+  // (dmr_hytera_dialable_talkgroup()) before it is used for anything. Unit addresses and the vendor short
+  // forms (8 / 16 bits) are not. False by default
+  bool compressed_talkgroups;
 };
 void dmr_call_config_init(struct dmr_call_config *c);
 static inline enum dmr_emb_pi_mode dmr_call_effective_emb_pi_mode(struct dmr_call_config const *c){
@@ -227,6 +232,8 @@ struct dmr_call_counters {
   uint64_t clear_by_repeated_lc;
   uint64_t clear_refused_header;
   uint64_t clear_refused_embedded;
+  uint64_t learned_mask_lcs;         // LCs valid only through a learned CRC residual: identity, never clear
+  uint64_t clear_refused_learned_mask;
   uint64_t off_grid;
   uint64_t gaps;
   uint64_t gaps_unconfirmed;

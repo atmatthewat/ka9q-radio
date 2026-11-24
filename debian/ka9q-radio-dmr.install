@@ -1,0 +1,3 @@
+usr/sbin/dmrd
+usr/lib/systemd/system/dmrd@.service
+usr/share/man/man8/dmrd.8

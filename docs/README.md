@@ -23,6 +23,7 @@ These are user-facing command references, not the proposed internal architecture
 |---|---|
 | [packetd.8](packetd.8) | AFSK/AX.25 demodulation |
 | [p25d.8](p25d.8) | P25 decoding and trunked call following (full description in [p25d.md](p25d.md)) |
+| [dmrd.8](dmrd.8) | DMR decoding, repeater voting and trunked call following (full description in [dmrd.md](dmrd.md)) |
 | [aprsfeed.8](aprsfeed.8) | Forward APRS traffic to APRS-IS |
 | [aprs.1](aprs.1) | Position/pointing display and rotor-control code |
 | [ctcss.1](ctcss.1) | Tone measurements |

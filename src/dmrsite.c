@@ -774,6 +774,7 @@ struct dmr_site {
   char site_name[DMR_SITE_NAME_MAX];
   enum dmr_system_type type;
   enum dmr_tag_family family;
+  bool compressed_talkgroups;
   struct dmr_control_log *log;
 
   pthread_mutex_t lock;
@@ -793,6 +794,7 @@ struct dmr_site {
   unsigned foreign_logged;
   int nneighbours;
   uint32_t neighbours[DMR_SITE_MAX_NEIGHBOURS];
+  char neighbour_details[DMR_SITE_MAX_NEIGHBOURS][40];
 
   bool rest_known;
   uint8_t rest_lsn;
@@ -983,6 +985,7 @@ struct dmr_site *dmr_site_create(struct dmr_site_config const *config,struct dmr
   copy_string(s->system_name,sizeof s->system_name,config->system_name);
   copy_string(s->site_name,sizeof s->site_name,config->site_name);
   s->type = config->type;
+  s->compressed_talkgroups = config->compressed_talkgroups;
   s->family = dmr_tag_family_of(config->type);
   s->log = log;
   pthread_mutex_init(&s->lock,NULL);
@@ -1324,17 +1327,22 @@ static bool identity(struct dmr_site *s,enum dmr_tag_family family,uint32_t tag,
   return true;
 }
 
-static void neighbour(struct dmr_site *s,uint32_t site){
-  if(s->nneighbours >= DMR_SITE_MAX_NEIGHBOURS)
-    return;
+// A neighbour site, with what the message says of it (detail; NULL or "" for nothing: what is held stays)
+static void neighbour(struct dmr_site *s,uint32_t site,char const *detail){
   int i = 0;
   while(i < s->nneighbours && s->neighbours[i] < site)
     i++;
-  if(i < s->nneighbours && s->neighbours[i] == site)
-    return;
-  memmove(&s->neighbours[i + 1],&s->neighbours[i],(size_t)(s->nneighbours - i) * sizeof s->neighbours[0]);
-  s->neighbours[i] = site;
-  s->nneighbours++;
+  if(i == s->nneighbours || s->neighbours[i] != site){
+    if(s->nneighbours >= DMR_SITE_MAX_NEIGHBOURS)
+      return;
+    memmove(&s->neighbours[i + 1],&s->neighbours[i],(size_t)(s->nneighbours - i) * sizeof s->neighbours[0]);
+    memmove(&s->neighbour_details[i + 1],&s->neighbour_details[i],(size_t)(s->nneighbours - i) * sizeof s->neighbour_details[0]);
+    s->neighbours[i] = site;
+    s->neighbour_details[i][0] = '\0';
+    s->nneighbours++;
+  }
+  if(detail != NULL && detail[0] != '\0')
+    copy_string(s->neighbour_details[i],sizeof s->neighbour_details[i],detail);
 }
 
 // ---- rest channel ----
@@ -1650,18 +1658,33 @@ void dmr_site_csbk(struct dmr_site *s,int handle,struct dmr_csbk_message const *
   case DMR_CSBK_CAP_PLUS_NEIGHBORS:
     if(family_is(s,DMR_TAG_CAPACITY_PLUS,"Capacity Plus neighbours",&a)){
       rest_channel(s,m->u.cap_plus_neighbors.rest_lsn,now,&a);
-      for(int i=0; i < dmr_cap_plus_neighbors_present(&m->u.cap_plus_neighbors); i++)
-        neighbour(s,m->u.cap_plus_neighbors.neighbors[i].site);
+      for(int i=0; i < dmr_cap_plus_neighbors_present(&m->u.cap_plus_neighbors); i++){
+        char detail[40] = "";
+        if(m->u.cap_plus_neighbors.neighbors[i].rest_lsn != 0)
+          format(detail,sizeof detail,"rest LSN %u",(unsigned)m->u.cap_plus_neighbors.neighbors[i].rest_lsn);
+        neighbour(s,m->u.cap_plus_neighbors.neighbors[i].site,detail);
+      }
     }
     break;
   case DMR_CSBK_CON_PLUS_NEIGHBORS:
     for(int i=0; i < 5; i++){
       if(m->u.con_plus_neighbors.sites[i] != 0)
-        neighbour(s,m->u.con_plus_neighbors.sites[i]);
+        neighbour(s,m->u.con_plus_neighbors.sites[i],NULL);
     }
     break;
   case DMR_CSBK_ADJACENT_SITE:
-    neighbour(s,m->u.other_site.other.raw);
+    {
+      char detail[40] = "";
+      uint16_t const lcn = m->u.other_site.lcn;
+      if(lcn != 0){
+        uint64_t const hz = dmr_map_downlink_hz(&s->map,lcn);
+        char mhz[24] = "";
+        if(hz != 0)
+          dmr_format_mhz(mhz,sizeof mhz,hz);
+        format(detail,sizeof detail,"LCN %u%s%s%s",(unsigned)lcn,hz != 0 ? " " : "",mhz,hz != 0 ? " MHz" : "");
+      }
+      neighbour(s,m->u.other_site.other.raw,detail);
+    }
     break;
   case DMR_CSBK_HYTERA_XPT_SITE_STATE:
     if(identity(s,DMR_TAG_HYTERA_XPT,dmr_xpt_system_tag(),"Hytera XPT site state",&a))
@@ -1669,8 +1692,11 @@ void dmr_site_csbk(struct dmr_site *s,int handle,struct dmr_csbk_message const *
     break;
   case DMR_CSBK_HYTERA_XPT_ADJACENT_SITES:
     for(int i=0; i < 4; i++){
-      if(m->u.hytera_xpt_adjacent_sites.sites[i].site != 0)
-        neighbour(s,m->u.hytera_xpt_adjacent_sites.sites[i].site);
+      if(m->u.hytera_xpt_adjacent_sites.sites[i].site != 0){
+        char detail[40];
+        format(detail,sizeof detail,"free %u",(unsigned)m->u.hytera_xpt_adjacent_sites.sites[i].free_repeater);
+        neighbour(s,m->u.hytera_xpt_adjacent_sites.sites[i].site,detail);
+      }
     }
     break;
   default:
@@ -1681,6 +1707,8 @@ void dmr_site_csbk(struct dmr_site *s,int handle,struct dmr_csbk_message const *
   struct dmr_grant grants[DMR_MAX_GRANTS];
   int const ngrants = dmr_csbk_grants(grants,m);
   for(int i=0; i < ngrants; i++){
+    if(s->compressed_talkgroups && grants[i].destination_is_group)
+      grants[i].destination = dmr_hytera_dialable_talkgroup(grants[i].destination);
     struct dmr_grant const *g = &grants[i];
     s->grants++;
     if(dmr_grant_is_data(g))
@@ -1797,6 +1825,7 @@ bool dmr_site_report_get(struct dmr_site *s,struct dmr_site_report *r){
   r->foreign_identity_messages = s->foreign_identity;
   r->nneighbours = s->nneighbours;
   memcpy(r->neighbours,s->neighbours,sizeof r->neighbours);
+  memcpy(r->neighbour_details,s->neighbour_details,sizeof r->neighbour_details);
   r->rest_known = s->rest_known;
   r->rest_lsn = s->rest_lsn;
   r->rest_lcn = (uint16_t)dmr_lsn_to_lcn(s->rest_lsn);
@@ -1898,8 +1927,11 @@ int dmr_site_format_summary(char *buf,size_t size,struct dmr_site_report const *
     append(buf,size,&len," cc_ignored=%llu",(ull)r->color_code_ignored_messages);
   if(r->nneighbours > 0){
     append(buf,size,&len," | neighbours=");
-    for(int i=0; i < r->nneighbours; i++)
+    for(int i=0; i < r->nneighbours; i++){
       append(buf,size,&len,"%s%u",i ? "," : "",r->neighbours[i]);
+      if(r->neighbour_details[i][0] != '\0')
+        append(buf,size,&len,"(%s)",r->neighbour_details[i]);
+    }
   }
   append(buf,size,&len," |");
   for(int i=0; i < r->nchannels; i++){
@@ -1977,6 +2009,7 @@ struct dmr_cplane {
   struct dmr_mbc_assembler mbc;
   struct dmr_csbk_mask_counter masks;
   bool masks_changed;
+  struct dmr_crc_learner learner; // CSBKs, when o.learn_crc_masks
   struct cplane_slot slots[3];
   struct dmr_cplane_counters counters; // the channel thread's
 
@@ -2013,6 +2046,9 @@ struct dmr_cplane *dmr_cplane_create(struct dmr_site_context const *channel,stru
   c->log = log;
   c->handle = -1;
   dmr_mbc_init(&c->mbc,c->o.mbc_max_block_gap_us);
+  dmr_crc_learner_init(&c->learner);
+  c->learner.learned = c->o.learned;
+  c->learner.learned_arg = c->o.learned_arg;
   dmr_csbk_mask_counter_init(&c->masks,0);
   dmr_csbk_mask_counter_init(&c->published_masks,0);
   for(int k=0; k < 3; k++)
@@ -2307,6 +2343,12 @@ void dmr_cplane_burst(struct dmr_cplane *c,struct dmr_burst const *b,struct dmr_
   if(unchecked && m->data.data_type == DMR_DT_CSBK){
     dmr_mbc_on_other_burst(&c->mbc,b->slot);
     dmr_csbk_parse(&e.message,m->data.info,b->slot,b->color_code,b->timestamp_us,c->o.csbk_crc_mask,mobile_sourced);
+    if(!dmr_csbk_parsed(&e.message) && c->o.learn_crc_masks){
+      // A residual seen twice for this (CSBKO, FID) within the window: the CSBK as it is, with that mask
+      uint16_t const mask = e.message.block.observed_mask;
+      if(dmr_crc_learner_check(&c->learner,DMR_CRC_CHECK_CSBK,e.message.block.opcode,e.message.block.fid,mask,b->timestamp_us))
+        dmr_csbk_parse(&e.message,m->data.info,b->slot,b->color_code,b->timestamp_us,mask,mobile_sourced);
+    }
     csbk = &e.message;
     crc_failed = !dmr_csbk_parsed(csbk);
   } else if(unchecked && (m->data.data_type == DMR_DT_MBC_HEADER || m->data.data_type == DMR_DT_MBC_CONTINUATION)){
@@ -2365,6 +2407,9 @@ void dmr_cplane_context(struct dmr_cplane *c,struct dmr_site_context *channel){
   *channel = c->context;
 }
 
+uint64_t dmr_cplane_learned_csbks(struct dmr_cplane const *c){
+  return c != NULL ? c->learner.accepted[DMR_CRC_CHECK_CSBK] : 0;
+}
 int dmr_cplane_handle(struct dmr_cplane const *c){
   return c->handle;
 }

@@ -1,0 +1,274 @@
+.\" Manual page for dmrd; the full description is docs/dmrd.md.
+.\" Source: src/dmrd.c
+.TH "DMRD" "8" "November 24, 2026" "ka9q-radio" "ka9q-radio Manual"
+.SH NAME
+dmrd \- decode ETSI DMR channels from radiod, vote between repeaters and follow trunked calls
+.SH SYNOPSIS
+.B dmrd
+.RI "[options] [-I input ...] [-R output] [-f sites] [input ...]"
+.SH DESCRIPTION
+dmrd listens to one or more multicast groups carrying complex baseband (I/Q)
+channels from radiod and decodes every DMR (ETSI TS 102 361) channel on them,
+both timeslots, each channel in its own thread: conventional repeaters and
+networks, and Motorola Capacity Plus, Connect Plus and Capacity Max, Tier III
+and Hytera systems. It logs every transmission with its talkgroup or unit,
+source, colour code and encryption state, every control message (CSBKs,
+multi-block CSBKs, short link control) with what it says about the site, and
+packet data (headers, and the location, text, registration and short data
+applications).
+.PP
+The speech of clear (unencrypted) calls can be sent as 8 kHz RTP audio streams
+that monitor plays and pcmrecord records (when dmrd is built with mbelib). A
+group call's stream is its talkgroup; when several repeaters carry the same
+call, as a multi-site system's do, dmrd makes one stream of it and takes each
+20 ms of speech from whichever repeater received it best.
+.PP
+With a sites file (\-f) dmrd knows which repeaters make up each site. When a
+site announces a call, or its rest channel, on a repeater no channel carries,
+dmrd asks radiod for that repeater for as long as it is needed.
+.PP
+This page is a summary. The package's docs/dmrd.md describes the radiod
+configuration, the sites file, call following, voting, the encryption rule and
+the log lines in full.
+.SH OPTIONS
+.TP
+.B "\-I group, \-\-input group"
+Add an input group. May be repeated; positional groups are also accepted.
+.TP
+.B "\-R group, \-\-pcm\-out group"
+Send decoded speech to this multicast group. Without it no audio is sent.
+Needs a dmrd built with mbelib.
+.TP
+.B "\-N name, \-\-name name"
+Name the voice output is advertised under. Default: not advertised.
+.TP
+.B "\-T ttl, \-\-ttl ttl"
+Multicast TTL of the voice output. Default 0: this host only.
+.TP
+.B "\-p tos, \-\-tos tos"
+IP type of service of the voice output. Default 184 (expedited forwarding).
+.TP
+.B "\-f file, \-\-sites file"
+The sites file: one section per site, naming its system, type, colour code,
+repeater frequencies and their logical channel numbers. A channel joins the
+site that lists its frequency, whichever radiod sends it; any other channel is
+a site of its own. See SITES.
+.TP
+.B "\-y type, \-\-system\-type type"
+The kind of system a channel no site lists belongs to: conventional (the
+default), tier3, capacity_plus, linked_capacity_plus, connect_plus,
+capacity_max, hytera_xpt or hytera_tier3.
+.TP
+.B "\-c n|any|track, \-\-color\-code n|any|track"
+The colour code to decode, 0\-15. track (the default) takes each channel's from
+its first strong sync and follows it; any decodes every one.
+.TP
+.B "\-s bs|ms|direct|all|auto, \-\-stations bs|ms|direct|all|auto"
+Which stations' syncs to look for: bs (the default), a repeater output; ms, a
+repeater input or simplex; direct, TDMA direct mode; all, every family; auto,
+every family until one family's synced bursts lead each other's by more than
+10, then that one only.
+.TP
+.B "\-M, \-\-mobile"
+The same as \-s all.
+.TP
+.B "\-L, \-\-learn\-crc\-masks"
+Accept messages whose check fails with a residual seen twice for the same
+message type within two minutes (systems such as Motorola's restricted access
+to system, RAS). A link control word so accepted never says a call is clear.
+.TP
+.B "\-n, \-\-no\-follow"
+Do not ask radiod for repeaters: decode only the channels already there, and
+do not probe a dark site.
+.TP
+.B "\-H seconds, \-\-hold seconds"
+Keep a followed repeater this long after the last sign of its call. Default 5.
+.TP
+.B "\-g list, \-\-talkgroups list"
+Follow group calls on only these talkgroups, for example 1,3,9000\-9099. May be
+repeated. A call whose talkgroup is not known yet, and a unit-to-unit call, is
+followed.
+.TP
+.B "\-x list, \-\-exclude list"
+Never follow group calls on these talkgroups. May be repeated.
+.TP
+.B "\-m n, \-\-max\-calls n"
+Follow at most n calls at once. Rest channels and probes do not count.
+Default: no limit.
+.TP
+.B "\-S ssrc, \-\-ssrc ssrc"
+Decode only this channel. Turns call following off.
+.TP
+.B "\-o source, \-\-source source"
+Accept only this sender, by name or address (source-specific multicast).
+.TP
+.B "\-A interface, \-\-iface interface"
+Set default multicast interface.
+.TP
+.B "\-t seconds, \-\-timeout seconds"
+Close a channel after this long without data. Default 20.
+.TP
+.B "\-u seconds, \-\-update seconds"
+Interval between the status lines and site summaries that \-v turns on.
+Default 10.
+.TP
+.B "\-l locale, \-\-locale locale"
+Locale for number formatting. Default $LANG.
+.TP
+.B "\-v, \-\-verbose"
+Increase diagnostics; repeat for more. At \-v each channel also logs a status
+line and each site a summary, and link control, talker aliases and probes of a
+dark site are logged.
+.TP
+.B "\-V, \-\-version"
+Print version and exit.
+.SH RADIOD CONFIGURATION
+dmrd needs I/Q, not demodulated audio, at 19.2 kHz (four samples per 4800 baud
+symbol), with the AGC off and a fixed gain. Configure every repeater output to
+decode; for a trunked site, at least its rest or control channel. Give the I/Q
+its own group, one nothing else listens to. An example is in
+config/examples/fragments/dmr.conf:
+.PP
+.nf
+[DMR]
+data = dmr\-iq.local
+mode = iq
+samprate = 19200
+low = \-6250
+high = +6250
+encoding = f32le
+agc = no
+gain = 60
+freq = "453m4250 453m9750 460m1375 460m6375"
+.fi
+.PP
+A DMR repeater's signal is often strong and the band busy: fix the front end's
+gain below its overload point (on an Airspy R2, gainstep = 17 with
+agc\-low\-threshold = \-100 in its section). Overload shows as a channel with
+signal and no syncs.
+.PP
+Repeaters dmrd asks for are asked for in the form of the I/Q channels it
+already decodes from that radiod, with a lifetime of \-H seconds, refreshed
+while they are needed; radiod builds them from its [global] section, whose
+"data =" must be set. Where there is more than one radiod, each is asked in
+turn until one covers the frequency.
+.SH SITES
+.nf
+[SCMTD 1]
+system = SCMTD
+site = 1
+type = capacity_plus
+color\-code = 0
+freq = "453m4250 460m1375"
+lcn = "1 2"
+.fi
+.PP
+system and site name the site in the logs and the streams' descriptions
+(default: the section's name); type and color\-code are as \-y and \-c; freq
+lists the site's repeater outputs and lcn their logical channel numbers, in the
+same order (none for a conventional site). learn\-crc\-masks is as \-L for the
+site, and compressed\-talkgroups = yes says that the system's talkgroups are in
+the dialable form of TS 102 361\-2 annex C (Hytera Tier III), so that a group
+call's talkgroup is converted to the number a user dials before it is used.
+See config/examples/dmrd\-sites.conf.
+.PP
+A Capacity Plus site's rest channel, when it is on a repeater no channel
+carries, is asked for and kept while the site names it. When every channel
+dmrd decodes for a site of more than one repeater has been silent for 5
+seconds, its other repeaters are probed, 2 seconds each, until one carries
+bursts.
+.SH INPUT AND OUTPUT
+Decoded events go to standard output, one line each, starting with the time of
+the signal, the SSRC and the channel frequency, or the site's name for a line
+about a site; errors and startup messages go to standard error. A control
+message repeated many times is written once and then counted.
+.PP
+The voice stream (\-R) is 8 kHz mono 16-bit audio, one RTP packet per 20 ms,
+with status packets as radiod sends them. A group call's stream has the
+talkgroup as its SSRC, whichever repeater carries it; any other call's, the
+channel's SSRC times ten plus the timeslot. The status carries the frequency
+and signal figures of the repeater the speech came from and a description
+such as "SCMTD TG 3 src 1301 453.4250 MHz TS2 CC0".
+.PP
+Encrypted voice is not decoded: a transmission's voice is decoded only after a
+checked header or embedded link control word of that transmission has said it
+is unencrypted. Voice that arrives before that is held, then sent in order or
+dropped.
+.SH SIGNALS
+SIGUSR1 increases verbosity; SIGUSR2 decreases it. SIGINT, SIGTERM and SIGQUIT
+stop dmrd; transmissions in progress are ended and the repeaters it asked for
+are released.
+.SH NOTES
+.TP
+.B "What has been tested."
+On the air, from this tree's radiod with an Airspy R2: a Motorola Capacity Plus
+system of three sites (wide-area calls, rest channel moves, both slots), with a
+sites file and without, call and rest channel following on it, and 67 amateur
+repeater outputs at once. From recordings and generated signals: each layer,
+frame for frame and field for field, and the codes against the tables of TS
+102 361\-1 annex B. Not yet on the air: Tier III, Connect Plus, Capacity Max or
+Hytera signalling, a site with more than one repeater, packet data, and more
+than one radiod.
+.TP
+.B "The vocoder is optional."
+Speech decoding uses mbelib, as p25d does; see p25d(8) for what it does and
+does not do, and its README's caution about patents.
+.TP
+.B "Talkgroup numbers are unique only within one system."
+Run one dmrd, with its own output group, per system, or accept that two
+systems' calls on one number are voted as one (they do not line up, and the
+second gets its own stream).
+.SH CREDITS
+sdrtrunk (Dennis Sheirer, GPL-3) and OP25 (Max H. Parke KA1RBI, Graham J.
+Norbury and others, GPL-3) were used as references for DMR implementation
+details, along with ETSI TS 102 361. Taken from them, with a credit beside each
+in the source: the sync words, the code tables and layouts, the CRC masks, the
+link control, talker alias, CSBK and packet data layouts, and the rules for
+learning CRC masks and choosing the station family automatically. Speech
+decoding uses mbelib (https://github.com/szechyjs/mbelib) when it is installed.
+.PP
+Much of what is here was first worked out, prototyped and run in production by
+the author in the
+receivers\ behind\ scanrad.io.
+That is especially true of the front-end signal processing: the approach to
+receive filtering, carrier frequency tracking, symbol timing recovery and
+burst framing was originally written for those receivers and tuned there.
+Those receivers are not ka9q-radio code: what is here is that work, rewritten
+by the author in plain C for this tree with the assistance of Anthropic's
+Claude (the Fable and Opus models).
+.SH FILES
+.TP
+.B dmrd@.service
+systemd template unit; the instance name is the input group. Its output is
+appended to /var/log/dmrd.log.
+.TP
+.B config/examples/fragments/dmr.conf
+Example radiod section.
+.TP
+.B config/examples/dmrd-sites.conf
+Example sites file.
+.SH EXAMPLES
+Decode a group and send the speech of clear calls:
+.PP
+.nf
+dmrd \-R dmr\-pcm.local dmr\-iq.local
+.fi
+.PP
+A trunked system described by a sites file, following its calls on talkgroups
+1 to 99 only:
+.PP
+.nf
+dmrd \-f /etc/ka9q\-radio/dmrd\-sites.conf \-g 1\-99 \-R dmr\-pcm.local dmr\-iq.local
+.fi
+.PP
+As a service:
+.PP
+.nf
+systemctl enable \-\-now dmrd@dmr\-iq.local
+.fi
+.SH AUTHOR
+Matthew Kaufman, KA6SQG.
+.SH SEE ALSO
+p25d(8), radiod(8), monitor(1), pcmrecord(1), tune(1), control(1)
+.PP
+Project documentation: https://github.com/ka9q/ka9q-radio

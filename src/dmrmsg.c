@@ -648,7 +648,129 @@ void dmr_data_options_init(struct dmr_data_options *o){
   o->bptc_max_weighted_errors = DMR_BPTC196_MAX_ERRORS;
 }
 
+// ---- CRC mask learning (see dmrmsg.h) ----
+
+char const *dmr_crc_check_name(enum dmr_crc_check k){
+  switch(k){
+  case DMR_CRC_CHECK_CSBK: return "csbk";
+  case DMR_CRC_CHECK_RS129: return "lc";
+  case DMR_CRC_CHECK_CRC5: return "emblc";
+  }
+  return "?";
+}
+void dmr_crc_learner_init(struct dmr_crc_learner *l){
+  assert(l != NULL);
+  memset(l,0,sizeof *l);
+  l->window_us = 120000000;
+  l->stale_lookups = 20;
+  l->sightings = 2;
+}
+static void learn_remove(struct dmr_learn_key *k,int i){
+  memmove(&k->residuals[i],&k->residuals[i + 1],(size_t)(k->nresiduals - i - 1) * sizeof k->residuals[0]);
+  k->nresiduals--;
+}
+bool dmr_crc_learner_check(struct dmr_crc_learner *l,enum dmr_crc_check kind,uint8_t opcode,uint8_t fid,
+                           uint32_t residual,uint64_t now_us){
+  if(l == NULL || (int)kind < 0 || kind > DMR_CRC_CHECK_CRC5)
+    return false;
+  l->lookups[kind]++;
+  struct dmr_learn_key *key = NULL;
+  for(int i=0; i < l->nkeys && key == NULL; i++)
+    if(l->keys[i].kind == kind && l->keys[i].opcode == opcode && l->keys[i].fid == fid)
+      key = &l->keys[i];
+  if(key == NULL){
+    if(l->nkeys >= DMR_LEARN_MAX_KEYS){
+      // The key whose newest residual is the oldest goes (one with none first)
+      int stalest = 0;
+      uint64_t oldest = UINT64_MAX;
+      for(int i=0; i < l->nkeys; i++){
+        uint64_t newest = 0;
+        for(int j=0; j < l->keys[i].nresiduals; j++)
+          if(l->keys[i].residuals[j].last_us > newest)
+            newest = l->keys[i].residuals[j].last_us;
+        if(newest < oldest){
+          oldest = newest;
+          stalest = i;
+        }
+      }
+      l->evicted += (uint64_t)l->keys[stalest].nresiduals;
+      memmove(&l->keys[stalest],&l->keys[stalest + 1],(size_t)(l->nkeys - stalest - 1) * sizeof l->keys[0]);
+      l->nkeys--;
+    }
+    key = &l->keys[l->nkeys++];
+    memset(key,0,sizeof *key);
+    key->kind = (uint8_t)kind;
+    key->opcode = opcode;
+    key->fid = fid;
+  }
+  // Age first: older than the window, or not seen in stale_lookups lookups, is forgotten
+  for(int i=0; i < key->nresiduals;){
+    struct dmr_learn_residual const *r = &key->residuals[i];
+    bool const old = now_us >= r->last_us ? now_us - r->last_us > l->window_us : false;
+    if(old || r->staleness >= l->stale_lookups){
+      learn_remove(key,i);
+      l->evicted++;
+    } else
+      i++;
+  }
+  struct dmr_learn_residual *hit = NULL;
+  for(int i=0; i < key->nresiduals; i++){
+    if(key->residuals[i].value == residual)
+      hit = &key->residuals[i];
+    else
+      key->residuals[i].staleness++;
+  }
+  if(hit == NULL){
+    if(key->nresiduals >= DMR_LEARN_MAX_RESIDUALS){
+      int stalest = 0;
+      for(int i=1; i < key->nresiduals; i++)
+        if(key->residuals[i].staleness > key->residuals[stalest].staleness)
+          stalest = i;
+      learn_remove(key,stalest);
+      l->evicted++;
+    }
+    struct dmr_learn_residual *r = &key->residuals[key->nresiduals++];
+    memset(r,0,sizeof *r);
+    r->value = residual;
+    r->sightings = 1;
+    r->last_us = now_us;
+    return false;
+  }
+  hit->sightings++;
+  hit->staleness = 0;
+  hit->last_us = now_us;
+  if(hit->sightings < l->sightings)
+    return false;
+  if(hit->accepted++ == 0 && l->learned != NULL)
+    l->learned(l->learned_arg,kind,opcode,fid,residual);
+  l->accepted[kind]++;
+  return true;
+}
+int dmr_crc_learner_summary(char *buf,size_t size,struct dmr_crc_learner const *l){
+  size_t len = 0;
+  append(buf,size,&len,"learned: csbk=%llu lc=%llu emblc=%llu",(unsigned long long)l->accepted[0],
+         (unsigned long long)l->accepted[1],(unsigned long long)l->accepted[2]);
+  int shown = 0;
+  for(int i=0; i < l->nkeys && shown < 8; i++){
+    struct dmr_learn_key const *k = &l->keys[i];
+    for(int j=0; j < k->nresiduals && shown < 8; j++){
+      struct dmr_learn_residual const *r = &k->residuals[j];
+      if(r->accepted == 0)
+        continue;
+      shown++;
+      append(buf,size,&len," %s %u/0x%02X:0x%0*X x%llu",dmr_crc_check_name((enum dmr_crc_check)k->kind),(unsigned)k->opcode,
+             (unsigned)k->fid,k->kind == DMR_CRC_CHECK_RS129 ? 6 : k->kind == DMR_CRC_CHECK_CSBK ? 4 : 2,
+             (unsigned)r->value,(unsigned long long)r->accepted);
+    }
+  }
+  return finish(buf,size,len);
+}
+
 void dmr_data_decode(struct dmr_data_burst *d,struct dmr_burst const *b,struct dmr_data_options const *options){
+  dmr_data_decode_learning(d,b,options,NULL);
+}
+void dmr_data_decode_learning(struct dmr_data_burst *d,struct dmr_burst const *b,struct dmr_data_options const *options,
+                              struct dmr_crc_learner *learner){
   assert(d != NULL && b != NULL);
   struct dmr_data_options defaults;
   if(options == NULL){
@@ -708,6 +830,21 @@ void dmr_data_decode(struct dmr_data_burst *d,struct dmr_burst const *b,struct d
       rs = dmr_rs129_decode_bits(bits,0x00,false,NULL,NULL);
       d->rs_mask = 0x00;
     }
+    if(rs < 0 && learner != NULL){
+      uint8_t const flco = (uint8_t)bits_to_uint(info + 2,6);
+      uint8_t const fid = (uint8_t)bits_to_uint(info + 8,8);
+      if(dmr_crc_learner_check(learner,DMR_CRC_CHECK_RS129,flco,fid,d->rs_observed_mask,b->timestamp_us)){
+        // Accepted as received, uncorrected, and never the stricter test for "clear"
+        d->rs_mask = 0;
+        d->rs_corrected = 0;
+        d->lc_uncorrected = false;
+        d->learned_mask = true;
+        dmr_lc_parse_bits(&d->lc,info);
+        d->has_lc = true;
+        d->status = DMR_DATA_VALID;
+        return;
+      }
+    }
     if(rs < 0){
       d->rs_mask = 0;
       d->status = DMR_DATA_CHECK_FAILED;
@@ -764,7 +901,9 @@ int dmr_data_describe(char *buf,size_t size,struct dmr_data_burst const *d){
     append(buf,size,&len,"%s: %s",name,lc);
     if(d->rs_corrected > 0)
       append(buf,size,&len," (rs corrected)");
-    if(d->rs_mask == 0x00)
+    if(d->learned_mask)
+      append(buf,size,&len," (learned rs mask %06X)",(unsigned)d->rs_observed_mask);
+    else if(d->rs_mask == 0x00)
       append(buf,size,&len," (zero rs mask)");
     return finish(buf,size,len);
   }
@@ -816,6 +955,7 @@ static void elc_abandon(struct dmr_elc_assembler *a){
   elc_clear(a);
 }
 static void elc_store(struct dmr_elc_assembler *a,struct dmr_burst const *b,int place,bool inferred){
+  a->timestamp_us = b->timestamp_us;
   dmr_embedded_from_burst(b->bits,b->confidence,a->bits + 32 * place,a->confidence + 32 * place);
   if(!a->present[place])
     a->count++;
@@ -830,7 +970,15 @@ static void elc_finish(struct dmr_elc_assembler *a,struct dmr_elc_result *r){
   struct dmr_bptc result;
   uint8_t info[77];
   bool const ok = dmr_bptc128_decode(&result,info,a->bits,a->confidence,DMR_BPTC128_MAX_ERRORS);
-  if(ok && dmr_elc_checksum_check(info)){
+  bool const checksum_ok = ok && dmr_elc_checksum_check(info);
+  uint8_t const residual = (uint8_t)(dmr_elc_checksum(info) ^ bits_to_uint(info + 72,5));
+  // A learned residual only for a word that arrived as a codeword (dmrmsg.h, CRC5)
+  bool const learned = !checksum_ok && ok && result.corrected == 0 && a->learner != NULL
+    && dmr_crc_learner_check(a->learner,DMR_CRC_CHECK_CRC5,(uint8_t)bits_to_uint(info + 2,6),(uint8_t)bits_to_uint(info + 8,8),
+                             residual,a->timestamp_us);
+  if(checksum_ok || learned){
+    r->lc.learned_mask = learned;
+    r->lc.checksum_residual = learned ? residual : 0;
     dmr_lc_parse_bits(&r->lc.lc,info);
     r->lc.corrected = result.corrected;
     r->lc.weighted_errors = result.weighted_errors;
@@ -1391,6 +1539,52 @@ void dmr_ta_reset(struct dmr_ta_assembler *a){
   memset(a->have_block,0,sizeof a->have_block);
   a->reported[0] = '\0';
   a->have_reported = false;
+  a->have_cap_max_first = a->have_cap_max_continuation = false;
+}
+
+// Capacity Max fragments (see dmrmsg.h)
+static bool ta_cap_max(struct dmr_ta_assembler *a,struct dmr_talker_alias *alias,struct dmr_lc_cap_max_talker_alias const *f){
+  if(f->continuation){
+    a->cap_max_continuation = *f;
+    a->have_cap_max_continuation = true;
+  } else {
+    if(a->have_cap_max_first && (f->length != a->cap_max_first.length || f->count != a->cap_max_first.count
+                                 || memcmp(f->text,a->cap_max_first.text,sizeof f->text) != 0))
+      a->have_cap_max_continuation = false; // another alias: the continuation held was the old one's
+    a->cap_max_first = *f;
+    a->have_cap_max_first = true;
+  }
+  if(!a->have_cap_max_first)
+    return false;
+  bool const whole = a->cap_max_first.length != 0 && a->cap_max_first.length <= a->cap_max_first.count;
+  if(!whole && !a->have_cap_max_continuation)
+    return false;
+  char text[DMR_TALKER_ALIAS_TEXT];
+  size_t len = 0;
+  for(int part=0; part < (whole ? 1 : 2); part++){
+    struct dmr_lc_cap_max_talker_alias const *p = part == 0 ? &a->cap_max_first : &a->cap_max_continuation;
+    for(int i=0; i < p->count && i < (int)sizeof p->text; i++)
+      if(p->text[i] != 0) // padding
+        ta_emit(text,&len,p->text[i]);
+  }
+  text[len] = '\0';
+  while(len > 0 && text[len - 1] == ' ')
+    text[--len] = '\0';
+  size_t lead = 0;
+  while(lead < len && text[lead] == ' ')
+    lead++;
+  if(lead == len)
+    return false;
+  if(a->have_reported && strcmp(text + lead,a->reported) == 0)
+    return false;
+  strlcpy(a->reported,text + lead,sizeof a->reported);
+  a->have_reported = true;
+  memset(alias,0,sizeof *alias);
+  strlcpy(alias->text,text + lead,sizeof alias->text);
+  alias->format = DMR_TA_ISO8859_1;
+  alias->length = a->cap_max_first.length;
+  alias->blocks = whole ? 0 : 1;
+  return true;
 }
 
 // Unit `index` of the alias: unit_bits bits from bit offset + index * unit_bits
@@ -1486,6 +1680,8 @@ bool dmr_ta_on_lc(struct dmr_ta_assembler *a,struct dmr_talker_alias *alias,stru
       return false;
     memcpy(a->blocks[b->block - 1],b->data,sizeof b->data);
     a->have_block[b->block - 1] = true;
+  } else if(lc->body == DMR_LCB_CAP_MAX_TALKER_ALIAS){
+    return ta_cap_max(a,alias,&lc->u.cap_max_alias);
   } else {
     return false;
   }
@@ -1517,8 +1713,10 @@ void dmr_msg_init(struct dmr_msg_decoder *d,struct dmr_msg_options const *option
   else
     dmr_msg_options_init(&d->options);
   dmr_slc_assembler_init(&d->short_lc);
+  dmr_crc_learner_init(&d->learner);
   for(int i=0; i < 3; i++){
     dmr_elc_init(&d->slots[i].embedded);
+    d->slots[i].embedded.learner = d->options.learn_crc_masks ? &d->learner : NULL;
     dmr_hidden_iv_reset(&d->slots[i].hidden_iv);
     dmr_ta_reset(&d->slots[i].alias);
   }
@@ -1555,7 +1753,7 @@ static void on_data(struct dmr_msg_decoder *dec,struct dmr_burst const *b,struct
   dmr_hidden_iv_reset(&s->hidden_iv);
 
   m->has_data = true;
-  dmr_data_decode(&m->data,b,&dec->options.data);
+  dmr_data_decode_learning(&m->data,b,&dec->options.data,dec->options.learn_crc_masks ? &dec->learner : NULL);
   struct dmr_data_burst const *d = &m->data;
   dec->counters.data_bursts++;
   switch(d->status){

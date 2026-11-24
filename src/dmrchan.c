@@ -76,6 +76,9 @@ struct dmr_chan {
   struct dmr_msg_decoder msg;
   struct dmr_call_tracker tracker;
   struct dmr_cplane *cplane;       // NULL without a site
+  bool auto_stations;
+  enum dmr_station family;         // the family locked to (auto_stations); UNKNOWN: not yet
+  uint64_t family_syncs[3];        // synced bursts: bs, ms, direct
   struct dmr_site *site;
   struct dmr_channel channel;
   char channel_id[32];
@@ -200,6 +203,8 @@ static bool foreign_color_code(struct dmr_chan const *c,struct dmr_burst const *
   return b->kind == DMR_KIND_DATA && b->slot_type_valid && required >= 0 && (b->color_code & 0xf) != required;
 }
 
+static void note_family(struct dmr_chan *c,enum dmr_sync sync);
+
 static void on_burst(void *arg,struct dmr_burst const *from_sink){
   struct dmr_chan * const c = arg;
   struct dmr_burst burst = *from_sink;
@@ -207,8 +212,11 @@ static void on_burst(void *arg,struct dmr_burst const *from_sink){
   if(burst.timestamp_us > c->last_burst_us)
     c->last_burst_us = burst.timestamp_us;
   c->stats.bursts++;
-  if(burst.sync != DMR_SYNC_NONE)
+  if(burst.sync != DMR_SYNC_NONE){
     c->stats.syncs++;
+    if(c->auto_stations && c->family == DMR_STATION_UNKNOWN)
+      note_family(c,burst.sync);
+  }
   if(dmr_is_voice(burst.kind))
     c->stats.voice_bursts++;
 
@@ -333,6 +341,46 @@ static void on_call_end(void *arg,struct dmr_call_meta const *meta,struct dmr_ca
   event(c,meta,info,false);
 }
 
+// Automatic station family: one more synced burst of a family; lock to it once it leads both others by
+// more than 10
+static char const *family_name(enum dmr_station m){
+  return m == DMR_STATION_BS ? "base station" : m == DMR_STATION_MS ? "mobile station" : m == DMR_STATION_DIRECT ? "direct mode" : "unknown";
+}
+static void note_family(struct dmr_chan *c,enum dmr_sync sync){
+  enum dmr_station const mode = dmr_mode_of(sync);
+  int const i = mode == DMR_STATION_BS ? 0 : mode == DMR_STATION_MS ? 1 : mode == DMR_STATION_DIRECT ? 2 : -1;
+  if(i < 0)
+    return;
+  c->family_syncs[i]++;
+  for(int f=0; f < 3; f++){
+    uint64_t const a = c->family_syncs[f],b = c->family_syncs[(f + 1) % 3],d = c->family_syncs[(f + 2) % 3];
+    if(a > b + 10 && a > d + 10){
+      c->family = f == 0 ? DMR_STATION_BS : f == 1 ? DMR_STATION_MS : DMR_STATION_DIRECT;
+      dmr_rx_restrict_family(c->rx,c->family);
+      if(c->h.notice != NULL){
+        char text[160];
+        snprintf(text,sizeof text,"stations auto: %s (synced bursts bs %llu ms %llu direct %llu); the other families are no longer looked for",
+                 family_name(c->family),(unsigned long long)c->family_syncs[0],(unsigned long long)c->family_syncs[1],
+                 (unsigned long long)c->family_syncs[2]);
+        c->h.notice(c->h.arg,c->anchored ? time_of_symbol(c,c->symbol_index) : 0,text);
+      }
+      return;
+    }
+  }
+}
+
+// A CRC residual accepted for the first time (learn_crc_masks): worth a line whatever the verbosity
+static void on_learned(void *arg,enum dmr_crc_check kind,uint8_t opcode,uint8_t fid,uint32_t residual){
+  struct dmr_chan *c = arg;
+  if(c->h.notice == NULL)
+    return;
+  char text[160];
+  snprintf(text,sizeof text,"CRC mask learned: %s %s %u FID 0x%02X residual 0x%0*X, accepted from now on (an LC so accepted never says clear)",
+           dmr_crc_check_name(kind),kind == DMR_CRC_CHECK_CSBK ? "CSBKO" : "FLCO",(unsigned)opcode,(unsigned)fid,
+           kind == DMR_CRC_CHECK_RS129 ? 6 : kind == DMR_CRC_CHECK_CSBK ? 4 : 2,(unsigned)residual);
+  c->h.notice(c->h.arg,c->anchored ? time_of_symbol(c,c->symbol_index) : 0,text);
+}
+
 struct dmr_chan *dmr_chan_create(struct dmr_chan_config const *config,double samprate,struct dmr_chan_handlers const *h){
   assert(config != NULL && h != NULL);
   struct dmr_chan *c = calloc(1,sizeof *c);
@@ -346,6 +394,7 @@ struct dmr_chan *dmr_chan_create(struct dmr_chan_config const *config,double sam
   rc.sink.base_station = config->base_station;
   rc.sink.mobile_station = config->mobile_station;
   rc.sink.direct = config->direct;
+  c->auto_stations = config->auto_stations;
   if(config->color_code >= 0 && config->color_code <= 15){
     rc.sink.cc_mode = DMR_CC_PINNED;
     rc.sink.pinned_cc = (uint8_t)config->color_code;
@@ -361,9 +410,15 @@ struct dmr_chan *dmr_chan_create(struct dmr_chan_config const *config,double sam
   dmr_rx_set_acquired_handler(c->rx,on_acquired,c);
   dmr_rx_set_lost_handler(c->rx,on_lost,c);
   dmr_rx_set_symbol_handler(c->rx,on_symbol,c);
-  dmr_msg_init(&c->msg,NULL);
+  struct dmr_msg_options mo;
+  dmr_msg_options_init(&mo);
+  mo.learn_crc_masks = config->learn_crc_masks;
+  dmr_msg_init(&c->msg,&mo);
+  c->msg.learner.learned = on_learned;
+  c->msg.learner.learned_arg = c;
   struct dmr_call_config cc;
   dmr_call_config_init(&cc);
+  cc.compressed_talkgroups = config->compressed_talkgroups;
   dmr_call_init(&c->tracker,&cc);
   dmr_call_set_voice_sink(&c->tracker,on_voice,c);
   dmr_call_set_start_callback(&c->tracker,on_call_start,c);
@@ -384,6 +439,9 @@ struct dmr_chan *dmr_chan_create(struct dmr_chan_config const *config,double sam
     ctx.user = c;
     struct dmr_cplane_options po;
     dmr_cplane_options_init(&po);
+    po.learn_crc_masks = config->learn_crc_masks;
+    po.learned = on_learned;
+    po.learned_arg = c;
     c->cplane = dmr_cplane_create(&ctx,config->site,config->log,&po);
     c->site = config->site;
   }
@@ -440,4 +498,7 @@ void dmr_chan_get_stats(struct dmr_chan const *c,struct dmr_chan_stats *s){
   *s = c->stats;
   s->color_code = dmr_sink_color_code(dmr_rx_sink(c->rx));
   s->frequency_offset = dmr_rx_frequency_offset(c->rx);
+  s->learned[0] = c->cplane != NULL ? dmr_cplane_learned_csbks(c->cplane) : 0;
+  s->learned[1] = c->msg.learner.accepted[DMR_CRC_CHECK_RS129];
+  s->learned[2] = c->msg.learner.accepted[DMR_CRC_CHECK_CRC5];
 }

@@ -506,6 +506,24 @@ uint64_t dmr_sink_color_code_changes(struct dmr_sink const *s){
 struct dmr_sink_counters const *dmr_sink_counters(struct dmr_sink const *s){
   return &s->counters;
 }
+// The patterns of the families the configuration enabled, of one family only when mode says which
+void dmr_sink_restrict_family(struct dmr_sink *s,enum dmr_station mode){
+  struct dmr_sink_config const *config = &s->config;
+  bool const all = mode == DMR_STATION_UNKNOWN;
+  memset(s->enabled,0,sizeof s->enabled);
+  if(config->base_station && (all || mode == DMR_STATION_BS))
+    s->enabled[DMR_SYNC_BS_VOICE] = s->enabled[DMR_SYNC_BS_DATA] = true;
+  if(config->mobile_station && (all || mode == DMR_STATION_MS)){
+    s->enabled[DMR_SYNC_MS_VOICE] = s->enabled[DMR_SYNC_MS_DATA] = true;
+    if(config->reverse_channel)
+      s->enabled[DMR_SYNC_MS_REVERSE] = true;
+  }
+  if(config->direct && (all || mode == DMR_STATION_DIRECT)){
+    s->enabled[DMR_SYNC_DIRECT_VOICE_TS1] = s->enabled[DMR_SYNC_DIRECT_DATA_TS1] = true;
+    s->enabled[DMR_SYNC_DIRECT_VOICE_TS2] = s->enabled[DMR_SYNC_DIRECT_DATA_TS2] = true;
+  }
+}
+
 struct dmr_sink_config const *dmr_sink_config(struct dmr_sink const *s){
   return &s->config;
 }

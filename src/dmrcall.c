@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "dmrcall.h"
+#include "dmrcsbk.h"
 
 // Theory of operation
 //
@@ -753,11 +754,23 @@ static void after_gap(struct dmr_call_tracker *t,struct dmr_transmission *tx,uin
 
 // What a checked LC of this transmission says: identity, then privacy. evidence: what the LC is
 // worth if it says clear
+// learned_mask: the LC is valid only through a learned CRC residual (dmrmsg.h): it gives identity and may
+// say encrypted, never clear (its evidence is NONE)
+// dmr_lc_voice_identity() with the system's talkgroup form applied (config.compressed_talkgroups): every
+// identity the tracker reads comes through here, so two LCs of one call compare alike
+static bool identity_of(struct dmr_call_tracker const *t,struct dmr_lc const *lc,struct dmr_voice_identity *id){
+  if(!dmr_lc_voice_identity(lc,id))
+    return false;
+  if(t->config.compressed_talkgroups && id->group && id->address_bits == 24)
+    id->destination = dmr_hytera_dialable_talkgroup(id->destination);
+  return true;
+}
+
 static void apply_lc(struct dmr_call_tracker *t,struct dmr_transmission *tx,uint8_t slot,uint64_t now,struct dmr_lc const *lc,
-                     enum clear_evidence evidence,bool header){
+                     enum clear_evidence evidence,bool header,bool learned_mask){
   struct dmr_call_counters *c = &t->counters;
   struct dmr_voice_identity id;
-  if(dmr_lc_voice_identity(lc,&id))
+  if(identity_of(t,lc,&id))
     adopt_identity(t,tx,&id,lc->fid);
   switch(dmr_lc_privacy(lc)){
   case DMR_LC_ENCRYPTED:
@@ -788,6 +801,8 @@ static void apply_lc(struct dmr_call_tracker *t,struct dmr_transmission *tx,uint
                 && memcmp(tx->clear_lc,lc->bytes,sizeof tx->clear_lc) == 0){
         c->clear_by_repeated_lc++;
         say_clear(t,tx,slot,now);
+      } else if(evidence == EVIDENCE_NONE && learned_mask){
+        c->clear_refused_learned_mask++;
       } else {
         if(header)
           c->clear_refused_header++;
@@ -813,7 +828,7 @@ static void on_header(struct dmr_call_tracker *t,uint8_t slot,struct dmr_burst c
                       uint64_t now){
   struct dmr_lc const *lc = &data->lc;
   struct dmr_voice_identity id;
-  bool const has_id = dmr_lc_voice_identity(lc,&id);
+  bool const has_id = identity_of(t,lc,&id);
   struct dmr_transmission *tx = &t->slots[slot];
   // Another header of the transmission that has not begun its voice yet?
   bool const join = tx->active && tx->voice_bursts == 0 && tx->started_by == DMR_START_HEADER
@@ -829,7 +844,10 @@ static void on_header(struct dmr_call_tracker *t,uint8_t slot,struct dmr_burst c
   tx->last_confirmed_us = now;
   note_burst(tx,b);
   bool const alone = data->lc_uncorrected || !t->config.header_clear_needs_uncorrected;
-  apply_lc(t,tx,slot,now,lc,alone ? EVIDENCE_ALONE : EVIDENCE_REPEATED,true);
+  if(data->learned_mask)
+    t->counters.learned_mask_lcs++;
+  apply_lc(t,tx,slot,now,lc,data->learned_mask ? EVIDENCE_NONE : alone ? EVIDENCE_ALONE : EVIDENCE_REPEATED,true,
+           data->learned_mask);
 }
 
 static void on_pi_header(struct dmr_call_tracker *t,uint8_t slot,struct dmr_burst const *b,struct dmr_pi_header const *pi,
@@ -854,7 +872,7 @@ static void on_pi_header(struct dmr_call_tracker *t,uint8_t slot,struct dmr_burs
 static void on_terminator_lc(struct dmr_call_tracker *t,struct dmr_transmission *tx,uint8_t slot,struct dmr_lc const *lc,
                              uint64_t now){
   struct dmr_voice_identity id;
-  bool const has_id = dmr_lc_voice_identity(lc,&id);
+  bool const has_id = identity_of(t,lc,&id);
   if(has_id && tx->identity_known && id.address_bits == tx->id.address_bits && !same_call(&tx->id,&id))
     return; // not ours
   if(has_id)
@@ -996,7 +1014,7 @@ static void on_voice(struct dmr_call_tracker *t,uint8_t slot,struct dmr_burst co
 
   // A new talker: an LC of this voice names another call than the one established
   struct dmr_voice_identity embedded_id;
-  bool const has_embedded_id = m->has_embedded_lc && dmr_lc_voice_identity(&m->embedded_lc.lc,&embedded_id);
+  bool const has_embedded_id = m->has_embedded_lc && identity_of(t,&m->embedded_lc.lc,&embedded_id);
   if(tx->active && tx->identity_known && has_embedded_id && embedded_id.address_bits == tx->id.address_bits
      && !same_call(&tx->id,&embedded_id)){
     end(t,slot,DMR_END_NEW_TALKER,now,END_BOUNDARY);
@@ -1071,9 +1089,11 @@ static void on_voice(struct dmr_call_tracker *t,uint8_t slot,struct dmr_burst co
     // The LC's four fragments came in the slot's last four voice bursts: all this transmission's,
     // and after its last gap, when it has had four since
     enum clear_evidence evidence = EVIDENCE_NONE;
-    if(tx->bursts_since_gap >= 4)
+    if(tx->bursts_since_gap >= 4 && !m->embedded_lc.learned_mask) // a learned residual never says clear
       evidence = m->embedded_lc.corrected <= cfg->embedded_clear_max_corrected ? EVIDENCE_ALONE : EVIDENCE_REPEATED;
-    apply_lc(t,tx,slot,now,&m->embedded_lc.lc,evidence,false);
+    if(m->embedded_lc.learned_mask)
+      c->learned_mask_lcs++;
+    apply_lc(t,tx,slot,now,&m->embedded_lc.lc,evidence,false,m->embedded_lc.learned_mask);
   }
   if(m->has_hidden_iv && tx->state == DMR_ENC_ENCRYPTED && tx->confirmed){
     tx->mi = m->hidden_iv.iv;
