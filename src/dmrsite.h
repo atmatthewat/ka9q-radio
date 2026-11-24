@@ -171,8 +171,9 @@ bool dmr_locate_single_radiod(void *arg,uint64_t frequency_hz,struct dmr_source 
 
 struct dmr_site;
 // A voice call announced on a timeslot of one of the site's repeaters (a Capacity Plus Site Status, an
-// XPT grant, a Tier III or Connect Plus grant or its updates): what a follower needs to tune it. Every
-// announcement, repeats included, so that a follower can keep a channel it asked for alive
+// XPT grant, a Tier III or Connect Plus grant or its updates), or the site's rest channel (rest): what a
+// follower needs to tune it. Every announcement and every report of the rest channel, repeats included,
+// so that a follower can keep a channel it asked for alive
 struct dmr_follow {
   uint16_t lcn;                 // 0: not known
   uint64_t frequency_hz;        // the repeater's downlink; 0: not known (not configured, not in the channel map)
@@ -180,6 +181,10 @@ struct dmr_follow {
   bool configured;              // the site's configuration lists the repeater
   bool attached;                // a decoder is on it now
   bool repeating;               // an announcement that repeats while the call lasts
+  bool rest;                    // the site's rest channel, not a call
+  uint32_t talkgroup;           // the call's destination, when talkgroup_bits != 0
+  uint8_t talkgroup_bits;       // 0: not known; 8: only its low 8 bits (Capacity Plus Site Status); 24
+  bool group;                   // a talkgroup (else a radio)
   char channel_id[DMR_CHANNEL_ID_MAX]; // "" for a repeater the site does not know
   char what[96];                // the message that announced it
 };

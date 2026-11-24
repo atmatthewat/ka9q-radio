@@ -218,9 +218,16 @@ static int const Ctl_ttl = 1;         // commands to radiod, as tune and control
 #define MAX_ASKED 256
 static struct {
   uint32_t ssrc;                      // SSRCs dmrd has asked for (under Ctl_mutex): a decoder on one is
-  int64_t logged;                     // a followed channel, even once radiod has let it go
+  int radio;                          // a followed channel, even once radiod has let it go
+  int64_t logged;
+  bool rest;                          // asked for as a site's rest channel, not for a call (not counted by -m)
 } Asked[MAX_ASKED];
 static int Nasked;
+struct tg_range { uint32_t lo,hi; };
+#define MAX_TG_RANGES 64
+static struct tg_range Allow[MAX_TG_RANGES],Deny[MAX_TG_RANGES]; // -g, -x
+static int Nallow,Ndeny;
+static int Max_calls;                 // -m: calls followed at once, 0 = no limit
 
 // Tuning constants
 static double const Max_fill = 1.0;   // Fill gaps up to this many seconds with zeroes; resynchronize on longer ones
@@ -278,11 +285,15 @@ static void observe_radio(struct session *sp);
 static void site_follow(void *arg,struct dmr_site *site,struct dmr_follow const *f);
 static void channel_follow(void *arg,struct dmr_site *site,struct dmr_follow const *f);
 static void keep_followed(struct decoder *dp,int64_t now);
+static int parse_ranges(struct tg_range *list,int n,char const *arg);
 
 static struct option Options[] = {
   {"iface", required_argument, NULL, 'A'},
   {"color-code", required_argument, NULL, 'c'},
   {"hold", required_argument, NULL, 'H'},
+  {"talkgroups", required_argument, NULL, 'g'},
+  {"exclude", required_argument, NULL, 'x'},
+  {"max-calls", required_argument, NULL, 'm'},
   {"no-follow", no_argument, NULL, 'n'},
   {"sites", required_argument, NULL, 'f'},
   {"input", required_argument, NULL, 'I'},
@@ -301,10 +312,10 @@ static struct option Options[] = {
   {"system-type", required_argument, NULL, 'y'},
   {NULL, 0, NULL, 0},
 };
-static char const Optstring[] = "A:c:f:H:I:l:MnN:o:p:R:S:t:T:u:vVy:";
+static char const Optstring[] = "A:c:f:g:H:I:l:m:MnN:o:p:R:S:t:T:u:vVx:y:";
 
 static void usage(void){
-  fprintf(stderr,"Usage: %s [-v|--verbose] [-V|--version] [-l|--locale locale] [-A|--iface interface] [-o|--source <source-name-or-address>] [-S|--ssrc ssrc] [-t|--timeout seconds] [-u|--update seconds] [-c|--color-code n|any|track] [-M|--mobile] [-y|--system-type conventional|capacity_plus|...] [-f|--sites sites_file] [-n|--no-follow] [-H|--hold seconds] [-R|--pcm-out audio_mcast_address] [-N|--name service_name] [-T|--ttl ttl] [-p|--tos tos] [-I|--input] iq_mcast_address [iq_mcast_address ...]\n",App_path);
+  fprintf(stderr,"Usage: %s [-v|--verbose] [-V|--version] [-l|--locale locale] [-A|--iface interface] [-o|--source <source-name-or-address>] [-S|--ssrc ssrc] [-t|--timeout seconds] [-u|--update seconds] [-c|--color-code n|any|track] [-M|--mobile] [-y|--system-type conventional|capacity_plus|...] [-f|--sites sites_file] [-n|--no-follow] [-H|--hold seconds] [-g|--talkgroups list] [-x|--exclude list] [-m|--max-calls n] [-R|--pcm-out audio_mcast_address] [-N|--name service_name] [-T|--ttl ttl] [-p|--tos tos] [-I|--input] iq_mcast_address [iq_mcast_address ...]\n",App_path);
 }
 
 int main(int argc,char *argv[]){
@@ -353,6 +364,15 @@ int main(int argc,char *argv[]){
       break;
     case 'n':
       Follow = false;
+      break;
+    case 'g':
+      Nallow = parse_ranges(Allow,Nallow,optarg);
+      break;
+    case 'x':
+      Ndeny = parse_ranges(Deny,Ndeny,optarg);
+      break;
+    case 'm':
+      Max_calls = atoi(optarg);
       break;
     case 'H':
       Hold = strtod(optarg,NULL);
@@ -1341,54 +1361,140 @@ static void observe_radio(struct session *sp){
 
 // Ask for the repeater an announcement names, unless a decoder is already on it that dmrd did not ask
 // for. 'who' and 'when' are for the line written when a channel is first asked for
+// Talkgroup ranges (-g, -x): DMR talkgroups are 24 bits, so ranges rather than lists
+static bool in_ranges(struct tg_range const *r,int n,struct dmr_follow const *f){
+  for(int i=0; i < n; i++){
+    if(f->talkgroup_bits >= 24){
+      if(f->talkgroup >= r[i].lo && f->talkgroup <= r[i].hi)
+        return true;
+    } else {
+      // Only the low bits are known (Capacity Plus Site Status): any talkgroup of the range with them
+      uint32_t const mask = (1u << f->talkgroup_bits) - 1;
+      if(r[i].hi - r[i].lo >= mask)
+        return true;
+      for(uint32_t g = r[i].lo; g <= r[i].hi; g++)
+        if((g & mask) == (f->talkgroup & mask))
+          return true;
+    }
+  }
+  return false;
+}
+// -g and -x apply to group calls whose talkgroup the announcement gives; any other call is followed
+static bool talkgroup_wanted(struct dmr_follow const *f){
+  if(!f->group || f->talkgroup_bits == 0)
+    return true;
+  if(in_ranges(Deny,Ndeny,f))
+    return false;
+  return Nallow == 0 || in_ranges(Allow,Nallow,f);
+}
+// Calls followed now (under Ctl_mutex): channels dmrd asked for for a call, still asked for or up
+static int calls_followed(void){
+  int n = 0;
+  for(int j=0; j < Nasked; j++){
+    if(Asked[j].rest)
+      continue;
+    enum chanctl_state const st = chanctl_state(Radios[Asked[j].radio].ctl,Asked[j].ssrc,NULL,NULL);
+    n += st == CHANCTL_PENDING || st == CHANCTL_UP;
+  }
+  return n;
+}
+// One line per refused call every 30 s (its announcements repeat several times a second)
+static bool refusal_due(uint64_t hz,uint32_t talkgroup){
+  static struct { uint64_t hz; uint32_t talkgroup; int64_t logged; } Refused[64];
+  static int Next;
+  int64_t const now = gps_time_ns();
+  for(int i=0; i < 64; i++){
+    if(Refused[i].hz == hz && Refused[i].talkgroup == talkgroup){
+      if(now - Refused[i].logged < 30 * (int64_t)BILLION)
+        return false;
+      Refused[i].logged = now;
+      return true;
+    }
+  }
+  Refused[Next].hz = hz;
+  Refused[Next].talkgroup = talkgroup;
+  Refused[Next].logged = now;
+  Next = (Next + 1) % 64;
+  return true;
+}
+
+// Ask for the repeater an announcement names, unless a decoder is already on it that dmrd did not ask
+// for, or the call is one not to follow (-g, -x, -m; never the rest channel). 'who' and 'when' are for
+// the lines written
 static void follow(char const *who,int64_t when,struct dmr_follow const *f){
   if(f->frequency_hz == 0)
     return; // nowhere to tune: the site has logged it
-  char text[256] = "";
+  char text[320] = "";
+  char where[64];
+  {
+    char lcn[16] = "",ts[8] = "";
+    if(f->lcn != 0)
+      snprintf(lcn,sizeof lcn," LCN %u",f->lcn);
+    if(f->timeslot == 1 || f->timeslot == 2)
+      snprintf(ts,sizeof ts," TS%u",f->timeslot);
+    snprintf(where,sizeof where,"%.6lf MHz%s%s",f->frequency_hz * 1e-6,lcn,ts);
+  }
   pthread_mutex_lock(&Ctl_mutex);
+  bool covered = false,tried = false;
   for(int i=0; i < Nradios; i++){
     struct radio * const r = &Radios[i];
     if(!r->have_format)
       continue;
+    tried = true;
     uint32_t const ssrc = chanctl_ssrc(r->ctl,(double)f->frequency_hz,&r->format);
     int asked = -1;
     for(int j=0; j < Nasked && asked < 0; j++)
       if(Asked[j].ssrc == ssrc)
         asked = j;
-    if(f->attached && asked < 0)
+    if(f->attached && asked < 0){
+      covered = true;
       break; // a channel radiod carries anyway: nothing to do
+    }
+    enum chanctl_state const st = chanctl_state(r->ctl,ssrc,NULL,NULL);
+    bool const following = asked >= 0 && (st == CHANCTL_PENDING || st == CHANCTL_UP);
+    if(!f->rest && !following){
+      // A new call: is it one to follow?
+      char why[96] = "";
+      if(!talkgroup_wanted(f))
+        snprintf(why,sizeof why,"talkgroup %u%s not wanted (-g, -x)",f->talkgroup,f->talkgroup_bits < 24 ? " (low 8 bits)" : "");
+      else if(Max_calls > 0 && calls_followed() >= Max_calls)
+        snprintf(why,sizeof why,"already following %d calls (-m)",Max_calls);
+      if(why[0] != '\0'){
+        if(refusal_due(f->frequency_hz,f->talkgroup))
+          snprintf(text,sizeof text,"not followed %s: %s; %s",where,why,f->what);
+        covered = true;
+        break;
+      }
+    }
     errno = 0;
     int const rc = chanctl_request(r->ctl,ssrc,(double)f->frequency_hz,&r->format,Hold);
     if(rc < 0 && errno == ERANGE)
       continue; // outside this radiod's front end: the next
-    if(rc >= 0 && asked < 0 && Nasked < MAX_ASKED){
+    covered = true;
+    if(rc < 0){
+      if(refusal_due(f->frequency_hz,0))
+        snprintf(text,sizeof text,"can't follow %s: %s",where,strerror(errno));
+      break;
+    }
+    if(asked < 0 && Nasked < MAX_ASKED){
       asked = Nasked++;
       Asked[asked].ssrc = ssrc;
+      Asked[asked].radio = i;
       Asked[asked].logged = 0;
-    }
+      Asked[asked].rest = f->rest;
+    } else if(asked >= 0 && !following)
+      Asked[asked].rest = f->rest; // asked for again: for what, now
     // A line when the channel is asked for while no decoder is on it (at most every 2 s: the
     // announcements repeat until its I/Q arrives)
-    bool log = false;
     int64_t const now_ns = gps_time_ns();
-    if(rc >= 0 && !f->attached && asked >= 0 && now_ns - Asked[asked].logged >= 2 * (int64_t)BILLION){
+    if(!f->attached && asked >= 0 && now_ns - Asked[asked].logged >= 2 * (int64_t)BILLION){
       Asked[asked].logged = now_ns;
-      log = true;
-    }
-    static int64_t last_error; // one error line every 30 s: announcements repeat several times a second
-    if(rc < 0 && gps_time_ns() - last_error >= 30 * (int64_t)BILLION){
-      last_error = gps_time_ns();
-      snprintf(text,sizeof text,"can't follow %.6lf MHz: %s",f->frequency_hz * 1e-6,strerror(errno));
-    }
-    else if(log){
-      char lcn[16] = "",ts[8] = "";
-      if(f->lcn != 0)
-        snprintf(lcn,sizeof lcn," LCN %u",f->lcn);
-      if(f->timeslot == 1 || f->timeslot == 2)
-        snprintf(ts,sizeof ts," TS%u",f->timeslot);
-      snprintf(text,sizeof text,"follow %.6lf MHz%s%s ssrc %u: %s",f->frequency_hz * 1e-6,lcn,ts,ssrc,f->what);
+      snprintf(text,sizeof text,"follow %s%s ssrc %u: %s",f->rest ? "rest channel " : "",where,ssrc,f->what);
     }
     break;
   }
+  if(tried && !covered && refusal_due(f->frequency_hz,1))
+    snprintf(text,sizeof text,"can't follow %s: no radiod covers it; %s",where,f->what);
   pthread_mutex_unlock(&Ctl_mutex);
   if(text[0] != '\0'){
     char ts[100];
@@ -1416,6 +1522,40 @@ static void channel_follow(void *arg,struct dmr_site *site,struct dmr_follow con
   char who[64];
   snprintf(who,sizeof who,"ssrc %u %.6lf MHz",dp->sp->ssrc,dp->frequency * 1e-6);
   follow(who,dp->block_time,f);
+}
+
+// Talkgroup list: decimal numbers or ranges, comma separated ("1,3,9000-9099"), added to list[n]
+static int parse_ranges(struct tg_range *list,int n,char const *arg){
+  char const *cp = arg;
+  while(*cp != '\0'){
+    char *end = NULL;
+    long const a = strtol(cp,&end,0);
+    long b = a;
+    if(end == cp || a < 1 || a > 0xFFFFFF)
+      goto bad;
+    cp = end;
+    if(*cp == '-'){
+      b = strtol(cp + 1,&end,0);
+      if(end == cp + 1 || b < a || b > 0xFFFFFF)
+        goto bad;
+      cp = end;
+    }
+    if(n == MAX_TG_RANGES){
+      fprintf(stderr,"Too many talkgroup ranges; max %d\n",MAX_TG_RANGES);
+      exit(EX_USAGE);
+    }
+    list[n].lo = (uint32_t)a;
+    list[n].hi = (uint32_t)b;
+    n++;
+    if(*cp == ',')
+      cp++;
+    else if(*cp != '\0')
+      goto bad;
+  }
+  return n;
+ bad:
+  fprintf(stderr,"Bad talkgroup list \"%s\": numbers 1-16777215 or ranges, comma separated\n",arg);
+  exit(EX_USAGE);
 }
 
 static bool was_asked(uint32_t ssrc){

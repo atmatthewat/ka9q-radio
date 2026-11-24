@@ -1172,27 +1172,44 @@ static void evaluate_all(struct dmr_site *s,uint64_t now,struct actions *a){
   }
 }
 
+// Who an announced call is for, when the message says
+struct follow_who {
+  uint32_t talkgroup;
+  uint8_t bits;                 // 0 not known
+  bool group;
+};
+static struct follow_who const Nobody = {0, 0, false};
+
+// For a follower: the repeater, as well as the site knows it
+static void push_follow(struct dmr_site *s,struct actions *a,struct site_channel const *target,uint16_t lcn,
+                        uint64_t hz,uint8_t timeslot,bool repeating,bool rest,char const *what,struct follow_who who){
+  if(a->nfollows >= (int)(sizeof a->follows / sizeof a->follows[0]))
+    return;
+  struct dmr_follow *f = &a->follows[a->nfollows++];
+  memset(f,0,sizeof *f);
+  f->lcn = target != NULL && target->lcn != 0 ? target->lcn : lcn;
+  f->frequency_hz = target != NULL && target->frequency_hz != 0 ? target->frequency_hz
+    : hz != 0 ? hz : lcn != 0 ? dmr_map_downlink_hz(&s->map,lcn) : 0;
+  f->timeslot = timeslot;
+  f->configured = target != NULL && target->configured;
+  f->attached = target != NULL && target->attached;
+  f->repeating = repeating;
+  f->rest = rest;
+  f->talkgroup = who.talkgroup;
+  f->talkgroup_bits = who.bits;
+  f->group = who.group;
+  if(target != NULL)
+    copy_string(f->channel_id,sizeof f->channel_id,target->channel_id);
+  copy_string(f->what,sizeof f->what,what);
+}
+
 // A message heard on 'by' says a timeslot carries a voice call. direct: the channel itself (Act_Updt
-// names the carrier it is on); else it is looked up by LCN or frequency
+// names the carrier it is on); else it is looked up by LCN or frequency. who: the call's destination
 static void announce_on(struct dmr_site *s,struct site_channel *direct,uint16_t lcn,uint64_t hz,uint8_t timeslot,bool repeating,
-                        char const *what,struct site_channel const *by,uint64_t now,struct actions *a){
+                        char const *what,struct follow_who who,struct site_channel const *by,uint64_t now,struct actions *a){
   s->announced++;
   struct site_channel *target = direct != NULL ? direct : find_channel(s,lcn,hz);
-  // For a follower: the repeater, as well as the site knows it
-  if(a->nfollows < (int)(sizeof a->follows / sizeof a->follows[0])){
-    struct dmr_follow *f = &a->follows[a->nfollows++];
-    memset(f,0,sizeof *f);
-    f->lcn = target != NULL && target->lcn != 0 ? target->lcn : lcn;
-    f->frequency_hz = target != NULL && target->frequency_hz != 0 ? target->frequency_hz
-      : hz != 0 ? hz : lcn != 0 ? dmr_map_downlink_hz(&s->map,lcn) : 0;
-    f->timeslot = timeslot;
-    f->configured = target != NULL && target->configured;
-    f->attached = target != NULL && target->attached;
-    f->repeating = repeating;
-    if(target != NULL)
-      copy_string(f->channel_id,sizeof f->channel_id,target->channel_id);
-    copy_string(f->what,sizeof f->what,what);
-  }
+  push_follow(s,a,target,lcn,hz,timeslot,repeating,false,what,who);
   if(target == NULL || (!target->configured && !target->attached)){
     s->announced_unconfigured++;
     uint64_t const key = hz != 0 ? hz : lcn;
@@ -1325,6 +1342,13 @@ static void neighbour(struct dmr_site *s,uint32_t site){
 static void rest_channel(struct dmr_site *s,uint8_t lsn,uint64_t now,struct actions *a){
   if(lsn == 0)
     return;  // there is no LSN 0
+  // Every report of the rest channel, for a follower: the site's control information is there
+  {
+    uint16_t const lcn = (uint16_t)dmr_lsn_to_lcn(lsn);
+    char what[48];
+    format(what,sizeof what,"rest channel LSN %u",(unsigned)lsn);
+    push_follow(s,a,find_channel(s,lcn,0),lcn,0,(uint8_t)dmr_lsn_to_timeslot(lsn),true,true,what,Nobody);
+  }
   if(s->rest_known && lsn == s->rest_lsn)
     return;
   if(s->rest_known && s->rest_has_previous && lsn == s->rest_previous_lsn && now - s->rest_moved_us < s->o.rest_holdoff_us){
@@ -1498,7 +1522,7 @@ void dmr_site_short_lc(struct dmr_site *s,int handle,uint8_t color_code,struct d
         continue;
       char what[64];
       format(what,sizeof what,"SLC activity update (%s)",dmr_slot_activity_name(activity[ts - 1]));
-      announce_on(s,ch,ch->lcn,ch->frequency_hz,(uint8_t)ts,true,what,ch,now,&a);
+      announce_on(s,ch,ch->lcn,ch->frequency_hz,(uint8_t)ts,true,what,Nobody,ch,now,&a);
     }
     break;
   }
@@ -1558,7 +1582,8 @@ void dmr_site_link_control(struct dmr_site *s,int handle,uint8_t slot,uint8_t co
       if(lc->u.xpt_grant.channel != 0){
         char what[64];
         format(what,sizeof what,"XPT channel grant tg=%u",lc->u.xpt_grant.target);
-        announce_on(s,NULL,lc->u.xpt_grant.channel,0,0,false,what,ch,now,&a);
+        struct follow_who const who = {lc->u.xpt_grant.target, 24, true};
+        announce_on(s,NULL,lc->u.xpt_grant.channel,0,0,false,what,who,ch,now,&a);
       }
     }
   }
@@ -1617,7 +1642,8 @@ void dmr_site_csbk(struct dmr_site *s,int handle,struct dmr_csbk_message const *
           format(what,sizeof what,"CAP+ Site Status (LSN %u tg %u)",act->lsn,act->id);
         else
           format(what,sizeof what,"CAP+ Site Status (LSN %u)",act->lsn);
-        announce_on(s,NULL,(uint16_t)dmr_lsn_to_lcn(act->lsn),0,(uint8_t)dmr_lsn_to_timeslot(act->lsn),true,what,ch,now,&a);
+        struct follow_who const who = {act->id, act->id_known ? 8 : 0, true};
+        announce_on(s,NULL,(uint16_t)dmr_lsn_to_lcn(act->lsn),0,(uint8_t)dmr_lsn_to_timeslot(act->lsn),true,what,who,ch,now,&a);
       }
     }
     break;
@@ -1695,7 +1721,8 @@ void dmr_site_csbk(struct dmr_site *s,int handle,struct dmr_csbk_message const *
     }
     if(!dmr_grant_is_data(g) && dmr_chref_valid(&g->channel)){
       bool const absolute = dmr_chref_has_frequency(&g->channel);
-      announce_on(s,NULL,absolute ? 0 : g->channel.lcn,absolute ? hz : 0,g->channel.timeslot,g->activity_update,desc,ch,now,&a);
+      struct follow_who const who = {g->destination, 24, g->destination_is_group};
+      announce_on(s,NULL,absolute ? 0 : g->channel.lcn,absolute ? hz : 0,g->channel.timeslot,g->activity_update,desc,who,ch,now,&a);
     }
   }
 

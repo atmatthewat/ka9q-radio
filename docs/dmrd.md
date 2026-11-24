@@ -54,6 +54,9 @@ dmrd [options] dmr-iq.local [more groups ...]
 - **-f**, **--sites** *file*: which repeaters make up each site, and the system each site belongs to (see **Sites** below)
 - **-n**, **--no-follow**: don't ask *radiod* for the repeaters calls are announced on
 - **-H**, **--hold** *seconds*: keep a followed repeater this long after the last sign of its call (default 5)
+- **-g**, **--talkgroups** *list*: follow group calls on only these talkgroups, e.g. **1,3,9000-9099** (repeatable)
+- **-x**, **--exclude** *list*: never follow group calls on these talkgroups (repeatable)
+- **-m**, **--max-calls** *n*: follow at most *n* calls at once (default: no limit; rest channels don't count)
 - **-y**, **--system-type** *type*: the kind of system the channels belong to, which says how its signalling is read: **conventional** (the default; amateur repeaters, IP Site Connect), **tier3**, **capacity_plus**, **linked_capacity_plus**, **connect_plus**, **capacity_max**, **hytera_xpt** or **hytera_tier3**
 - **-v**, **--verbose**: more messages; at -v each channel also logs a status line, and link control, talker aliases and re-anchored clocks are logged
 - **-u**, **--update** *seconds*: interval between the -v status lines (default 10)
@@ -128,6 +131,13 @@ A trunked site announces where each call is: a Capacity Plus site in the Site St
 Tue 24 Nov 2026 01:20:04.212 UTC site SCMTD/1 follow 453.975000 MHz LCN 1 TS2 ssrc 453975: CAP+ Site Status (LSN 2 tg 1)
 ```
 Each repeat of the announcement asks again, and the channel's own decoder keeps it while it carries voice; **--hold** seconds after both stop, *radiod* removes it, and *dmrd* closes the channel a second after its data stops (**closed (followed channel released)**), so that a channel asked for again starts afresh. Its I/Q joins the site like any configured channel's, and its speech is voted with the other repeaters'. The repeater's frequency comes from the sites file (its LCN), or from the channel map the site learns from the air (Tier III and Connect Plus send it): without either, the call is logged and not followed. Where there is more than one *radiod*, each is asked in turn until one covers the frequency. Channels *radiod* carries anyway (its configured ones) are left alone.
+
+**The rest channel.** A Capacity Plus site's control information (where calls are, where the rest channel goes next) is on its rest channel, which moves from repeater to repeater. When the rest channel is on a repeater no channel carries, *dmrd* asks for it as it would for a call, keeps it for as long as the site goes on naming it the rest channel, and lets it go **--hold** seconds after the rest channel has moved on (unless it then carries a call). So a site can be decoded from fewer channels than it has repeaters, as long as one of them is the rest channel when *dmrd* starts.
+
+**Which calls.** **-g** and **-x** choose by talkgroup, for group calls whose announcement gives it; a call whose talkgroup is not known yet (or a unit-to-unit call) is followed. A Capacity Plus Site Status gives only a talkgroup's low 8 bits, so there a call is followed when any talkgroup of **-g** has them. **-m** caps the calls followed at once. A call already followed stays followed when these would refuse it now. Each refusal is logged, once every 30 s per call:
+```
+Tue 24 Nov 2026 02:29:47.399 UTC site SCMTD/1 not followed 453.975000 MHz LCN 1 TS2: talkgroup 3 not wanted (-g, -x); CAP+ Site Status (LSN 2 tg 3)
+```
 
 ## Running as a service
 
