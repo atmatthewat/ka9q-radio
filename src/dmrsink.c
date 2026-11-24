@@ -1,6 +1,7 @@
 // DMR frame sync and TDMA slot framing (see dmrsink.h)
 // Copyright 2026, Matthew Kaufman, KA6SQG
 #include <assert.h>
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,14 +55,31 @@
 //     retimed_sync (18) is judged as a weak sync. Never as a strong one: the best of many timings of a
 //     noise window is good far more often than the window itself.
 //
+// Half a symbol off. A Gardner timing loop has a second, unstable, equilibrium on the midpoints
+// between the symbols, and coming up near it a loop can hang there for several bursts (Gardner's
+// hang-up: the error averages out on both sides). As sampled its syncs then read 3 - 11, half a
+// symbol earlier 17 - 24, so no window reaches candidate_sync and the frame is acquired only when
+// the loop has slid off by itself, at the carrier's third burst or later. So, searching and with a
+// receiver (half_symbol_search), every dibit is also taken half a symbol earlier (resample() of the
+// newest symbol, which needs no sample still to come) into a ring of its own, and the same windows
+// are correlated on those. One that reaches candidate_sync is judged Slot_type_tail dibits later as a
+// near miss is, from the timing half a symbol earlier and no further than a nudge reaches
+// (Max_nudge_symbols): the climb's best levelled correlation reaching retimed_sync is judged as a weak
+// sync, and the window at half a symbol, if it reached strong_sync, as a strong one (it is one timing,
+// as a window as sampled is). Taken (or a voice sync left waiting for its EMBs), the burst so far is
+// re-sampled there and the receiver nudged there, in two steps when that is more than one nudge
+// moves; looking back then finds the period before, whose climb reaches it from either side.
+//
 // Acquisition (a sync accepted with no frame held). The burst so far is re-sampled from the
 // receiver's history at the timing that maximises its sync (on a rigid grid of nominal symbol
 // periods through the sync where the receiver can: its timing loop, at its wide acquisition
 // bandwidth, was slewing under those symbols), the receiver's timing is nudged there and the
-// receiver is told it is frame locked. The Look_back_periods (2) periods ahead of the acquiring sync
-// are in the ring too, and their position is now known: a levelled sync of weak_sync or better there
-// (with a receiver, every pattern of the acquiring family at its own best timing, as far back as the
-// history reaches) starts the frame that much earlier. A transmission's first sync is seldom the one
+// receiver is told it is frame locked; once the acquiring burst is in, its second half is re-sampled
+// on that rigid grid too (rigid_tail), not as the loops sampled it after the nudge, still settling.
+// The Look_back_periods (2) periods ahead of the acquiring sync are in the ring too, and their
+// position is now known: a levelled sync of weak_sync or better there (with a receiver, every
+// pattern of the acquiring family at its own best timing, as far back as the history reaches)
+// starts the frame that much earlier. A transmission's first sync is seldom the one
 // the search takes, so this is what recovers most first bursts. A frame begun by a weak sync is not
 // believed until a second burst is confirmed: its first burst waits and is dropped if the frame is
 // lost first. A strong sync's burst goes out alone (a lone CSBK is a burst). The next
@@ -153,6 +171,7 @@ enum {
 };
 static float const Tight_limit = 1.0f;      // an EMB (or a re-frame's slot type) believed by itself
 static float const Max_retime_symbols = 0.45f;
+static float const Max_nudge_symbols = 0.49f; // the most the receiver's nudge moves (nudge_symsync())
 static float const Settling_gain = 0.3f;
 static float const Max_level = 1.0f;        // radians: a sync's level error is clamped here
 static float const Level_error_range = 1.3f;
@@ -325,6 +344,15 @@ struct dmr_sink {
   int64_t first_index;      // index of the first since the (re)start
 
   struct candidate candidates[8]; // by the sync's last dibit: at most one a dibit, due 5 later
+  // Half a symbol off: each dibit sampled half a symbol earlier, while searching (store_half()),
+  // from half_from on
+  float half_sin[Ring],half_cos[Ring];
+  int64_t half_from;
+  struct candidate half_candidates[8];
+  int retime_base;          // arms retime_head()'s climbs start from (half a symbol earlier, or 0)
+  bool acquired_rigid;      // the acquiring burst's head was re-sampled on a rigid grid ...
+  int acquired_rigid_offset; // ... at this offset (its tail follows: rigid_tail)
+  int pending_nudge_arms;   // what a nudge of more than one could move is still to do (nudge_receiver())
   struct pending_voice pending_voice[4];
 
   // The frame
@@ -344,6 +372,7 @@ struct dmr_sink {
   float radians_per_hz;
   bool follow_correction;   // the receiver tells its frequency corrections
   int64_t acquired_end;
+  int acquired_back;        // periods the frame was begun ahead of acquired_end
   struct forced forced[8];
   struct {
     struct dmr_burst burst;
@@ -389,6 +418,8 @@ void dmr_sink_config_defaults(struct dmr_sink_config *c){
   c->rigid_grid = true;
   c->frame_keeps_family = true;
   c->emb_revives_channel = true;
+  c->half_symbol_search = true;
+  c->rigid_tail = true;
   c->strong_sync = DMR_STRONG_SYNC;
   c->weak_sync = DMR_WEAK_SYNC;
   c->retimed_sync = DMR_RETIMED_SYNC;
@@ -451,6 +482,7 @@ struct dmr_sink *create_dmr_sink(struct dmr_sink_config const *config,struct dmr
     s->cos[i] = 1.0f;
   s->mode = DMR_STATION_UNKNOWN;
   s->channel0_is_slot1 = true;
+  s->half_from = -1;
   s->radians_per_hz = DMR_DEFAULT_LEVEL_RADIANS_PER_HZ;
   if(timing != NULL){
     s->have_timing = true;
@@ -527,6 +559,12 @@ void dmr_sink_restrict_family(struct dmr_sink *s,enum dmr_station mode){
 struct dmr_sink_config const *dmr_sink_config(struct dmr_sink const *s){
   return &s->config;
 }
+uint64_t dmr_sink_acquired_sync_end(struct dmr_sink const *s){
+  return s->acquired_end > 0 ? (uint64_t)s->acquired_end : 0;
+}
+int dmr_sink_acquired_back_periods(struct dmr_sink const *s){
+  return s->acquired_back;
+}
 int dmr_sink_summary(struct dmr_sink const *s,char *line,int size){
   struct dmr_sink_counters const *c = &s->counters;
   uint64_t syncs = 0;
@@ -555,6 +593,10 @@ void dmr_sink_reset(struct dmr_sink *s){
   s->count = 0;
   for(int i=0; i < 8; i++)
     s->candidates[i].active = false;
+  for(int i=0; i < 8; i++)
+    s->half_candidates[i].active = false;
+  s->half_from = -1;
+  s->pending_nudge_arms = 0;
   for(int i=0; i < 4; i++)
     s->pending_voice[i].active = false;
   s->have_emitted = false;
@@ -619,11 +661,11 @@ static void store(struct dmr_sink *s,int64_t index,float phase){
 static bool in_ring(struct dmr_sink const *s,int64_t first){
   return first >= s->first_index && s->now - first < Ring;
 }
-// The best enabled pattern for the 24 dibits ending at 'end'
-static struct sync_score best_sync(struct dmr_sink const *s,int64_t end){
+// The best enabled pattern for the 24 dibits ending at 'end', of a ring of sines and cosines
+static struct sync_score best_sync_in(struct dmr_sink const *s,float const *sines,float const *cosines,int64_t end){
   float common = 0.0f;
   for(int i=0; i < DMR_SYNC_DIBITS; i++)
-    common -= s->cos[ring_index(end - DMR_SYNC_DIBITS + 1 + i)];
+    common -= cosines[ring_index(end - DMR_SYNC_DIBITS + 1 + i)];
   struct sync_score best = No_sync;
   for(int pair=0; pair < Pairs; pair++){
     bool const a = s->enabled[s->pair_first[pair]];
@@ -632,7 +674,7 @@ static struct sync_score best_sync(struct dmr_sink const *s,int64_t end){
       continue;
     float sum = 0.0f;
     for(int i=0; i < DMR_SYNC_DIBITS; i++)
-      sum += s->sign[pair][i] * s->sin[ring_index(end - DMR_SYNC_DIBITS + 1 + i)];
+      sum += s->sign[pair][i] * sines[ring_index(end - DMR_SYNC_DIBITS + 1 + i)];
     float const ca = (common + sum) * Inv_sqrt2,cb = (common - sum) * Inv_sqrt2;
     if(a && ca > best.correlation)
       best = (struct sync_score){ s->pair_first[pair], ca };
@@ -640,6 +682,10 @@ static struct sync_score best_sync(struct dmr_sink const *s,int64_t end){
       best = (struct sync_score){ s->pair_second[pair], cb };
   }
   return best;
+}
+// ... of the ring as sampled
+static struct sync_score best_sync(struct dmr_sink const *s,int64_t end){
+  return best_sync_in(s,s->sin,s->cos,end);
 }
 static float correlation_of(struct dmr_sink const *s,int64_t end,enum dmr_sync pattern){
   float sum = 0.0f;
@@ -898,13 +944,14 @@ static void climb_at(struct dmr_sink const *s,int64_t end,enum dmr_sync pattern,
     *value = -1.0e9f;
 }
 // Hill climb of the levelled sync correlation over timing: from an eighth of a symbol down to one
-// interpolator arm, within Max_retime_symbols
-static struct climb climb_timing(struct dmr_sink const *s,int64_t end,enum dmr_sync pattern,bool rigid){
+// interpolator arm, within Max_retime_symbols of 'base' arms (and within [lo,hi] arms in all). The
+// climb's offset is the whole offset, base included
+static struct climb climb_timing_from(struct dmr_sink const *s,int64_t end,enum dmr_sync pattern,bool rigid,int base,int lo,int hi){
   struct climb climb = { false, 0, 0.0f, 0.0f };
   if(!s->have_timing || end - DMR_SYNC_DIBITS + 1 < s->first_index)
     return climb;
   float const arms_per_symbol = s->timing.arms_per_symbol(s->timing.arg);
-  if(!climb_score(s,end,pattern,rigid,0,&climb.centre))
+  if(!climb_score(s,end,pattern,rigid,base,&climb.centre))
     return climb;
   int const max_arms = (int)(Max_retime_symbols * arms_per_symbol);
   int step = (int)(arms_per_symbol / 8.0f);
@@ -912,37 +959,99 @@ static struct climb climb_timing(struct dmr_sink const *s,int64_t end,enum dmr_s
     step = 1;
   int offset = 0;
   float best = climb.centre,left = 0.0f,right = 0.0f;
-  climb_at(s,end,pattern,rigid,-step,&left);
-  climb_at(s,end,pattern,rigid,step,&right);
+#define ALLOWED(o) ((o) >= -max_arms && (o) <= max_arms && base + (o) >= lo && base + (o) <= hi)
+  climb_at(s,end,pattern,rigid,base - step,&left);
+  climb_at(s,end,pattern,rigid,base + step,&right);
   while(step >= 1){
-    if(left > right && left > best && offset - step >= -max_arms){
+    if(left > right && left > best && ALLOWED(offset - step)){
       offset -= step;
       right = best;
       best = left;
-      climb_at(s,end,pattern,rigid,offset - step,&left);
-    } else if(right > left && right > best && offset + step <= max_arms){
+      climb_at(s,end,pattern,rigid,base + offset - step,&left);
+    } else if(right > left && right > best && ALLOWED(offset + step)){
       offset += step;
       left = best;
       best = right;
-      climb_at(s,end,pattern,rigid,offset + step,&right);
+      climb_at(s,end,pattern,rigid,base + offset + step,&right);
     } else {
       step /= 2;
       if(step >= 1){
-	climb_at(s,end,pattern,rigid,offset - step,&left);
-	climb_at(s,end,pattern,rigid,offset + step,&right);
+	climb_at(s,end,pattern,rigid,base + offset - step,&left);
+	climb_at(s,end,pattern,rigid,base + offset + step,&right);
       }
     }
   }
+#undef ALLOWED
   climb.ok = true;
-  climb.offset = offset;
+  climb.offset = base + offset;
   climb.best = best;
   return climb;
+}
+// ... from the timing as sampled, unbounded but for Max_retime_symbols
+static struct climb climb_timing(struct dmr_sink const *s,int64_t end,enum dmr_sync pattern,bool rigid){
+  return climb_timing_from(s,end,pattern,rigid,0,INT_MIN / 2,INT_MAX / 2);
 }
 static float arms_per_symbol(struct dmr_sink const *s){
   return s->timing.arms_per_symbol(s->timing.arg);
 }
 static void nudge(struct dmr_sink *s,int offset_arms){
   s->timing.nudge(s->timing.arg,(float)offset_arms / arms_per_symbol(s));
+}
+
+// ---------------- half a symbol off ----------------
+
+// Arms of half a symbol, and the most a nudge moves the receiver (< 0.5 symbol)
+static int half_symbol_arms(struct dmr_sink const *s){
+  return (int)lroundf(0.5f * arms_per_symbol(s));
+}
+static int max_nudge_arms(struct dmr_sink const *s){
+  return (int)(Max_nudge_symbols * arms_per_symbol(s));
+}
+// The earliest a climb from half a symbol earlier goes: three quarters of a symbol (later than half a
+// symbol, the window as sampled is the nearer, and its own climb reaches it)
+static int half_search_low(struct dmr_sink const *s){
+  return -half_symbol_arms(s) - half_symbol_arms(s) / 2;
+}
+// Searching: dibit 'index' (the newest) half a symbol earlier, into the half ring. Returns whether
+// the half ring is being kept (from half_from on)
+static bool store_half(struct dmr_sink *s,int64_t index){
+  if(!s->have_timing || !s->config.retime || !s->config.half_symbol_search || s->locked){
+    s->half_from = -1;
+    return false;
+  }
+  struct softdibit d;
+  if(!s->timing.resample(s->timing.arg,(uint64_t)index,1,-half_symbol_arms(s),&d)){
+    s->half_from = -1;
+    return false;
+  }
+  size_t const r = ring_index(index);
+  s->half_sin[r] = sinf(d.phase);
+  s->half_cos[r] = cosf(d.phase);
+  if(s->half_from < 0)
+    s->half_from = index;
+  return true;
+}
+// The receiver's sampling instant moved 'arms' (earlier negative): what one nudge moves now, the
+// rest at the next dibit (see dmr_sink_dibit())
+static void nudge_receiver(struct dmr_sink *s,int arms){
+  int const max = max_nudge_arms(s);
+  int const now = arms < -max ? -max : arms > max ? max : arms;
+  if(now != 0)
+    nudge(s,now);
+  s->pending_nudge_arms = arms - now;
+}
+// The rest of such a nudge, at the next dibit: the phase to keep of it (delivered at the first
+// nudge's timing, it is re-sampled at the rest, which is earlier: no sample is still to come)
+static float finish_nudge(struct dmr_sink *s,struct softdibit const *sd,int64_t index){
+  int const rest = s->pending_nudge_arms;
+  s->pending_nudge_arms = 0;
+  if(rest == 0 || !s->have_timing)
+    return sd->phase;
+  nudge(s,rest);
+  struct softdibit resampled;
+  if(rest < 0 && s->timing.resample(s->timing.arg,(uint64_t)index,1,rest,&resampled))
+    return resampled.phase;
+  return sd->phase;
 }
 
 // ---------------- voice syncs waiting for their EMBs ----------------
@@ -1040,17 +1149,30 @@ static void reset_channels(struct dmr_sink *s){
   s->channels[0].next = s->channels[1].next = DMR_KIND_DATA;
 }
 
+// The receiver's nudge of a head re-timed from half a symbol off may be more than one nudge moves
+static void retime_nudge(struct dmr_sink *s,bool half,int arms){
+  if(half)
+    nudge_receiver(s,arms);
+  else
+    nudge(s,arms);
+}
 // CACH + first half + sync (and what has come since) at the timing that maximises the sync
-// correlation; the receiver samples there from the next symbol on
+// correlation; the receiver samples there from the next symbol on. From a sync found half a symbol
+// off (retime_base, see evaluate_half_candidate()) both climbs start half a symbol earlier, the
+// newest dibit is re-sampled too (an earlier timing needs no sample still to come) and the
+// receiver's nudge may be more than one nudge moves (nudge_receiver())
 static void retime_head(struct dmr_sink *s,int64_t end,enum dmr_sync pattern){
+  bool const half = s->retime_base != 0;
   int64_t const first = end - Sync_end_offset > s->first_index ? end - Sync_end_offset : s->first_index;
-  int const count = (int)(s->now - first); // up to the symbol before this one
+  int const count = (int)(s->now - first) + (half ? 1 : 0); // up to the symbol before this one
   if(count < DMR_SYNC_DIBITS || count > Max_retime_dibits)
     return;
-  struct climb const climb = climb_timing(s,end,pattern,false);
+  int const lo = half ? half_search_low(s) : INT_MIN / 2;
+  int const hi = half ? 0 : INT_MAX / 2;
+  struct climb const climb = climb_timing_from(s,end,pattern,false,s->retime_base,lo,hi);
   if(s->config.rigid_grid){
     // On a rigid grid through the sync; the receiver's nudge stays the relative climb's
-    struct climb const rigid = climb_timing(s,end,pattern,true);
+    struct climb const rigid = climb_timing_from(s,end,pattern,true,s->retime_base,lo,hi);
     struct softdibit grid[Max_retime_dibits];
     int const head = (int)(end + 1 - first);
     if(rigid.ok && s->timing.resample_rigid != NULL
@@ -1064,7 +1186,9 @@ static void retime_head(struct dmr_sink *s,int64_t end,enum dmr_sync pattern){
 	  store(s,end + 1 + i,grid[i].phase);
       }
       if(climb.ok && climb.offset != 0)
-	nudge(s,climb.offset);
+	retime_nudge(s,half,climb.offset);
+      s->acquired_rigid = true;
+      s->acquired_rigid_offset = rigid.offset;
       s->counters.retimed_acquisitions++;
       return;
     }
@@ -1076,7 +1200,7 @@ static void retime_head(struct dmr_sink *s,int64_t end,enum dmr_sync pattern){
     return;
   for(int i=0; i < count; i++)
     store(s,first + i,window[i].phase);
-  nudge(s,climb.offset);
+  retime_nudge(s,half,climb.offset);
   s->counters.retimed_acquisitions++;
 }
 
@@ -1143,6 +1267,7 @@ static void acquire(struct dmr_sink *s,int64_t end,enum dmr_sync pattern,bool re
   bool const was_locked = s->locked;
   release_held(s); // of the frame this one replaces
   s->weak_frame = weak;
+  s->acquired_rigid = false;
   if(!retimed && s->have_timing && s->config.retime)
     retime_head(s,end,pattern);
 
@@ -1189,6 +1314,7 @@ static void acquire(struct dmr_sink *s,int64_t end,enum dmr_sync pattern,bool re
   s->settling = s->config.settling_bursts;
   s->origin -= (int64_t)back * DMR_SLOT_DIBITS;
   s->channel_index = back & 1;
+  s->acquired_back = back;
   // The frequency loop's running mean starts again: a new frame, or another transmitter's
   s->afc_syncs = 0;
   s->afc_pending.valid = false;
@@ -1357,6 +1483,64 @@ static void evaluate_candidate(struct dmr_sink *s,struct candidate const *c){
   }
   count_rejection(s,verdict);
   near_miss(s,c);
+}
+
+// A window that reached candidate_sync half a symbol earlier than sampled. As a near miss: the
+// timing that maximises its levelled correlation, from half a symbol earlier (within
+// Max_retime_symbols, and not later than as sampled nor earlier than half_search_low()); a window
+// reaching retimed_sync there is judged as a weak sync, one that reached strong_sync at half a
+// symbol (one timing, as a window as sampled is) as a strong one. Taken, the frame is acquired as
+// from any sync, its head re-timed from half a symbol earlier (retime_head()); a voice sync left
+// waiting for its EMBs has the window kept at that timing and the receiver nudged there
+static void evaluate_half_candidate(struct dmr_sink *s,struct candidate const *c){
+  if(s->locked || !s->have_timing)
+    return;
+  struct climb const climb = climb_timing_from(s,c->end,c->pattern,false,-half_symbol_arms(s),half_search_low(s),0);
+  if(!climb.ok)
+    return;
+  bool const strong = c->correlation >= s->config.strong_sync;
+  if(!strong && climb.best < s->config.retimed_sync)
+    return;
+  int64_t const first = c->end - Sync_end_offset > s->first_index ? c->end - Sync_end_offset : s->first_index;
+  int const count = (int)(s->now - first) + 1; // up to this one: an earlier timing needs no samples to come
+  if(count < DMR_SYNC_DIBITS + Slot_type_tail || count > Max_retime_dibits)
+    return;
+  struct softdibit window[Max_retime_dibits];
+  if(!s->timing.resample(s->timing.arg,(uint64_t)first,count,climb.offset,window))
+    return;
+  float saved[Max_retime_dibits];
+  for(int i=0; i < count; i++){
+    saved[i] = s->phase[ring_index(first + i)];
+    store(s,first + i,window[i].phase);
+  }
+  float const levelled = levelled_correlation_of(s,c->end,c->pattern);
+  enum verdict verdict = V_BELOW_WEAK;
+  if(strong)
+    verdict = search_verdict(s,c->end,c->pattern,c->correlation,true);
+  if(verdict != V_STRONG && verdict != V_WEAK && verdict != V_VOICE_PENDING && levelled >= s->config.retimed_sync)
+    verdict = search_verdict(s,c->end,c->pattern,levelled,false);
+  if(verdict != V_STRONG && verdict != V_WEAK && verdict != V_VOICE_PENDING){
+    for(int i=0; i < count; i++)
+      store(s,first + i,saved[i]);
+    return;
+  }
+  // The receiver samples there from the next symbol on; the half ring restarts at the new timing
+  s->half_from = -1;
+  for(int i=0; i < 8; i++)
+    s->half_candidates[i].active = false;
+  if(verdict == V_VOICE_PENDING){
+    nudge_receiver(s,climb.offset);
+    add_pending_voice(s,c);
+    return;
+  }
+  s->counters.half_symbol_syncs++;
+  if(verdict == V_STRONG)
+    s->counters.strong_syncs++;
+  else
+    s->counters.weak_syncs++;
+  s->retime_base = -half_symbol_arms(s);
+  acquire(s,c->end,c->pattern,false,verdict == V_WEAK);
+  s->retime_base = 0;
 }
 
 // A channel of a mobile station or direct mode frame with a transmitter on it
@@ -1634,6 +1818,24 @@ static void process_period(struct dmr_sink *s){
       s->counters.retimed_settling++;
     }
   }
+  if(forced != NULL && end == s->acquired_end && s->acquired_rigid && s->have_timing && s->config.retime
+     && s->config.rigid_grid && s->config.rigid_tail && s->timing.resample_rigid != NULL){
+    // The burst the frame was acquired on: its second half on the grid its head was re-sampled on
+    // (retime_head()), not as the receiver's loops sampled it after the nudge, still settling. (The
+    // newest dibit may need samples not in yet at a later timing: without it, then)
+    s->acquired_rigid = false;
+    struct softdibit grid[DMR_BURST_DIBITS];
+    uint64_t const anchor = (uint64_t)(end - DMR_SYNC_DIBITS / 2);
+    int const tail = (int)(s->now - end);
+    for(int count = tail; count >= tail - 1; count--){
+      if(count <= 0 || count > DMR_BURST_DIBITS || !s->timing.resample_rigid(s->timing.arg,anchor,s->acquired_rigid_offset,(uint64_t)(end + 1),count,grid))
+	continue;
+      for(int i=0; i < count; i++)
+	store(s,end + 1 + i,grid[i].phase);
+      s->counters.rigid_tails++;
+      break;
+    }
+  }
 
   if(taken == TAKEN_SYNC){
     enum dmr_station const mode = dmr_mode_of(score.pattern);
@@ -1829,7 +2031,8 @@ void dmr_sink_dibit(struct dmr_sink *s,struct softdibit const *sd,uint64_t symbo
     s->first_index = index;
   s->now = index;
   s->count++;
-  store(s,index,sd->phase);
+  store(s,index,s->pending_nudge_arms != 0 ? finish_nudge(s,sd,index) : sd->phase);
+  bool const half_search = store_half(s,index);
   if(s->count < (uint64_t)DMR_SYNC_DIBITS)
     return;
 
@@ -1838,11 +2041,23 @@ void dmr_sink_dibit(struct dmr_sink *s,struct softdibit const *sd,uint64_t symbo
   // Every window that reaches candidate_sync is judged on its own, Slot_type_tail dibits later
   if(!expected_here && score.correlation >= s->config.candidate_sync)
     s->candidates[(uint64_t)index & 7] = (struct candidate){ true, index, score.pattern, score.correlation };
+  // The same of the dibits half a symbol earlier (see Half a symbol off)
+  if(half_search && index - s->half_from >= DMR_SYNC_DIBITS - 1){
+    struct sync_score const half = best_sync_in(s,s->half_sin,s->half_cos,index);
+    if(half.correlation >= s->config.candidate_sync)
+      s->half_candidates[(uint64_t)index & 7] = (struct candidate){ true, index, half.pattern, half.correlation };
+  }
   struct candidate *due = &s->candidates[(uint64_t)(index - Slot_type_tail) & 7];
   if(due->active && due->end == index - Slot_type_tail){
     struct candidate const candidate = *due;
     due->active = false;
     evaluate_candidate(s,&candidate);
+  }
+  struct candidate *half_due = &s->half_candidates[(uint64_t)(index - Slot_type_tail) & 7];
+  if(half_due->active && half_due->end == index - Slot_type_tail){
+    struct candidate const candidate = *half_due;
+    half_due->active = false;
+    evaluate_half_candidate(s,&candidate);
   }
   check_pending_voice(s);
   while(s->locked && s->now >= s->origin + DMR_SLOT_DIBITS - 1)

@@ -70,6 +70,8 @@ struct dmr_sink_config {
   bool rigid_grid;                 // the acquiring burst and the looked-back periods re-sampled on a rigid grid
   bool frame_keeps_family;         // below a strong sync a held frame takes only its own family's patterns
   bool emb_revives_channel;        // an idle channel of a bursty frame comes back on an error-free EMB
+  bool half_symbol_search;         // searching, the dibits are looked at half a symbol earlier as well
+  bool rigid_tail;                 // the acquiring burst's second half re-sampled on its head's rigid grid
   float strong_sync,weak_sync,retimed_sync,candidate_sync,locked_sync,mid_superframe_sync;
   float weak_slot_type_limit_bs,weak_slot_type_limit,weak_tact_limit;
   int loss_bursts;
@@ -83,12 +85,14 @@ struct dmr_sink_counters {
   uint64_t strong_syncs;          // frames begun (or moved) by a strong sync
   uint64_t weak_syncs;            // ... by a validated weak sync
   uint64_t retimed_syncs;         // ... by a near miss accepted after re-timing
+  uint64_t half_symbol_syncs;     // ... by a sync found half a symbol off (also counted strong / weak)
   uint64_t voice_syncs_confirmed; // ... by a voice sync confirmed by its EMBs
   uint64_t retimed_acquisitions;  // acquisitions whose head was re-sampled
   uint64_t look_back_syncs;       // syncs found ahead of an acquiring sync, at the frame's positions
   uint64_t retimed_look_backs;    // ... whose period was re-sampled
   uint64_t retimed_settling;      // sync bursts after an acquisition re-sampled at their own best timing
-  uint64_t afc_reports;           // syncs whose frequency error went to the receiver
+  uint64_t rigid_tails;           // acquiring bursts whose second half was re-sampled on the grid
+  uint64_t afc_reports;          // syncs whose frequency error went to the receiver
   uint64_t loop_holds;            // times the receiver's loops were held for an empty period
   // Weak syncs refused, by the validator that refused them
   uint64_t weak_rejected_no_cc,weak_rejected_tact,weak_rejected_slot_type,weak_rejected_cc;
@@ -167,6 +171,11 @@ uint32_t dmr_sink_color_code_observations(struct dmr_sink const *s,uint8_t cc); 
 uint64_t dmr_sink_color_code_changes(struct dmr_sink const *s); // times the tracked code changed
 struct dmr_sink_counters const *dmr_sink_counters(struct dmr_sink const *s);
 struct dmr_sink_config const *dmr_sink_config(struct dmr_sink const *s);
+// Tools: the last dibit of the sync the frame was last acquired (or re-framed) on, and how many slot
+// periods ahead of that sync the frame was begun (look-back, or waiting voice syncs it confirmed).
+// Meaningful once an acquisition has happened (counters' acquisitions)
+uint64_t dmr_sink_acquired_sync_end(struct dmr_sink const *s);
+int dmr_sink_acquired_back_periods(struct dmr_sink const *s);
 // Look for one station family's syncs only from now on (DMR_STATION_BS, _MS, _DIRECT), or for every family
 // the configuration enabled (DMR_STATION_UNKNOWN). On the sink's thread, between bursts
 void dmr_sink_restrict_family(struct dmr_sink *s,enum dmr_station mode);
