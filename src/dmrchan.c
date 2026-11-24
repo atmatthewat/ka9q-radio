@@ -15,6 +15,8 @@
 #include "dmrcall.h"
 #include "dmrcsbk.h"
 #include "dmrsite.h"
+#include "dmrdata.h"
+#include "dmrdataapp.h"
 #include "dmrchan.h"
 
 // Theory of operation
@@ -76,6 +78,8 @@ struct dmr_chan {
   struct dmr_msg_decoder msg;
   struct dmr_call_tracker tracker;
   struct dmr_cplane *cplane;       // NULL without a site
+  struct dmr_data_assembler *data; // NULL: no packet data
+  uint64_t data_last_us;           // the last burst it was given
   bool auto_stations;
   enum dmr_station family;         // the family locked to (auto_stations); UNKNOWN: not yet
   uint64_t family_syncs[3];        // synced bursts: bs, ms, direct
@@ -111,6 +115,7 @@ void dmr_chan_config_init(struct dmr_chan_config *c){
   memset(c,0,sizeof *c);
   c->color_code = -1;
   c->base_station = true;
+  c->decode_data = true;
 }
 
 static uint64_t time_of_symbol(struct dmr_chan const *c,uint64_t index){
@@ -177,6 +182,8 @@ static uint64_t sink_clock(void *arg,uint64_t index){
 }
 
 // Each symbol, after the sink: the tracker's timeouts
+enum { DATA_IDLE_FLUSH_US = 500000 }; // a packet left open this long on a quiet carrier is delivered
+
 static void on_symbol(void *arg,uint64_t index){
   struct dmr_chan * const c = arg;
   c->symbol_index = index;
@@ -192,9 +199,56 @@ static void on_symbol(void *arg,uint64_t index){
   int64_t const behind = (int64_t)index - TICK_LAG_SYMBOLS;
   if(behind >= c->first_symbol)
     dmr_call_on_time(&c->tracker,&c->channel,time_of_symbol(c,(uint64_t)behind));
-  dmr_cplane_time(c->cplane);
+  if(c->cplane != NULL)
+    dmr_cplane_time(c->cplane);
+  // A packet left open on a carrier quiet for half a second is delivered as it is
+  if(c->data != NULL && dmr_data_packet_open(c->data) && c->anchored
+     && time_of_symbol(c,index) - c->data_last_us > DATA_IDLE_FLUSH_US)
+    dmr_data_flush(c->data);
   if(c->ticks % DRIFT_CHECK_TICKS == 0)
     check_clock(c,index);
+}
+
+// Packet data lines: what the packet carries (its application's line, or the packet's own when it has
+// none); at -v (the log handler) the packet's assembly and CRC evidence too, and every data header
+static void on_data_packet(void *arg,struct dmr_data_packet const *p){
+  struct dmr_chan * const c = arg;
+  c->stats.data_packets++;
+  if(p->complete)
+    c->stats.data_packets_complete++;
+  char line[DMR_DATA_DESCRIBE_MAX],text[DMR_DATA_DESCRIBE_MAX + 16];
+  int64_t const when = (int64_t)p->first_timestamp_us * 1000;
+  if(c->h.data != NULL){
+    if(p->app != NULL)
+      dmr_data_app_describe(line,sizeof line,p->app);
+    else
+      dmr_data_packet_describe(line,sizeof line,p);
+    snprintf(text,sizeof text,"slot %u DATA %s",(unsigned)p->slot,line);
+    c->h.data(c->h.arg,when,text);
+  }
+  if(c->h.log != NULL && p->app != NULL){
+    dmr_data_packet_describe(line,sizeof line,p);
+    snprintf(text,sizeof text,"slot %u %s",(unsigned)p->slot,line);
+    c->h.log(c->h.arg,when,text);
+  }
+}
+static void on_data_header(void *arg,struct dmr_data_header const *hd){
+  struct dmr_chan * const c = arg;
+  if(c->h.log == NULL)
+    return;
+  char line[DMR_DATA_DESCRIBE_MAX],text[DMR_DATA_DESCRIBE_MAX + 16];
+  dmr_data_header_describe(line,sizeof line,hd);
+  snprintf(text,sizeof text,"slot %u %s",(unsigned)hd->slot,line);
+  c->h.log(c->h.arg,(int64_t)hd->timestamp_us * 1000,text);
+}
+static void on_data_usbd(void *arg,struct dmr_usbd const *u){
+  struct dmr_chan * const c = arg;
+  if(c->h.data == NULL)
+    return;
+  char line[DMR_DATA_DESCRIBE_MAX],text[DMR_DATA_DESCRIBE_MAX + 16];
+  dmr_usbd_describe(line,sizeof line,u);
+  snprintf(text,sizeof text,"slot %u DATA %s",(unsigned)u->slot,line);
+  c->h.data(c->h.arg,(int64_t)u->timestamp_us * 1000,text);
 }
 
 // A data burst of another colour code than the one the sink requires
@@ -232,7 +286,12 @@ static void on_burst(void *arg,struct dmr_burst const *from_sink){
       c->h.log(c->h.arg,(int64_t)burst.timestamp_us * 1000,text);
     }
   }
-  if(!foreign_color_code(c,&burst))
+  bool const foreign = foreign_color_code(c,&burst);
+  if(c->data != NULL && !foreign){ // another system's data is not this channel's packets
+    dmr_data_on_burst(c->data,&burst,&m);
+    c->data_last_us = burst.timestamp_us;
+  }
+  if(!foreign)
     dmr_call_on_burst(&c->tracker,&c->channel,&burst,&m);
   else {
     // As a data burst that did not decode: it ends a transmission, and says nothing
@@ -259,6 +318,8 @@ static void on_lost(void *arg){
   if(c->flushing)
     return; // the sink's reset at the end is not a sync loss
   dmr_msg_reset(&c->msg);
+  if(c->data != NULL)
+    dmr_data_sync_lost(c->data);
   if(c->cplane != NULL)
     dmr_cplane_sync_lost(c->cplane);
   dmr_call_on_sync_lost(&c->tracker,&c->channel,time_of_symbol(c,c->symbol_index));
@@ -362,7 +423,7 @@ static void note_family(struct dmr_chan *c,enum dmr_sync sync){
         snprintf(text,sizeof text,"stations auto: %s (synced bursts bs %llu ms %llu direct %llu); the other families are no longer looked for",
                  family_name(c->family),(unsigned long long)c->family_syncs[0],(unsigned long long)c->family_syncs[1],
                  (unsigned long long)c->family_syncs[2]);
-        c->h.notice(c->h.arg,c->anchored ? time_of_symbol(c,c->symbol_index) : 0,text);
+        c->h.notice(c->h.arg,c->anchored ? (int64_t)time_of_symbol(c,c->symbol_index) * 1000 : 0,text);
       }
       return;
     }
@@ -378,7 +439,7 @@ static void on_learned(void *arg,enum dmr_crc_check kind,uint8_t opcode,uint8_t 
   snprintf(text,sizeof text,"CRC mask learned: %s %s %u FID 0x%02X residual 0x%0*X, accepted from now on (an LC so accepted never says clear)",
            dmr_crc_check_name(kind),kind == DMR_CRC_CHECK_CSBK ? "CSBKO" : "FLCO",(unsigned)opcode,(unsigned)fid,
            kind == DMR_CRC_CHECK_RS129 ? 6 : kind == DMR_CRC_CHECK_CSBK ? 4 : 2,(unsigned)residual);
-  c->h.notice(c->h.arg,c->anchored ? time_of_symbol(c,c->symbol_index) : 0,text);
+  c->h.notice(c->h.arg,c->anchored ? (int64_t)time_of_symbol(c,c->symbol_index) * 1000 : 0,text);
 }
 
 struct dmr_chan *dmr_chan_create(struct dmr_chan_config const *config,double samprate,struct dmr_chan_handlers const *h){
@@ -395,6 +456,15 @@ struct dmr_chan *dmr_chan_create(struct dmr_chan_config const *config,double sam
   rc.sink.mobile_station = config->mobile_station;
   rc.sink.direct = config->direct;
   c->auto_stations = config->auto_stations;
+  if(config->decode_data){
+    struct dmr_data_handlers const dh = {
+      .arg = c,
+      .on_header = on_data_header,
+      .on_packet = on_data_packet,
+      .on_usbd = on_data_usbd,
+    };
+    c->data = dmr_data_create(&dh,NULL);
+  }
   if(config->color_code >= 0 && config->color_code <= 15){
     rc.sink.cc_mode = DMR_CC_PINNED;
     rc.sink.pinned_cc = (uint8_t)config->color_code;
@@ -455,6 +525,11 @@ void dmr_chan_destroy(struct dmr_chan *c){
   dmr_rx_flush(c->rx);
   c->flushing = false;
   dmr_call_flush(&c->tracker);
+  if(c->data != NULL){
+    dmr_data_flush(c->data); // a packet in progress is delivered as it is
+    dmr_data_destroy(c->data);
+    c->data = NULL;
+  }
   if(c->cplane != NULL){
     dmr_cplane_flush(c->cplane);
     dmr_cplane_destroy(c->cplane);

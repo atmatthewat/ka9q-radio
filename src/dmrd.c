@@ -950,6 +950,7 @@ static void *decode_task(void *arg){
     .event = voice_event,
     .log = voice_log,
     .notice = voice_notice,
+    .data = voice_notice, // packet data lines: always written
     .arg = &dec,
   };
   snprintf(dec.channel_id,sizeof dec.channel_id,"%u",sp->ssrc);
@@ -1790,6 +1791,9 @@ static void status_line(struct decoder const *dp){
   if(st.learned[0] + st.learned[1] + st.learned[2] != 0)
     decoder_event(dp,0,"accepted with a learned CRC mask: csbk %'llu lc %'llu emblc %'llu",(unsigned long long)st.learned[0],
                   (unsigned long long)st.learned[1],(unsigned long long)st.learned[2]);
+  if(st.data_packets != 0)
+    decoder_event(dp,0,"data packets %'llu, complete %'llu",(unsigned long long)st.data_packets,
+                  (unsigned long long)st.data_packets_complete);
 }
 
 // ---------------------------------------------------------------------------

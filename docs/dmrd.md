@@ -9,8 +9,7 @@ Matthew Kaufman, KA6SQG, November 2026
 - when several repeaters carry the same call at once, as the repeaters of a multi-site system do, makes one stream of it and takes each 20 ms of speech from whichever repeater received it best;
 - decodes control signalling (CSBKs and multi-block CSBKs, short link control) and logs it with what it says about the site: its identity, the rest channel, neighbours, channel grants and releases;
 - follows trunked calls: when a site announces a call on a repeater no channel carries (a Capacity Plus Site Status, a Tier III, Connect Plus, Capacity Max or Hytera grant), it asks *radiod* for that repeater for as long as the call lasts.
-
-Not yet: data packets.
+- decodes packet data: data headers of every kind, blocks at rate 1/2, 3/4 and 1 (confirmed ones with their retries), short data, UDT and unified single block data, and what the packets carry: IP and UDP, Motorola location (LRRP), registration (ARS) and text (TMS), Hytera messages, short data and UDT text.
 
 ## Configuring *radiod*
 
@@ -87,6 +86,15 @@ monitor dmr-pcm.local
 ### The vocoder
 
 DMR's vocoder is the AMBE+2 half rate vocoder of P25 Phase 2, and *dmrd* uses the same one as *p25d*: mbelib, when it is found at build time. See *p25d.md* (**The vocoder**, and **Things to know**) for what mbelib does and does not do, and its README's caution about patents.
+
+## Packet data
+
+Each packet, once its last block has come (or when the carrier has been quiet for half a second, or a sync is lost, with what arrived), gets one line saying what it carries:
+```
+... ssrc 453425 453.425000 MHz slot 1 DATA [DMR data] slot=1 motorola-lrrp src=7002 dst=5001 udp 4001->4001: LRRP triggered-location request=01 position=point-2d len=14
+... ssrc 453425 453.425000 MHz slot 1 DATA [DMR data] slot=1 motorola-tms src=7002 dst=5001 udp 4007->4007: TMS text chars=19 seq=3 len=48
+```
+The line names the application and its fields; it never shows a message's text, a position's coordinates or a password. A packet that is not complete (a block missing, a CRC failed) says INCOMPLETE. At **-v** each data header gets a line too, and each packet a second one with its assembly and CRC evidence (blocks received and good, retries, the CRC-32 as received and the readings that would make it pass). Encrypted packets are marked and left as they are. The **-v** status lines count the packets. On generated signals, a confirmed rate 1/2 packet came through whole at an Es/N0 of 9 dB, a rate 3/4 one at 12 dB, and a rate 1 one (which has no error correction) only above that.
 
 ## Output
 
@@ -172,6 +180,6 @@ The instance name is the multicast group. All instances append to **/var/log/dmr
 
 ### Credits
 
-sdrtrunk (Dennis Sheirer, GPL-3) and OP25 (Max H. Parke KA1RBI, Graham J. Norbury and others, GPL-3) were used as references for DMR implementation details, along with ETSI TS 102 361. Taken from them, with a credit beside each in the source: the sync words, the Hamming generator matrices, the CACH bit positions, the block product code layouts and interleaves, the RS(12,9) field and octet order, the CRC masks, the link control, talker alias and burst layouts, the CSBK opcode table, message layouts and channel numbering (sdrtrunk; OP25 for parts of Connect Plus), and the rules for learning CRC masks and for choosing the station family automatically (sdrtrunk). The decoders are not theirs, and several of sdrtrunk's known errors (its EMB table for colour codes 8-15, its inverted RS(12,9) check, its CRC residual rule) are not repeated. Speech decoding uses mbelib (https://github.com/szechyjs/mbelib) when it is installed.
+sdrtrunk (Dennis Sheirer, GPL-3) and OP25 (Max H. Parke KA1RBI, Graham J. Norbury and others, GPL-3) were used as references for DMR implementation details, along with ETSI TS 102 361. Taken from them, with a credit beside each in the source: the sync words, the Hamming generator matrices, the CACH bit positions, the block product code layouts and interleaves, the RS(12,9) field and octet order, the CRC masks, the link control, talker alias and burst layouts, the CSBK opcode table, message layouts and channel numbering (sdrtrunk; OP25 for parts of Connect Plus), the rules for learning CRC masks and for choosing the station family automatically (sdrtrunk), and the packet data header, block and application layouts (sdrtrunk; OP25 for the data headers' common fields), each checked against TS 102 361-1 and -3. The decoders are not theirs, and several of sdrtrunk's known errors (its EMB table for colour codes 8-15, its inverted RS(12,9) check, its CRC residual rule) are not repeated. Speech decoding uses mbelib (https://github.com/szechyjs/mbelib) when it is installed.
 
 Much of what is here was first worked out, prototyped and run in production by the author in the receivers behind scanrad.io. That is especially true of the front-end signal processing: the approach to receive filtering, carrier frequency tracking, symbol timing recovery and burst framing was originally written for those receivers and tuned there. Those receivers are not ka9q-radio code: what is here is that work, rewritten by the author in plain C for this tree with the assistance of Anthropic's Claude (the Fable and Opus models).

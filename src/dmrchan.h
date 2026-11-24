@@ -49,6 +49,7 @@ struct dmr_chan_handlers {
   void (*event)(void *arg,struct dmr_chan_event const *e);
   void (*log)(void *arg,int64_t when,char const *text); // other decoded messages worth a line (-v)
   void (*notice)(void *arg,int64_t when,char const *text); // a line always worth writing (a CRC mask learned)
+  void (*data)(void *arg,int64_t when,char const *text); // a packet data line (a packet, a short data burst)
   void *arg;
 };
 
@@ -63,6 +64,7 @@ struct dmr_chan_config {
   // DMRSyncModeMonitor.java, GPL-3, Dennis Sheirer). A notice says which
   bool auto_stations;
   bool compressed_talkgroups;      // the system's talkgroups in the dialable form (dmrcall.h)
+  bool decode_data;                // packet data (dmrdata.h; default true)
   // The site this carrier belongs to, and the control log its lines go to (both the owner's, shared
   // by the site's channels, outliving the channel; either may be NULL: no CSBKs decoded then without
   // a site, no lines without a log). The channel attaches itself to the site as channel_id
@@ -94,6 +96,8 @@ struct dmr_chan_stats {
   uint64_t frames_unconfirmed;
   int color_code;                  // tracked, -1 not yet
   uint64_t learned[3];             // messages accepted with a learned CRC residual: CSBK, LC, embedded LC
+  uint64_t data_packets;           // packets delivered (complete or not)
+  uint64_t data_packets_complete;
   float frequency_offset;          // Hz, the receiver's correction
 };
 void dmr_chan_get_stats(struct dmr_chan const *c,struct dmr_chan_stats *s);

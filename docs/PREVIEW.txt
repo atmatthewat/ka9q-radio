@@ -2091,7 +2091,11 @@ INPUT AND OUTPUT
        time of the signal, the SSRC and the channel frequency, or the site's
        name for a line about a site; errors and startup messages go to
        standard error. A control message repeated many times is written once
-       and then counted.
+       and then counted. Each packet data packet gets a line naming its
+       application (IP and UDP, LRRP location, ARS registration, TMS text,
+       Hytera messages, short data) and its fields, never a message's text, a
+       position or a password; at -v its data header and its assembly and CRC
+       evidence get lines too.
 
        The voice stream (-R) is 8 kHz mono 16-bit audio, one RTP packet per 20
        ms, with status packets as radiod sends them. A group call's stream has
