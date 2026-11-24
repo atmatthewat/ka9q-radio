@@ -67,7 +67,10 @@
 //           complement (B.3.9, equation B.22). The order of the four CRC octets on air is AMBIGUOUS in
 //           ETSI itself: B.3.9's x-terms put x^31..x^24 in the first octet sent, while the same
 //           paragraph's "less significant octets first" and figure B.8C's labels put x^7..x^0 there.
-//           Least significant first (as dmrshark) is the default; crc32_observed keeps the evidence.
+//           Least significant first is the default, as dmrshark has it and as DSD-FME (lwvmobile/dsd-fme,
+//           dmr_block.c, ComputeCrc32Bit in dmr_utils.c) checks it on real packets: the remainder over
+//           pair-swapped octets, byte-reversed, against the four octets read most significant first.
+//           sdrtrunk and OP25 never check it. crc32_observed keeps the evidence until a capture settles it.
 //   UDT     CRC-CCITT over the appended blocks before their last 16 bits, complemented, no mask
 //           (table 9.17E, B.3.8).
 // How a capture settles them: dmr_data_crc9_observed() and dmr_data_crc32_observed() give "stored XOR
