@@ -7,9 +7,10 @@ Matthew Kaufman, KA6SQG, November 2026
 - logs every transmission on each timeslot, with its talkgroup or unit, source, colour code, how it began and ended, and its encryption state;
 - sends the speech of clear (unencrypted) calls as ka9q-radio RTP audio streams that *monitor* plays and *pcmrecord* records (when built with mbelib);
 - when several repeaters carry the same call at once, as the repeaters of a multi-site system do, makes one stream of it and takes each 20 ms of speech from whichever repeater received it best;
-- decodes control signalling (CSBKs and multi-block CSBKs, short link control) and logs it with what it says about the site: its identity, the rest channel, neighbours, channel grants and releases.
+- decodes control signalling (CSBKs and multi-block CSBKs, short link control) and logs it with what it says about the site: its identity, the rest channel, neighbours, channel grants and releases;
+- follows trunked calls: when a site announces a call on a repeater no channel carries (a Capacity Plus Site Status, a Tier III, Connect Plus, Capacity Max or Hytera grant), it asks *radiod* for that repeater for as long as the call lasts.
 
-Not yet: following trunked calls on Capacity Plus, Connect Plus or Tier III systems by asking *radiod* for granted channels, and data packets.
+Not yet: data packets.
 
 ## Configuring *radiod*
 
@@ -51,6 +52,8 @@ dmrd [options] dmr-iq.local [more groups ...]
 - **-c**, **--color-code** *n*|**any**|**track**: the colour code to decode, 0-15; **track** (the default) takes each channel's from its first strong sync and follows it; **any** decodes every one
 - **-M**, **--mobile**: also look for mobile station and direct mode syncs (simplex, talkaround), not only repeater outputs
 - **-f**, **--sites** *file*: which repeaters make up each site, and the system each site belongs to (see **Sites** below)
+- **-n**, **--no-follow**: don't ask *radiod* for the repeaters calls are announced on
+- **-H**, **--hold** *seconds*: keep a followed repeater this long after the last sign of its call (default 5)
 - **-y**, **--system-type** *type*: the kind of system the channels belong to, which says how its signalling is read: **conventional** (the default; amateur repeaters, IP Site Connect), **tier3**, **capacity_plus**, **linked_capacity_plus**, **connect_plus**, **capacity_max**, **hytera_xpt** or **hytera_tier3**
 - **-v**, **--verbose**: more messages; at -v each channel also logs a status line, and link control, talker aliases and re-anchored clocks are logged
 - **-u**, **--update** *seconds*: interval between the -v status lines (default 10)
@@ -118,6 +121,14 @@ lcn = "1"
 
 A channel joins the site that lists its frequency (to within 1 kHz), whichever *radiod* it comes from; one no site lists is a site of its own. The site's channels share its state and its control log, and their clocks are the signal's.
 
+## Following calls
+
+A trunked site announces where each call is: a Capacity Plus site in the Site Status its rest channel sends, Tier III, Connect Plus, Capacity Max and Hytera sites in a grant on their control channel. When the repeater a call is announced on has no channel, *dmrd* asks *radiod* for one there, in the same form as the I/Q channels it already decodes from that *radiod* (as *p25d* does: see *p25d.md*), and logs it:
+```
+Tue 24 Nov 2026 01:20:04.212 UTC site SCMTD/1 follow 453.975000 MHz LCN 1 TS2 ssrc 453975: CAP+ Site Status (LSN 2 tg 1)
+```
+Each repeat of the announcement asks again, and the channel's own decoder keeps it while it carries voice; **--hold** seconds after both stop, *radiod* removes it, and *dmrd* closes the channel a second after its data stops (**closed (followed channel released)**), so that a channel asked for again starts afresh. Its I/Q joins the site like any configured channel's, and its speech is voted with the other repeaters'. The repeater's frequency comes from the sites file (its LCN), or from the channel map the site learns from the air (Tier III and Connect Plus send it): without either, the call is logged and not followed. Where there is more than one *radiod*, each is asked in turn until one covers the frequency. Channels *radiod* carries anyway (its configured ones) are left alone.
+
 ## Running as a service
 
 ```
@@ -132,7 +143,7 @@ The instance name is the multicast group. All instances append to **/var/log/dmr
 
 - **What has been tested.** On the air, from this tree's *radiod* with an Airspy R2: a Motorola Capacity Plus system of three sites (wide-area calls, beacons, rest channel moves, both slots), with a sites file and without, and 67 amateur repeater outputs at once. From recordings of those repeaters and from generated signals (clear and encrypted calls, late entry, unit-to-unit calls, data, both slots, base station, mobile and direct mode, noise and fading): each layer checked frame for frame and field for field.
 - **CPU.** *dmrd* takes about a quarter of a core of an Apple M-series machine for 67 channels; *radiod* making 67 I/Q channels takes about three cores.
-- **One front end, for now.** The repeaters decoded must all be within what one *radiod* front end covers. Multi-site and trunked systems often span more than one tuner's bandwidth (e.g. 450-455 and 460-465 MHz); work with more than one *radiod*, choosing for each frequency the one that covers it, is planned.
+- **More than one front end.** Multi-site and trunked systems often span more than one tuner's bandwidth (e.g. 450-455 and 460-465 MHz). Give *dmrd* each *radiod*'s I/Q group: a sites file places channels by frequency whichever *radiod* they come from, and a followed call is asked of each *radiod* in turn until one covers it. This has not yet been tried with two.
 - **Talkgroup numbers.** A stream's SSRC is the talkgroup, and talkgroup numbers are unique only within one system: run one *dmrd*, with its own output group, per system, or accept that two systems' calls on the same number will be voted as one (they will not line up, and the second gets its own stream).
 
 ### Credits

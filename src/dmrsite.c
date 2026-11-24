@@ -843,6 +843,8 @@ struct actions {
   struct dmr_grant grants[DMR_MAX_GRANTS];
   uint64_t grant_hz[DMR_MAX_GRANTS];
   bool have_clear;
+  int nfollows;
+  struct dmr_follow follows[8];
   struct dmr_site_context clear_channel;
   uint8_t clear_slot;
   struct dmr_site_handlers h;   // the hooks as they were under the lock
@@ -901,6 +903,10 @@ static void run(struct dmr_site *s,struct actions *a){
   if(a->h.grant != NULL){
     for(int i=0; i < a->ngrants; i++)
       a->h.grant(a->h.arg,s,&a->grants[i],a->grant_hz[i]);
+  }
+  if(a->h.follow != NULL){
+    for(int i=0; i < a->nfollows; i++)
+      a->h.follow(a->h.arg,s,&a->follows[i]);
   }
   if(a->h.clear != NULL && a->have_clear)
     a->h.clear(a->h.arg,&a->clear_channel,a->clear_slot,"P_CLEAR");
@@ -1172,6 +1178,21 @@ static void announce_on(struct dmr_site *s,struct site_channel *direct,uint16_t 
                         char const *what,struct site_channel const *by,uint64_t now,struct actions *a){
   s->announced++;
   struct site_channel *target = direct != NULL ? direct : find_channel(s,lcn,hz);
+  // For a follower: the repeater, as well as the site knows it
+  if(a->nfollows < (int)(sizeof a->follows / sizeof a->follows[0])){
+    struct dmr_follow *f = &a->follows[a->nfollows++];
+    memset(f,0,sizeof *f);
+    f->lcn = target != NULL && target->lcn != 0 ? target->lcn : lcn;
+    f->frequency_hz = target != NULL && target->frequency_hz != 0 ? target->frequency_hz
+      : hz != 0 ? hz : lcn != 0 ? dmr_map_downlink_hz(&s->map,lcn) : 0;
+    f->timeslot = timeslot;
+    f->configured = target != NULL && target->configured;
+    f->attached = target != NULL && target->attached;
+    f->repeating = repeating;
+    if(target != NULL)
+      copy_string(f->channel_id,sizeof f->channel_id,target->channel_id);
+    copy_string(f->what,sizeof f->what,what);
+  }
   if(target == NULL || (!target->configured && !target->attached)){
     s->announced_unconfigured++;
     uint64_t const key = hz != 0 ? hz : lcn;
@@ -1447,6 +1468,7 @@ void dmr_site_burst(struct dmr_site *s,int handle,struct dmr_burst const *b){
         evaluate(s,ch,p,now,&a);
     }
   }
+  a.h = s->h;  // the hooks as they are now, called once the lock is let go
   pthread_mutex_unlock(&s->lock);
   run(s,&a);
 }
@@ -1499,6 +1521,7 @@ void dmr_site_short_lc(struct dmr_site *s,int handle,uint8_t color_code,struct d
     break;
   }
   evaluate_all(s,now,&a);
+  a.h = s->h;  // the hooks as they are now, called once the lock is let go
   pthread_mutex_unlock(&s->lock);
   run(s,&a);
 }
@@ -1539,6 +1562,7 @@ void dmr_site_link_control(struct dmr_site *s,int handle,uint8_t slot,uint8_t co
       }
     }
   }
+  a.h = s->h;  // the hooks as they are now, called once the lock is let go
   pthread_mutex_unlock(&s->lock);
   run(s,&a);
 }
@@ -1691,7 +1715,7 @@ void dmr_site_csbk(struct dmr_site *s,int handle,struct dmr_csbk_message const *
   }
 
   evaluate_all(s,now,&a);
-  a.h = s->h;
+  a.h = s->h;  // the hooks as they are now, called once the lock is let go
   pthread_mutex_unlock(&s->lock);
   run(s,&a);
 }
@@ -1709,6 +1733,7 @@ void dmr_site_time(struct dmr_site *s){
   actions_init(&a);
   pthread_mutex_lock(&s->lock);
   evaluate_all(s,clock_now(s),&a);
+  a.h = s->h;  // the hooks as they are now, called once the lock is let go
   pthread_mutex_unlock(&s->lock);
   run(s,&a);
 }

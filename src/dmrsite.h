@@ -170,6 +170,19 @@ struct dmr_single_radiod {
 bool dmr_locate_single_radiod(void *arg,uint64_t frequency_hz,struct dmr_source *source);
 
 struct dmr_site;
+// A voice call announced on a timeslot of one of the site's repeaters (a Capacity Plus Site Status, an
+// XPT grant, a Tier III or Connect Plus grant or its updates): what a follower needs to tune it. Every
+// announcement, repeats included, so that a follower can keep a channel it asked for alive
+struct dmr_follow {
+  uint16_t lcn;                 // 0: not known
+  uint64_t frequency_hz;        // the repeater's downlink; 0: not known (not configured, not in the channel map)
+  uint8_t timeslot;             // 1, 2; 0: not known
+  bool configured;              // the site's configuration lists the repeater
+  bool attached;                // a decoder is on it now
+  bool repeating;               // an announcement that repeats while the call lasts
+  char channel_id[DMR_CHANNEL_ID_MAX]; // "" for a repeater the site does not know
+  char what[96];                // the message that announced it
+};
 struct dmr_site_handlers {
   // GRANT FOLLOWING HOOK. Every grant the site hears (voice and data, repeats included), with the
   // frequency its CG_AP block or the channel map gives it (0: not known). Following is not done here:
@@ -179,6 +192,9 @@ struct dmr_site_handlers {
   // A P_CLEAR heard on a channel's timeslot (reason "P_CLEAR"): end the call there
   // (dmr_call_end_call()). On that channel's thread, no lock held
   void (*clear)(void *arg,struct dmr_site_context const *channel,uint8_t slot,char const *reason);
+  // CALL-FOLLOWING HOOK. Each announcement of a voice call (above). On the thread of the channel it
+  // was heard on, no lock held
+  void (*follow)(void *arg,struct dmr_site *site,struct dmr_follow const *f);
   void *arg;
   // Which radiod and SSRC serve a frequency (dmr_site_locate()); NULL: not known
   dmr_locate_fn locate;

@@ -294,7 +294,7 @@ opussend: opussend.o libradio.a
 p25d: p25d.o p25audio.o chanctl.o avahi.o libdigital.a libdsp.a libstatus.a libradio.a
 	$(CC) $(LDFLAGS) -o $@ $^ $(MBELIB_LIBS) $(LDLIBS)
 
-dmrd: dmrd.o dmrchan.o dmraudio.o dmrvote.o p25audio.o avahi.o libdigital.a libdsp.a libstatus.a libradio.a
+dmrd: dmrd.o dmrchan.o dmraudio.o dmrvote.o p25audio.o chanctl.o avahi.o libdigital.a libdsp.a libstatus.a libradio.a
 	$(CC) $(LDFLAGS) -o $@ $^ $(MBELIB_LIBS) -liniparser $(LDLIBS)
 
 p25audio.o: CPPFLAGS += $(MBELIB_CPPFLAGS)

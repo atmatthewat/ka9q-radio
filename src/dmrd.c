@@ -37,6 +37,7 @@
 #include "dmrsite.h"
 #include "dmraudio.h"
 #include "dmrvote.h"
+#include "chanctl.h"
 
 // Theory of operation
 //
@@ -111,6 +112,8 @@ struct decoder {
   uint64_t site_clock;     // the site's clock, us, never going back
   struct configured_site *configured; // the site from the sites file the carrier belongs to, else NULL
   char const *system_name; // "DMR", or the configured site's system
+  uint64_t refresh_voice;  // voice bursts decoded when a followed channel was last kept alive
+  int64_t next_refresh;    // signal time of the next check, ns
 };
 
 // A site from the sites file (-f): its repeaters, the site state and control log they share, which
@@ -196,6 +199,29 @@ static char const *Sites_file;        // -f
 static struct configured_site *Sites;
 static int Nsites;
 
+// Call following: the radiods channels may be asked of, each by its command group as its channels'
+// status names it, with a channel's format to ask in. Which radiod serves a frequency is decided by
+// asking each in turn until one covers it (locate_radio()), so a site may span receivers
+#define MAX_RADIOS 8
+struct radio {
+  struct sockaddr_storage control;
+  struct chanctl *ctl;
+  struct chanctl_format format;  // of an I/Q channel dmrd decodes from it, not one it asked for
+  bool have_format;
+};
+static struct radio Radios[MAX_RADIOS];
+static int Nradios;
+static pthread_mutex_t Ctl_mutex = PTHREAD_MUTEX_INITIALIZER; // Radios, and every chanctl call
+static bool Follow = true;            // -n: don't
+static double Hold = 5.0;             // -H: a followed channel is kept this long after the last sign of a call
+static int const Ctl_ttl = 1;         // commands to radiod, as tune and control send them
+#define MAX_ASKED 256
+static struct {
+  uint32_t ssrc;                      // SSRCs dmrd has asked for (under Ctl_mutex): a decoder on one is
+  int64_t logged;                     // a followed channel, even once radiod has let it go
+} Asked[MAX_ASKED];
+static int Nasked;
+
 // Tuning constants
 static double const Max_fill = 1.0;   // Fill gaps up to this many seconds with zeroes; resynchronize on longer ones
 static double const Max_queue = 5.0;  // Seconds of samples queued to a decoder before blocks are dropped
@@ -248,10 +274,16 @@ static struct configured_site *find_site(uint64_t frequency_hz,struct configured
 static void site_line(void *arg,struct dmr_control_line const *line);
 static int64_t site_wall_clock(void *arg);
 static uint64_t site_site_clock(void *arg);
+static void observe_radio(struct session *sp);
+static void site_follow(void *arg,struct dmr_site *site,struct dmr_follow const *f);
+static void channel_follow(void *arg,struct dmr_site *site,struct dmr_follow const *f);
+static void keep_followed(struct decoder *dp,int64_t now);
 
 static struct option Options[] = {
   {"iface", required_argument, NULL, 'A'},
   {"color-code", required_argument, NULL, 'c'},
+  {"hold", required_argument, NULL, 'H'},
+  {"no-follow", no_argument, NULL, 'n'},
   {"sites", required_argument, NULL, 'f'},
   {"input", required_argument, NULL, 'I'},
   {"locale", required_argument, NULL, 'l'},
@@ -269,10 +301,10 @@ static struct option Options[] = {
   {"system-type", required_argument, NULL, 'y'},
   {NULL, 0, NULL, 0},
 };
-static char const Optstring[] = "A:c:f:I:l:MN:o:p:R:S:t:T:u:vVy:";
+static char const Optstring[] = "A:c:f:H:I:l:MnN:o:p:R:S:t:T:u:vVy:";
 
 static void usage(void){
-  fprintf(stderr,"Usage: %s [-v|--verbose] [-V|--version] [-l|--locale locale] [-A|--iface interface] [-o|--source <source-name-or-address>] [-S|--ssrc ssrc] [-t|--timeout seconds] [-u|--update seconds] [-c|--color-code n|any|track] [-M|--mobile] [-y|--system-type conventional|capacity_plus|...] [-f|--sites sites_file] [-R|--pcm-out audio_mcast_address] [-N|--name service_name] [-T|--ttl ttl] [-p|--tos tos] [-I|--input] iq_mcast_address [iq_mcast_address ...]\n",App_path);
+  fprintf(stderr,"Usage: %s [-v|--verbose] [-V|--version] [-l|--locale locale] [-A|--iface interface] [-o|--source <source-name-or-address>] [-S|--ssrc ssrc] [-t|--timeout seconds] [-u|--update seconds] [-c|--color-code n|any|track] [-M|--mobile] [-y|--system-type conventional|capacity_plus|...] [-f|--sites sites_file] [-n|--no-follow] [-H|--hold seconds] [-R|--pcm-out audio_mcast_address] [-N|--name service_name] [-T|--ttl ttl] [-p|--tos tos] [-I|--input] iq_mcast_address [iq_mcast_address ...]\n",App_path);
 }
 
 int main(int argc,char *argv[]){
@@ -318,6 +350,14 @@ int main(int argc,char *argv[]){
       break;
     case 'l':
       Locale = optarg;
+      break;
+    case 'n':
+      Follow = false;
+      break;
+    case 'H':
+      Hold = strtod(optarg,NULL);
+      if(Hold < 1)
+        Hold = 1;
       break;
     case 'M':
       Mobile = true;
@@ -370,6 +410,11 @@ int main(int argc,char *argv[]){
   setlocale(LC_ALL,Locale);
   setlinebuf(stdout);
   setlinebuf(stderr);
+  if(Ssrc != 0 && Follow){
+    if(Verbose)
+      fprintf(stderr,"%s: --ssrc given, not following calls\n",App_path);
+    Follow = false;
+  }
   if(Sites_file != NULL)
     load_sites(Sites_file); // exits if it can't be read
 
@@ -427,6 +472,8 @@ int main(int argc,char *argv[]){
   input_loop();
   cleanup();
   free_sites(); // after every channel has gone: their pending counts are written here
+  for(int i=0; i < Nradios; i++)
+    chanctl_destroy(Radios[i].ctl); // the channels followed are released
   dmr_voter_destroy(Voter);
   p25_audio_close(Audio_group);
   if(Verbose)
@@ -473,7 +520,7 @@ static void input_loop(void){
         process_data(Data_fd[i]);
     }
     int64_t const now = gps_time_ns();
-    if(now >= last_scan + BILLION){
+    if(now >= last_scan + BILLION / 4){
       scan_sessions(now);
       last_scan = now;
     }
@@ -514,6 +561,8 @@ static void process_status(int fd){
                   encoding_string(sp->chan.output.encoding),demod_name_from_type(sp->chan.demod_type),
                   sp->chan.filter.min_IF,sp->chan.filter.max_IF,sp->chan.linear.agc ? "on" : "off",
                   formatsock(&sender,false));
+  if(Follow)
+    observe_radio(sp);
   if(!sp->warned && (sp->chan.output.channels != 2 || sample_size(sp->chan.output.encoding) == 0)){
     session_event(sp,0,"can't decode: need 2 channels (I/Q) of s16le, s16be, f32le or f32be; stream is %d channels %s",
                   sp->chan.output.channels,encoding_string(sp->chan.output.encoding));
@@ -695,6 +744,8 @@ static int64_t session_time(struct session const *sp,uint32_t timestamp){
   return sp->chan.clocktime + (int64_t)BILLION * (int32_t)(timestamp - sp->chan.output.time_snap) / sp->samprate;
 }
 
+static bool was_asked(uint32_t ssrc);
+
 static void scan_sessions(int64_t now){
   struct session *next = NULL;
   for(struct session *sp = Sessions; sp != NULL; sp = next){
@@ -702,6 +753,11 @@ static void scan_sessions(int64_t now){
     int64_t const last = sp->running ? sp->last_data : sp->last_status;
     if(now - last >= Timeout * BILLION)
       close_session(sp,"idle timeout");
+    else if(Follow && sp->running && now - sp->last_data >= BILLION && was_asked(sp->ssrc))
+      // radiod sends a channel's I/Q without a break while it exists: a followed one whose data has
+      // stopped is gone, and closing it now means that if it is asked for again, the new channel
+      // (its own RTP timestamps, under the same SSRC) starts a session of its own, timed by its status
+      close_session(sp,"followed channel released");
   }
 }
 
@@ -886,6 +942,7 @@ static void *decode_task(void *arg){
       so.warnings_to_stderr = false; // they are lines of the log already
       struct dmr_site_handlers sh = {
         .clear = control_clear,
+        .follow = channel_follow,
         .arg = &dec,
       };
       dec.site = dmr_site_create(&sc,dec.log,&so,&sh);
@@ -910,6 +967,8 @@ static void *decode_task(void *arg){
     dmr_voter_set_signal(Voter,sp->ssrc,dec.frequency,dec.bb_power,dec.n0,dec.low,dec.high);
     if(dec.chan != NULL)
       dmr_chan_samples(dec.chan,bp->samples,bp->count,bp->time); // voice_frame(), voice_event() run in here
+    if(Follow && dec.chan != NULL)
+      keep_followed(&dec,bp->time);
     int64_t const end = bp->time != 0 ? bp->time + llrint(1e9 * bp->count / dec.samprate) : 0;
     dmr_voter_poll(Voter,end); // frames now due are played
     dec.samples += bp->count;
@@ -1153,6 +1212,8 @@ static void load_sites(char const *file){
     so.warnings_to_stderr = false;
     struct dmr_site_handlers const sh = {
       .clear = control_clear,
+      .follow = site_follow,
+      .arg = cs,
     };
     cs->site = dmr_site_create(&sc,cs->log,&so,&sh);
     free(plan);
@@ -1234,6 +1295,157 @@ static uint64_t site_site_clock(void *arg){
   while(now > prev && !atomic_compare_exchange_weak(&cs->site_clock,&prev,now))
     ;
   return now > prev ? now : prev;
+}
+
+// ---------------------------------------------------------------------------
+// Call following. A site announces each voice call on one of its repeaters (dmr_site_handlers.follow:
+// a Capacity Plus Site Status, a grant, their repeats). When no decoder is on that repeater, dmrd asks
+// a radiod for a channel there, in the form of the I/Q channels it already decodes from that radiod
+// (chanctl.c), for Hold seconds; each repeat of the announcement asks again, and the followed channel's
+// decoder keeps it while it carries voice. Its I/Q then arrives like any other channel's, joins the
+// site by its frequency, and is decoded and voted as the rest. Repeaters radiod already carries (its
+// configured channels, and channels someone else asked for) are left as they are
+
+// The radiod a status packet came from: its command handle, and the format to ask for channels in
+static void observe_radio(struct session *sp){
+  struct sockaddr_storage const *control = &sp->frontend.metadata_dest_socket;
+  if(control->ss_family != AF_INET && control->ss_family != AF_INET6)
+    return; // radiod's command address isn't known (yet)
+  pthread_mutex_lock(&Ctl_mutex);
+  struct radio *r = NULL;
+  for(int i=0; i < Nradios && r == NULL; i++){
+    if(address_match(&Radios[i].control,control) == 1 && getportnumber(&Radios[i].control) == getportnumber(control))
+      r = &Radios[i];
+  }
+  if(r == NULL && Nradios < MAX_RADIOS){
+    struct chanctl * const ctl = chanctl_create(control,Default_mcast_iface,Ctl_ttl);
+    if(ctl == NULL)
+      fprintf(stderr,"%s: can't open radiod command channel %s: %s\n",App_path,formatsock(control,false),strerror(errno));
+    else {
+      r = &Radios[Nradios++];
+      memset(r,0,sizeof *r);
+      r->control = *control;
+      r->ctl = ctl;
+      if(Verbose)
+        fprintf(stderr,"%s: radiod commands to %s\n",App_path,formatsock(control,false));
+    }
+  }
+  if(r != NULL){
+    chanctl_observe(r->ctl,&sp->frontend,&sp->chan);
+    if(!r->have_format && !chanctl_ours(r->ctl,sp->ssrc) && sp->chan.output.channels == 2
+       && sample_size(sp->chan.output.encoding) != 0)
+      r->have_format = chanctl_format(&r->format,&sp->frontend,&sp->chan) == 0;
+  }
+  pthread_mutex_unlock(&Ctl_mutex);
+}
+
+// Ask for the repeater an announcement names, unless a decoder is already on it that dmrd did not ask
+// for. 'who' and 'when' are for the line written when a channel is first asked for
+static void follow(char const *who,int64_t when,struct dmr_follow const *f){
+  if(f->frequency_hz == 0)
+    return; // nowhere to tune: the site has logged it
+  char text[256] = "";
+  pthread_mutex_lock(&Ctl_mutex);
+  for(int i=0; i < Nradios; i++){
+    struct radio * const r = &Radios[i];
+    if(!r->have_format)
+      continue;
+    uint32_t const ssrc = chanctl_ssrc(r->ctl,(double)f->frequency_hz,&r->format);
+    int asked = -1;
+    for(int j=0; j < Nasked && asked < 0; j++)
+      if(Asked[j].ssrc == ssrc)
+        asked = j;
+    if(f->attached && asked < 0)
+      break; // a channel radiod carries anyway: nothing to do
+    errno = 0;
+    int const rc = chanctl_request(r->ctl,ssrc,(double)f->frequency_hz,&r->format,Hold);
+    if(rc < 0 && errno == ERANGE)
+      continue; // outside this radiod's front end: the next
+    if(rc >= 0 && asked < 0 && Nasked < MAX_ASKED){
+      asked = Nasked++;
+      Asked[asked].ssrc = ssrc;
+      Asked[asked].logged = 0;
+    }
+    // A line when the channel is asked for while no decoder is on it (at most every 2 s: the
+    // announcements repeat until its I/Q arrives)
+    bool log = false;
+    int64_t const now_ns = gps_time_ns();
+    if(rc >= 0 && !f->attached && asked >= 0 && now_ns - Asked[asked].logged >= 2 * (int64_t)BILLION){
+      Asked[asked].logged = now_ns;
+      log = true;
+    }
+    static int64_t last_error; // one error line every 30 s: announcements repeat several times a second
+    if(rc < 0 && gps_time_ns() - last_error >= 30 * (int64_t)BILLION){
+      last_error = gps_time_ns();
+      snprintf(text,sizeof text,"can't follow %.6lf MHz: %s",f->frequency_hz * 1e-6,strerror(errno));
+    }
+    else if(log){
+      char lcn[16] = "",ts[8] = "";
+      if(f->lcn != 0)
+        snprintf(lcn,sizeof lcn," LCN %u",f->lcn);
+      if(f->timeslot == 1 || f->timeslot == 2)
+        snprintf(ts,sizeof ts," TS%u",f->timeslot);
+      snprintf(text,sizeof text,"follow %.6lf MHz%s%s ssrc %u: %s",f->frequency_hz * 1e-6,lcn,ts,ssrc,f->what);
+    }
+    break;
+  }
+  pthread_mutex_unlock(&Ctl_mutex);
+  if(text[0] != '\0'){
+    char ts[100];
+    format_gpstime(ts,sizeof ts,when != 0 ? when : gps_time_ns());
+    pthread_mutex_lock(&Output_mutex);
+    fprintf(stdout,"%s %s %s\n",ts,who,text);
+    pthread_mutex_unlock(&Output_mutex);
+  }
+}
+
+static void site_follow(void *arg,struct dmr_site *site,struct dmr_follow const *f){
+  (void)site;
+  struct configured_site const * const cs = arg;
+  if(!Follow)
+    return;
+  char who[2 * DMR_SITE_NAME_MAX + 8];
+  snprintf(who,sizeof who,"site %s/%s",cs->system_name,cs->site_name);
+  follow(who,atomic_load(&cs->latest),f);
+}
+static void channel_follow(void *arg,struct dmr_site *site,struct dmr_follow const *f){
+  (void)site;
+  struct decoder const * const dp = arg;
+  if(!Follow)
+    return;
+  char who[64];
+  snprintf(who,sizeof who,"ssrc %u %.6lf MHz",dp->sp->ssrc,dp->frequency * 1e-6);
+  follow(who,dp->block_time,f);
+}
+
+static bool was_asked(uint32_t ssrc){
+  pthread_mutex_lock(&Ctl_mutex);
+  bool asked = false;
+  for(int j=0; j < Nasked && !asked; j++)
+    asked = Asked[j].ssrc == ssrc;
+  pthread_mutex_unlock(&Ctl_mutex);
+  return asked;
+}
+
+// A followed channel is kept while it carries voice, checked twice a second. Not any burst: a repeater
+// that is also a rest channel sends its beacons between calls
+static void keep_followed(struct decoder *dp,int64_t now){
+  if(now == 0 || now < dp->next_refresh)
+    return;
+  dp->next_refresh = now + BILLION / 2;
+  struct dmr_chan_stats st;
+  dmr_chan_get_stats(dp->chan,&st);
+  if(st.voice_bursts == dp->refresh_voice)
+    return;
+  dp->refresh_voice = st.voice_bursts;
+  pthread_mutex_lock(&Ctl_mutex);
+  for(int i=0; i < Nradios; i++){
+    if(chanctl_ours(Radios[i].ctl,dp->sp->ssrc)){
+      chanctl_refresh(Radios[i].ctl,dp->sp->ssrc);
+      break;
+    }
+  }
+  pthread_mutex_unlock(&Ctl_mutex);
 }
 
 static void vote_end(void *arg,struct dmr_vote_result const *r){
