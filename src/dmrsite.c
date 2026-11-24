@@ -2103,7 +2103,7 @@ static void count_burst(struct dmr_cplane *c,struct dmr_burst const *b){
 static void short_lc_key(char *key,size_t size,struct dmr_short_lc const *slc,char const *text){
   if(slc->body == DMR_SLCB_SYS_PARMS)
     format(key,size,"SLC SYS_PARMS %u %04X %d",(unsigned)slc->slco,(unsigned)slc->u.sys_parms.system_identity_code,
-             slc->u.sys_parms.registration_required ? 1 : 0);
+             slc->u.sys_parms.registration_required || slc->u.sys_parms.composite_control_channel ? 1 : 0);
   else
     copy_string(key,size,text);
 }

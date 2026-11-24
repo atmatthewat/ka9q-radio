@@ -439,12 +439,15 @@ struct dmr_slc_activity_update {
   uint8_t ts2_hash;        // bits 20-27
 };
 // C_SYS_Parms / P_SYS_Parms: system identity code at bits 4-17 (model 2 bits, then network / site:
-// tiny 9 / 3, small 7 / 5, large 4 / 8, huge 2 / 10), registration required (18), common slot counter (19-27)
+// tiny 9 / 3, small 7 / 5, large 4 / 8, huge 2 / 10), bit 18, common slot counter (19-27). Bit 18 is Reg
+// (registration required) in C_SYS_Parms but Payload Channel Type (1 = composite control channel) in
+// P_SYS_Parms (TS 102 361-4 tables 7.33, 7.34); sdrtrunk reads it as Reg in both
 struct dmr_slc_sys_parms {
   enum dmr_network_model model;
   uint16_t network;
   uint16_t site;
-  bool registration_required;
+  bool registration_required;      // C_SYS_Parms (SLCO 2) only
+  bool composite_control_channel;  // P_SYS_Parms (SLCO 3) only
   uint16_t common_slot_counter;
   uint16_t system_identity_code; // the 14 bits as sent
 };

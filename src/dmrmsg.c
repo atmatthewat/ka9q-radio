@@ -1156,7 +1156,10 @@ void dmr_slc_parse(struct dmr_short_lc *s,uint8_t const bits28[28]){
     int const net_bits = Network_bits[p->model];
     p->network = (uint16_t)FIELD(6,net_bits);
     p->site = (uint16_t)FIELD(6 + net_bits,12 - net_bits);
-    p->registration_required = FIELD(18,1) != 0;
+    if(s->slco == 2)
+      p->registration_required = FIELD(18,1) != 0;
+    else
+      p->composite_control_channel = FIELD(18,1) != 0;
     p->common_slot_counter = (uint16_t)FIELD(19,9);
     s->kind = s->slco == 2 ? DMR_SLC_CONTROL_CHANNEL_SYS_PARMS : DMR_SLC_TRAFFIC_CHANNEL_SYS_PARMS;
     s->body = DMR_SLCB_SYS_PARMS;
@@ -1211,8 +1214,9 @@ int dmr_slc_describe(char *buf,size_t size,struct dmr_short_lc const *s){
   case DMR_SLCB_SYS_PARMS: {
     static char const *Model[4] = { "tiny", "small", "large", "huge" };
     struct dmr_slc_sys_parms const *p = &s->u.sys_parms;
-    append(buf,size,&len," model=%s net=%u site=%u%s slot_counter=%u",Model[p->model & 3],(unsigned)p->network,
-           (unsigned)p->site,p->registration_required ? " registration" : "",(unsigned)p->common_slot_counter);
+    append(buf,size,&len," model=%s net=%u site=%u%s%s slot_counter=%u",Model[p->model & 3],(unsigned)p->network,
+           (unsigned)p->site,p->registration_required ? " registration" : "",
+           p->composite_control_channel ? " composite-cc" : "",(unsigned)p->common_slot_counter);
     break;
   }
   case DMR_SLCB_CONNECT_PLUS:

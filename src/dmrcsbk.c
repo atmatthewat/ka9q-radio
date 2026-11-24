@@ -64,13 +64,21 @@
 //     are kept raw, and the sixth is available from them.
 //   - Connect Plus data grants say they are data. sdrtrunk's ignore_data_calls misses them: the opcode
 //     is not in its data grant set (Opcode.java:170-172).
-// Layouts neither sdrtrunk nor OP25 parses, written from TS 102 361-2 / -4 as remembered and marked
-// UNCONFIRMED until a capture checks them: unit-to-unit request and answer (CSBKO 4, 5), BS outbound
-// activation (56 from a mobile), random access (31); and two sdrtrunk returns unparsed: the negative
-// acknowledgement (38), given the acknowledgement layout because its reason table holds the refusals,
-// and the multi-item data grants (55, 56), given the single-item grant layout. FID 0 CSBKO 56 is both
-// a multi-item talkgroup data grant (from a Tier III base station) and BS_Dwn_Act (from a mobile), so
-// the caller says which by mobile_sourced. trunk-recorder reads FID 0 grants with the Connect Plus
+//   Checked against TS 102 361-2 V2.5.1 and -4 V1.12.1 (the reference decoder's audit of 2026-11-23):
+//   - Data grants: HI_RATE is bit 29; bit 31 is offset timing (sdrtrunk reads 31 as "high rate").
+//     TV_GRANT and BTV_GRANT carry Late_Entry at bit 29 (tables 7.9-7.15).
+//   - Ann_WD_TSCC: AW_FLAG 0 = add the channel, 1 = withdraw it (table 7.69; sdrtrunk inverts it).
+//   - Local_Time: the UTC offset is 4 bits (30-33, 15 = not sent) and a sign (34), not 5 bits (table 7.73).
+//   - Queued for busy radio is reason 0xA1, not 0xAA (table 7.44).
+//   - CSBKO 38 is the Tier II NACK_Rsp, with its own layout (TS 102 361-2 table 7.6: reason 24-31,
+//     source before target), not an acknowledgement. CSBKO 30 is C_ACKVIT.
+//   - C_ALOHA bit 17 is TSCCAS (table 7.19; sdrtrunk: reserved).
+//   - The multi-item data grants (55, 56) carry a CG_AP block like the other grants (tables 7.13, 7.15).
+// Layouts neither sdrtrunk nor OP25 parses, written from TS 102 361-2 / -4: unit-to-unit request and
+// answer (CSBKO 4, 5), BS outbound activation (56 from a mobile), random access (31), the multi-item
+// data grants (55, 56, with the single-item grant layout). FID 0 CSBKO 56 is both a multi-item
+// talkgroup data grant (from a Tier III base station) and BS_Dwn_Act (from a mobile), so the caller
+// says which by mobile_sourced. trunk-recorder reads FID 0 grants with the Connect Plus
 // layout (addresses first, a 4-bit LCN at 64); that contradicts sdrtrunk and is not used.
 //
 // The Connect Plus channel field. sdrtrunk reads a 5-bit "logical slot number" at bits 64-68 of the
@@ -103,8 +111,10 @@
 // continuation CRC covers: OP25 (dmr_slot.cc:349-386) computes it over every continuation block together,
 // sdrtrunk (CSBKMessage.java:93-107) over the first block's 80 bits. With one block, the CG_AP case,
 // those are the same computation, so that case has two sources; with more only OP25's reading makes
-// sense (sdrtrunk never looks at blocks 2 and 3), and it is used, UNCONFIRMED. Three blocks as the limit
-// is TS 102 361 as remembered: OP25 takes any number, sdrtrunk reads one. The two CRCs are separate, so
+// sense (sdrtrunk never looks at blocks 2 and 3), and it is used: TS 102 361-1 7.4.0 (figures 7.11-7.13)
+// confirms it, the last block's CRC over all but the header, no mask. Three blocks as the limit: 7.4.0
+// describes a header, up to two intermediate blocks and a last block without stating a maximum; OP25
+// takes any number, sdrtrunk reads one. The two CRCs are separate, so
 // a header and a block of two different messages would pass together; three things prevent it: any
 // other burst on the timeslot abandons the message (as sdrtrunk, DMRMessageProcessor.java:218-230), a
 // block more than 90 ms after the one before is refused (the bursts of a timeslot are 60 ms apart; 90
@@ -331,7 +341,7 @@ char const *dmr_csbk_name(uint8_t fid,uint8_t opcode){
     case 26: return "UDT OUTBOUND HEADER";
     case 27: return "UDT INBOUND HEADER";
     case 28: return "AHOY";
-    case 30: return "ACTIVATION";
+    case 30: return "C_ACKVIT";
     case 31: return "C_RAND";
     case 32: return "C_ACKD";
     case 33: return "C_ACKU";
@@ -339,7 +349,7 @@ char const *dmr_csbk_name(uint8_t fid,uint8_t opcode){
     case 35: return "P_ACKU";
     case 36: return "UDT DGNA OUTBOUND HEADER";
     case 37: return "UDT DGNA INBOUND HEADER";
-    case 38: return "C_NACKD";
+    case 38: return "NACK_RSP";
     case 40: return "C_BCAST";
     case 42: return "P_MAINT";
     case 46: return "P_CLEAR";
@@ -514,7 +524,7 @@ char const *dmr_ack_reason_name(uint8_t reason){
   case 0x64: return "authentication response";
   case 0x65: return "subscription service registration accepted";
   case 0xA0: return "queued for resource";
-  case 0xAA: return "queued for busy radio";
+  case 0xA1: return "queued for busy radio";
   case 0xE0: return "wait";
   default: return NULL;
   }
@@ -547,7 +557,7 @@ char const *dmr_tier3_grant_name(enum dmr_tier3_grant_kind kind){
 
 // ---------------- Standard (FID 0x00) messages ----------------
 // Layouts: sdrtrunk (GPL-3, Dennis Sheirer, commit 1945b835) message/data/csbk/standard/*.java, with
-// the corrections the theory of operation lists; the UNCONFIRMED ones from TS 102 361 as remembered
+// the corrections the theory of operation lists; the ones sdrtrunk lacks from TS 102 361-2 / -4
 
 void dmr_system_code_parse(struct dmr_system_code *s,struct dmr_csbk_block const *k,int first,bool has_par){
   // sdrtrunk SystemIdentityCode.java:34-43
@@ -585,6 +595,7 @@ static void append_system_code(char *buf,size_t size,size_t *len,struct dmr_syst
 static void parse_aloha(struct dmr_csbk_aloha *a,struct dmr_csbk_block const *k,enum dmr_aloha_flavor flavor){
   memset(a,0,sizeof *a);
   a->flavor = flavor;
+  a->tsccas = bit(k,17);
   a->site_timeslot_sync = bit(k,18);
   a->version = (uint8_t)dmr_csbk_bits(k,19,3);
   a->timing_offset = bit(k,22);
@@ -606,6 +617,8 @@ static void describe_aloha(char *buf,size_t size,size_t *len,struct dmr_csbk_alo
   append(buf,size,len," services=%u mask=%u backoff=%u",a->service_function,a->mask,a->backoff);
   if(dmr_system_code_multiple_cc(&a->system))
     append(buf,size,len," multi-cc");
+  if(a->flavor == DMR_ALOHA_STANDARD && a->tsccas)
+    append(buf,size,len," tsccas");
   if(a->radio != 0){
     append(buf,size,len," to=");
     append_address(buf,size,len,a->radio);
@@ -663,7 +676,7 @@ static void describe_ahoy(char *buf,size_t size,size_t *len,struct dmr_csbk_ahoy
   }
 }
 
-// Acknowledgements, CSBKO 32-35, 38 (UNCONFIRMED for 38) and the Hytera copies (sdrtrunk
+// Acknowledgements, CSBKO 32-35 (38 is NACK_Rsp, parsed apart) and the Hytera copies (sdrtrunk
 // acknowledge/Acknowledge.java:42-50, hytera/Hytera08Acknowledge.java, Hytera68Acknowledge.java)
 static void parse_ack(struct dmr_csbk_ack *a,struct dmr_csbk_block const *k){
   memset(a,0,sizeof *a);
@@ -693,8 +706,8 @@ static void describe_ack(char *buf,size_t size,size_t *len,struct dmr_csbk_ack c
     append(buf,size,len," info=%u",a->response_info);
 }
 
-// Channel grants, CSBKO 48-56 (sdrtrunk grant/ChannelGrant.java:41-45 and its subclasses; 55 and 56
-// UNCONFIRMED)
+// Channel grants, CSBKO 48-56 (sdrtrunk grant/ChannelGrant.java:41-45 and its subclasses; 55 and 56 with
+// the single-item layout, as TS 102 361-4 tables 7.13 and 7.15 have them)
 static void parse_grant(struct dmr_csbk_grant *g,struct dmr_csbk_block const *k){
   memset(g,0,sizeof *g);
   g->opcode = k->opcode;
@@ -718,8 +731,21 @@ bool dmr_csbk_grant_to_talkgroup(struct dmr_csbk_grant const *g){
   return g->kind == DMR_T3G_TALKGROUP_VOICE || g->kind == DMR_T3G_BROADCAST_TALKGROUP_VOICE
     || g->kind == DMR_T3G_TALKGROUP_DATA || g->kind == DMR_T3G_TALKGROUP_DATA_MULTI;
 }
+// Bits 29-31 by grant (TS 102 361-4 tables 7.9-7.15):
+//                          bit 29        bit 30      bit 31
+//   PV_GRANT (48)          reserved      emergency   offset timing
+//   PV_GRANT_DX (53)       reserved      emergency   call direction
+//   TV / BTV_GRANT (49/50) late entry    emergency   offset timing
+//   data grants            HI_RATE       emergency   offset timing (duplex: call direction)
+// sdrtrunk reads bit 31 as the data grants' "high rate"
 static bool grant_high_rate(struct dmr_csbk_grant const *g){
-  return dmr_csbk_grant_is_data(g) && !dmr_csbk_grant_is_duplex(g) && g->flag31;
+  return dmr_csbk_grant_is_data(g) && g->flag29;
+}
+static bool grant_late_entry(struct dmr_csbk_grant const *g){
+  return (g->kind == DMR_T3G_TALKGROUP_VOICE || g->kind == DMR_T3G_BROADCAST_TALKGROUP_VOICE) && g->flag29;
+}
+static bool grant_offset_timing(struct dmr_csbk_grant const *g){
+  return !dmr_csbk_grant_is_duplex(g) && g->flag31;
 }
 static bool grant_target_is_source(struct dmr_csbk_grant const *g){
   return dmr_csbk_grant_is_duplex(g) && g->flag31;
@@ -751,6 +777,29 @@ static void describe_grant(char *buf,size_t size,size_t *len,struct dmr_csbk_gra
     append(buf,size,len," EMERGENCY");
   if(grant_high_rate(g))
     append(buf,size,len," hi-rate");
+  if(grant_late_entry(g))
+    append(buf,size,len," late-entry");
+  if(grant_offset_timing(g))
+    append(buf,size,len," offset");
+}
+
+static void parse_nack_response(struct dmr_csbk_nack_response *n,struct dmr_csbk_block const *k){
+  memset(n,0,sizeof *n);
+  n->additional_info = bit(k,16);
+  n->ms_sourced = bit(k,17);
+  n->service_type = (uint8_t)dmr_csbk_bits(k,18,6);
+  n->reason = (uint8_t)dmr_csbk_bits(k,24,8);
+  n->source = dmr_csbk_bits(k,32,24);
+  n->target = dmr_csbk_bits(k,56,24);
+}
+static void describe_nack_response(char *buf,size_t size,size_t *len,struct dmr_csbk_nack_response const *n){
+  append(buf,size,len,"NACK_RSP reason=0x%02X",n->reason);
+  if(n->reason == 0x21)
+    append(buf,size,len," (MS does not support this service)");
+  append(buf,size,len," service=%u %s to=",n->service_type,n->ms_sourced ? "ms-sourced" : "bs-sourced");
+  append_address(buf,size,len,n->target);
+  append(buf,size,len," from=");
+  append_address(buf,size,len,n->source);
 }
 
 // P_CLEAR (sdrtrunk Clear.java:47-51), P_PROTECT (Protect.java:41-45), C_MOVE (MoveTSCC.java:43-50,
@@ -845,8 +894,8 @@ static void parse_announce_withdraw_tscc(struct dmr_csbk_announce_withdraw_tscc 
   parse_bcast_common(&a->common,k);
   a->color_code1 = (uint8_t)dmr_csbk_bits(k,25,4);
   a->color_code2 = (uint8_t)dmr_csbk_bits(k,29,4);
-  a->add1 = bit(k,33);
-  a->add2 = bit(k,34);
+  a->add1 = !bit(k,33);  // AW_FLAG 0 = add to the hunt list, 1 = withdraw (TS 102 361-4 table 7.69;
+  a->add2 = !bit(k,34);  // sdrtrunk has them the other way round)
   a->lcn1 = (uint16_t)dmr_csbk_bits(k,56,12);
   a->lcn2 = (uint16_t)dmr_csbk_bits(k,68,12);
 }
@@ -906,7 +955,8 @@ static void parse_local_time(struct dmr_csbk_local_time *t,struct dmr_csbk_block
   parse_bcast_common(&t->common,k);
   t->day = (uint8_t)dmr_csbk_bits(k,21,5);
   t->month = (uint8_t)dmr_csbk_bits(k,26,4);   // 26-29, not sdrtrunk's 26, 27, 28, 39
-  t->utc_offset_hours = (uint8_t)dmr_csbk_bits(k,30,5);
+  t->utc_offset_hours = (uint8_t)dmr_csbk_bits(k,30,4);  // not sdrtrunk's five bits without a sign
+  t->utc_offset_negative = bit(k,34);
   t->hour = (uint8_t)dmr_csbk_bits(k,56,5);
   t->minute = (uint8_t)dmr_csbk_bits(k,61,6);
   t->second = (uint8_t)dmr_csbk_bits(k,67,6);
@@ -915,8 +965,11 @@ static void parse_local_time(struct dmr_csbk_local_time *t,struct dmr_csbk_block
 }
 static void describe_local_time(char *buf,size_t size,size_t *len,struct dmr_csbk_local_time const *t){
   append(buf,size,len,"%s",bcast_prefix(&t->common));
-  append(buf,size,len,"local time month=%u day=%u %02u:%02u:%02u utc-offset=%u ",t->month,t->day,t->hour,t->minute,
-         t->second,t->utc_offset_hours);
+  append(buf,size,len,"local time month=%u day=%u %02u:%02u:%02u ",t->month,t->day,t->hour,t->minute,t->second);
+  if(t->utc_offset_hours == 15)
+    append(buf,size,len,"utc-offset=none ");
+  else
+    append(buf,size,len,"utc-offset=%c%u:%02u ",t->utc_offset_negative ? '-' : '+',t->utc_offset_hours,15u * t->utc_offset_fraction);
   append_system_code(buf,size,len,&t->common.system);
 }
 static void parse_mass_registration(struct dmr_csbk_mass_registration *m,struct dmr_csbk_block const *k){
@@ -937,7 +990,7 @@ static void describe_mass_registration(char *buf,size_t size,size_t *len,struct 
   append_system_code(buf,size,len,&m->common.system);
 }
 
-// UNCONFIRMED (TS 102 361-2 / -4 as remembered)
+// TS 102 361-2 7.1.2.2 / 7.1.2.3 (tables 7.5b, 7.5c), 7.1.2.1 (table 7.5a) and TS 102 361-4 table 7.25
 static void parse_unit_to_unit(struct dmr_csbk_unit_to_unit *u,struct dmr_csbk_block const *k){
   memset(u,0,sizeof *u);
   u->is_answer = k->opcode == DMR_CSBKO_UU_ANS_RSP;
@@ -1284,17 +1337,42 @@ static void parse_hytera_sms_available(struct dmr_csbk_hytera_sms_available *s,s
   s->destination = dmr_csbk_bits(k,32,24);
   s->source = dmr_csbk_bits(k,56,24);
 }
-// Seven digits with the weights 1464100, 146410, 14641, 1331, 121, 11, 1 written as a decimal number; a
-// digit above 9 carries into the next place, as sdrtrunk's does
+// "Compressed" talkgroups, TS 102 361-2 annex C.2.1.2.6 (ETSI's; sdrtrunk's use_compressed_talkgroups,
+// seen on Hytera Tier III). By the air address (figure C.4):
+//   0 .. 0xDF6767         B2 (table C.5): K1 x 1464100 + K2 x 146410 + K3 x 14641 + K4 x 1331 + K5 x 121 +
+//                         K6 x 11 + K7, K1-K3 decimal and K4-K7 base 11 (the digit 10 is written "*")
+//   0xDF6768 .. 0xE02AB7  B4 (table C.7): the prefixes 10-14, eight digits K1 K2 0 0 K5 K6 K7 K8, the air
+//                         address 14541000 + K1K2 x 10000 + K5..K8 ("12005678" is 0xDFCBB6, table C.8)
+//   above                 reserved and special addresses: no user form, returned unchanged
+// sdrtrunk applies B2 to every address, mangling B4 and the special ones. A "*" has no number: as in
+// sdrtrunk, the digit 10 carries into the next decimal place, so that a configuration written for it
+// still matches (at the cost that such a talkgroup shares its number with an all-digit one)
 uint32_t dmr_hytera_dialable_talkgroup(uint32_t address){
-  static uint32_t const weights[7] = {1464100u, 146410u, 14641u, 1331u, 121u, 11u, 1u};
-  static uint32_t const places[7] = {1000000u, 100000u, 10000u, 1000u, 100u, 10u, 1u};
+  uint8_t digit[8] = {0};
+  int n;
+  if(address <= 0xDF6767u){
+    static uint32_t const weights[7] = {1464100u, 146410u, 14641u, 1331u, 121u, 11u, 1u};
+    n = 7;
+    for(int i=0; i < 7; i++){
+      digit[i] = (uint8_t)(address / weights[i]);
+      address -= digit[i] * weights[i];
+    }
+  } else if(address <= 0xE02AB7u){
+    uint32_t const v = address - 14541000u;
+    uint32_t const prefix = v / 10000u;
+    uint32_t low = v % 10000u;
+    n = 8;
+    digit[0] = (uint8_t)(prefix / 10u);
+    digit[1] = (uint8_t)(prefix % 10u);
+    for(int i=7; i >= 4; i--){
+      digit[i] = (uint8_t)(low % 10u);
+      low /= 10u;
+    }
+  } else
+    return address;
   uint32_t dialable = 0;
-  for(int i=0; i < 7; i++){
-    uint32_t const digit = address / weights[i];
-    dialable += digit * places[i];
-    address -= digit * weights[i];
-  }
+  for(int i=0; i < n; i++)
+    dialable = dialable * 10u + digit[i];  // a 10 carries
   return dialable;
 }
 
@@ -1382,9 +1460,12 @@ void dmr_csbk_parse_body(struct dmr_csbk_message *m,struct dmr_csbk_block const 
     case DMR_CSBKO_ACK_INBOUND_TSCC:
     case DMR_CSBKO_ACK_OUTBOUND_PAYLOAD:
     case DMR_CSBKO_ACK_INBOUND_PAYLOAD:
-    case DMR_CSBKO_NACK:
       m->kind = DMR_CSBK_ACK;
       parse_ack(&m->u.ack,k);
+      return;
+    case DMR_CSBKO_NACK:
+      m->kind = DMR_CSBK_NACK_RESPONSE;
+      parse_nack_response(&m->u.nack_response,k);
       return;
     case DMR_CSBKO_BROADCAST:
       parse_broadcast_body(m,k);
@@ -1618,6 +1699,9 @@ static void describe_body(char *buf,size_t size,size_t *len,struct dmr_csbk_mess
   case DMR_CSBK_ACK:
     describe_ack(buf,size,len,&m->u.ack);
     break;
+  case DMR_CSBK_NACK_RESPONSE:
+    describe_nack_response(buf,size,len,&m->u.nack_response);
+    break;
   case DMR_CSBK_GRANT:
     describe_grant(buf,size,len,&m->u.grant);
     break;
@@ -1805,9 +1889,12 @@ void dmr_mbc_init(struct dmr_mbc_assembler *a,uint64_t max_block_gap_us){
   a->max_block_gap_us = max_block_gap_us;
 }
 
-bool dmr_mbc_carries_absolute(struct dmr_csbk_block const *header){
+bool dmr_mbc_carries_absolute(struct dmr_csbk_block const *header,bool mobile_sourced){
   if(header->fid == DMR_FID_STANDARD){
-    if(header->opcode >= DMR_CSBKO_PV_GRANT && header->opcode <= DMR_CSBKO_PD_GRANT_DX)
+    // Every grant, the multi-item data grants (55, 56) included (TS 102 361-4 tables 7.13, 7.15)
+    if(header->opcode == DMR_CSBKO_TD_GRANT_MI)
+      return !mobile_sourced;
+    if(header->opcode >= DMR_CSBKO_PV_GRANT && header->opcode <= DMR_CSBKO_PD_GRANT_MI)
       return true;
     if(header->opcode == DMR_CSBKO_CLEAR || header->opcode == DMR_CSBKO_MOVE_TSCC)
       return true;
@@ -1907,7 +1994,7 @@ void dmr_mbc_on_continuation(struct dmr_mbc_assembler *a,struct dmr_mbc_event *e
   m->from_mbc = true;
   m->mbc_continuation_blocks = (uint8_t)p->blocks;
   memcpy(m->mbc_continuation_bits,p->bits,(size_t)total);
-  if(dmr_mbc_carries_absolute(&p->header)){
+  if(dmr_mbc_carries_absolute(&p->header,p->mobile_sourced)){
     m->has_absolute = true;
     dmr_cgap_parse(&m->absolute,p->bits);
   }

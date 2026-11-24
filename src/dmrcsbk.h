@@ -181,7 +181,7 @@ static inline bool dmr_csbk_is_grant_opcode(uint8_t opcode){
 
 // ---------------- Standard (FID 0x00) messages ----------------
 // Layouts after sdrtrunk (GPL-3, Dennis Sheirer) message/data/csbk/standard/*.java and message/type/*.java,
-// except those marked UNCONFIRMED; the fixes to sdrtrunk's are listed in dmrcsbk.c
+// and TS 102 361-2 / -4 for what sdrtrunk lacks; the fixes to sdrtrunk's are listed in dmrcsbk.c
 
 // System identity code: model (2 bits), then network / site: tiny 9 / 3, small 7 / 5, large 4 / 8, huge 2 / 10;
 // PAR (2 bits) after it where the message has one
@@ -210,6 +210,7 @@ char const *dmr_tier3_gateway_name(uint32_t address); // NULL for an ordinary ad
 enum dmr_aloha_flavor { DMR_ALOHA_STANDARD = 0, DMR_ALOHA_CAPACITY_MAX, DMR_ALOHA_HYTERA };
 struct dmr_csbk_aloha {
   enum dmr_aloha_flavor flavor;
+  bool tsccas;                  // 17: this TSCC supports a TSCCAS (TS 102 361-4 table 7.19; sdrtrunk: reserved)
   bool site_timeslot_sync;      // 18
   uint8_t version;              // 19-21
   bool timing_offset;           // 22
@@ -251,7 +252,18 @@ struct dmr_csbk_ack {
   uint32_t source;              // 56-79
 };
 static inline enum dmr_ack_class dmr_ack_class(struct dmr_csbk_ack const *a){ return (enum dmr_ack_class)(a->reason >> 6); }
-char const *dmr_ack_reason_name(uint8_t reason); // NULL for a code not listed
+char const *dmr_ack_reason_name(uint8_t reason); // NULL for a code not listed (Queued-for-busy is 0xA1, not sdrtrunk's 0xAA)
+
+// NACK_Rsp (CSBKO 38, FID 0), TS 102 361-2 7.1.2.4 table 7.6: a Tier II refusal, not a Tier III
+// acknowledgement, with its own layout (the source before the target)
+struct dmr_csbk_nack_response {
+  bool additional_info;         // 16
+  bool ms_sourced;              // 17
+  uint8_t service_type;         // 18-23: the CSBKO of the service refused
+  uint8_t reason;               // 24-31: 0x21 = the MS does not support the service
+  uint32_t source;              // 32-55
+  uint32_t target;              // 56-79
+};
 
 enum dmr_tier3_grant_kind {
   DMR_T3G_PRIVATE_VOICE = 0, DMR_T3G_TALKGROUP_VOICE, DMR_T3G_BROADCAST_TALKGROUP_VOICE, DMR_T3G_PRIVATE_DATA,
@@ -263,9 +275,9 @@ struct dmr_csbk_grant {
   uint8_t opcode;
   uint16_t lcn;                 // 16-27
   uint8_t timeslot;             // 28, as 1 or 2
-  bool flag29;
+  bool flag29;                  // data: HI_RATE; TV / BTV: Late_Entry (TS 102 361-4 tables 7.11-7.15)
   bool emergency;               // 30
-  bool flag31;                  // data: high rate; duplex: the addresses are swapped
+  bool flag31;                  // duplex: call direction (the addresses are swapped); else offset timing
   uint32_t destination;         // 32-55 as sent
   uint32_t source;              // 56-79 as sent
 };
@@ -351,7 +363,8 @@ struct dmr_csbk_local_time {
   struct dmr_bcast_common common;
   uint8_t day;                  // 21-25
   uint8_t month;                // 26-29
-  uint8_t utc_offset_hours;     // 30-34
+  uint8_t utc_offset_hours;     // 30-33: 0-14, 15 = not sent (TS 102 361-4 table 7.73)
+  bool utc_offset_negative;     // 34: local time lags UTC
   uint8_t hour;                 // 56-60
   uint8_t minute;               // 61-66
   uint8_t second;               // 67-72
@@ -365,7 +378,7 @@ struct dmr_csbk_mass_registration {
   uint32_t radio;               // 56-79
 };
 
-// UNCONFIRMED layouts (neither sdrtrunk nor OP25 parses them; see dmrcsbk.c)
+// Layouts neither sdrtrunk nor OP25 parses, from TS 102 361-2 / -4 (see dmrcsbk.c)
 struct dmr_csbk_unit_to_unit {  // UU_V_Req, UU_Ans_Rsp
   bool is_answer;
   uint8_t service_options;      // 16-23
@@ -547,7 +560,7 @@ uint32_t dmr_hytera_dialable_talkgroup(uint32_t address);
 enum dmr_csbk_kind {
   DMR_CSBK_NONE = 0,           // not parsed: the CRC failed
   DMR_CSBK_UNKNOWN,            // a (FID, CSBKO) with no parser: u.unknown
-  DMR_CSBK_ALOHA, DMR_CSBK_AHOY, DMR_CSBK_ACK, DMR_CSBK_GRANT, DMR_CSBK_CLEAR, DMR_CSBK_PROTECT, DMR_CSBK_MOVE_TSCC,
+  DMR_CSBK_ALOHA, DMR_CSBK_AHOY, DMR_CSBK_ACK, DMR_CSBK_NACK_RESPONSE, DMR_CSBK_GRANT, DMR_CSBK_CLEAR, DMR_CSBK_PROTECT, DMR_CSBK_MOVE_TSCC,
   DMR_CSBK_PREAMBLE, DMR_CSBK_BROADCAST, DMR_CSBK_ANNOUNCE_WITHDRAW_TSCC, DMR_CSBK_CALL_TIMERS, DMR_CSBK_VOTE_NOW,
   DMR_CSBK_LOCAL_TIME, DMR_CSBK_MASS_REGISTRATION, DMR_CSBK_CHANNEL_FREQUENCY, DMR_CSBK_ADJACENT_SITE,
   DMR_CSBK_UNIT_TO_UNIT, DMR_CSBK_BS_DOWNLINK_ACTIVATION, DMR_CSBK_RANDOM_ACCESS,
@@ -572,6 +585,7 @@ struct dmr_csbk_message {
   union {
     struct dmr_csbk_unknown unknown;
     struct dmr_csbk_aloha aloha;
+    struct dmr_csbk_nack_response nack_response;
     struct dmr_csbk_ahoy ahoy;
     struct dmr_csbk_ack ack;
     struct dmr_csbk_grant grant;
@@ -675,8 +689,9 @@ struct dmr_mbc_assembler {
 };
 #define DMR_MBC_MAX_BLOCK_GAP_US 90000
 void dmr_mbc_init(struct dmr_mbc_assembler *a,uint64_t max_block_gap_us);
-// The messages whose first continuation block is a CG_AP block
-bool dmr_mbc_carries_absolute(struct dmr_csbk_block const *header);
+// The messages whose first continuation block is a CG_AP block. mobile_sourced: the header came from a
+// mobile (CSBKO 56 from a mobile is BS_Dwn_Act, which carries none)
+bool dmr_mbc_carries_absolute(struct dmr_csbk_block const *header,bool mobile_sourced);
 // Feed every data burst of a carrier: headers and continuation blocks are assembled, any other data type
 // abandons a message in progress on that timeslot. mobile_sourced: the burst carried an MS or direct
 // mode sync; a header's decides how the completed message is parsed (dmr_csbk_parse_body())
