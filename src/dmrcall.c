@@ -758,8 +758,11 @@ static void after_gap(struct dmr_call_tracker *t,struct dmr_transmission *tx,uin
 // say encrypted, never clear (its evidence is NONE)
 // dmr_lc_voice_identity() with the system's talkgroup form applied (config.compressed_talkgroups): every
 // identity the tracker reads comes through here, so two LCs of one call compare alike
+// A voice LC naming source 0 says nothing of the call yet: Capacity Plus sends a wide-area voice header
+// with source 0 and, 120 ms later, one naming the radio. Taken as an identity it opened a transmission of
+// its own, ended empty by the next header; as none, the next header joins its transmission
 static bool identity_of(struct dmr_call_tracker const *t,struct dmr_lc const *lc,struct dmr_voice_identity *id){
-  if(!dmr_lc_voice_identity(lc,id))
+  if(!dmr_lc_voice_identity(lc,id) || id->source == 0)
     return false;
   if(t->config.compressed_talkgroups && id->group && id->address_bits == 24)
     id->destination = dmr_hytera_dialable_talkgroup(id->destination);
