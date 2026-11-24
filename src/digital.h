@@ -132,7 +132,11 @@ void run_rotator(struct rotator *r,float complex *buffer,int count);  // multipl
 
 // Symbol timing: polyphase interpolator to two samples per symbol, Gardner detector, PI loop
 // Wide loop until told the signal is locked (e.g. by frame sync), narrow after
-enum { SYMSYNC_TAPS = 8, SYMSYNC_HISTORY = 1024, SYMSYNC_OUTPUTS = 512 }; // history sizes are powers of two
+// History sizes are powers of two. symsync_near() reaches back SYMSYNC_HISTORY input samples and
+// SYMSYNC_OUTPUTS outputs (two a symbol): 512 symbols, so that DMR's look-back can re-time the burst two
+// slot periods (288 symbols, 382 from the burst's head to the acquiring sync's end) ahead of a sync.
+// P25 looks back only one sync window
+enum { SYMSYNC_TAPS = 8, SYMSYNC_HISTORY = 2048, SYMSYNC_OUTPUTS = 1024 };
 
 typedef void (*symsync_output)(void *arg,float complex sample,bool is_symbol);
 

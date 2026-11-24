@@ -76,8 +76,8 @@
 // eight bursts) times the symbols held.
 //   Past symbols at another timing. The sink finds a burst's sync in its middle, so the 66 dibits
 // ahead of it were sampled at whatever timing the loop had then. Symbol k is the synchronizer's
-// output symbol_output[k], and symsync_near() re-interpolates any output still in its history (1024
-// input samples, 256 symbols less the interpolator's span) at whole interpolator arms earlier or
+// output symbol_output[k], and symsync_near() re-interpolates any output still in its history (2048
+// input samples, 512 symbols less the interpolator's span) at whole interpolator arms earlier or
 // later: resample() does that relative to where each symbol was sampled, resample_rigid() on a grid
 // of nominal symbol periods through one symbol's instant, whatever the loop did in between.
 //
@@ -113,7 +113,7 @@ static float const Rate_limit = 0.0003f;           // the rate estimate stays wi
 static int const Interpolator_digits = 6;
 static double const Rate_average_symbols = 1024.0;
 static int const Chain_delay_samples = 51;
-enum { Symbol_ring = 512 }; // a power of two; twice the synchronizer's history in symbols
+enum { Symbol_ring = 1024 }; // a power of two; twice the synchronizer's history in symbols
 
 // std::min, std::max and std::clamp's comparisons, NaN included
 static inline float minf(float a,float b){ return b < a ? b : a; }
