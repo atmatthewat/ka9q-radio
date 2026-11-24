@@ -25,7 +25,8 @@ struct dmr_vote_result {
   int lost;             // no copy arrived in time
   int sources;          // repeater slots that contributed
   struct {
-    uint32_t channel;   // channel SSRC
+    uint32_t channel;   // channel SSRC (its label: two receivers may share one)
+    uint32_t receiver;  // the receiver it came from (unique)
     int slot;
     int chosen;         // frames played from it
     int frames;         // frames it offered
@@ -40,14 +41,16 @@ void dmr_voter_set_end_handler(struct dmr_voter *v,dmr_vote_end_fn fn,void *arg)
 // repeater 'channel' (its SSRC) and 'slot'. 'description' names the stream in its status (the first
 // frame's is used). own_ssrc: the stream this repeater slot's frames go to instead if they turn out
 // to be another conversation than the stream's (0: none, they are then dropped)
-void dmr_voter_frame(struct dmr_voter *v,uint32_t ssrc,uint32_t own_ssrc,char const *description,uint32_t channel,int slot,
+// 'receiver' tells sources apart and must be unique per receiver: two radiods on one frequency may send
+// it under one SSRC. 'label' is what results call the source (its channel SSRC)
+void dmr_voter_frame(struct dmr_voter *v,uint32_t ssrc,uint32_t own_ssrc,char const *description,uint32_t receiver,uint32_t label,int slot,
                      uint8_t const bits[DMR_VOICE_FRAME_BITS],int64_t when);
 // That repeater slot's transmission ended (it offers no more frames to the stream)
-void dmr_voter_source_end(struct dmr_voter *v,uint32_t ssrc,uint32_t channel,int slot);
+void dmr_voter_source_end(struct dmr_voter *v,uint32_t ssrc,uint32_t receiver,int slot);
 // The time now on some channel: frames now due are played, streams with nothing left end
 void dmr_voter_poll(struct dmr_voter *v,int64_t now);
 // The signal measurements for a channel's status (see p25_audio_set_signal()): used for the stream a
 // channel last contributed to
-void dmr_voter_set_signal(struct dmr_voter *v,uint32_t channel,double frequency,float bb_power,float n0,float low,float high);
+void dmr_voter_set_signal(struct dmr_voter *v,uint32_t receiver,double frequency,float bb_power,float n0,float low,float high);
 
 #endif

@@ -90,7 +90,8 @@ struct pending {         // an unaligned source's recent frames
 
 struct source {
   bool used;
-  uint32_t channel;
+  uint32_t channel;      // the receiver (unique); 'label' is its channel SSRC, for the results
+  uint32_t label;
   int slot;
   bool ended;
   bool aligned;
@@ -100,6 +101,8 @@ struct source {
   int npending;
   struct pending pend[ALIGN_LIMIT];
   uint32_t moved_to;     // given up: its frames go to this stream instead
+  int tries;             // frames of this transmission offered while not aligned (the alignment limit)
+  uint32_t own_ssrc;     // the stream its frames go to if it is another conversation
   char description[256]; // its latest: the stream takes it on when a frame of it is played
   int offered;
   int chosen;
@@ -125,9 +128,10 @@ struct stream {
 };
 
 struct signal {
-  uint32_t channel;
+  uint32_t channel;      // the receiver
   double frequency;
   float bb_power,n0,low,high;
+  uint64_t updated;      // the voter's count of updates when it was last set: the stalest goes when full
 };
 
 struct dmr_voter {
@@ -135,6 +139,7 @@ struct dmr_voter {
   struct p25_audio_group *group;
   int64_t delay;
   int64_t now;           // latest time any channel has reported
+  uint64_t signal_updates;
   dmr_vote_end_fn end_fn;
   void *end_arg;
   struct stream streams[MAX_STREAMS];
@@ -176,18 +181,22 @@ void dmr_voter_set_signal(struct dmr_voter *v,uint32_t channel,double frequency,
   if(v == NULL)
     return;
   pthread_mutex_lock(&v->lock);
-  struct signal *free_entry = NULL;
+  // Receivers come and go (a followed channel is a new one each time): when the table is full the
+  // entry set longest ago, a receiver that is gone, makes room
+  struct signal *entry = NULL,*stalest = NULL;
   for(int i=0; i < MAX_CHANNELS; i++){
     struct signal * const g = &v->signals[i];
     if(g->channel == channel){
-      free_entry = g;
+      entry = g;
       break;
     }
-    if(g->channel == 0 && free_entry == NULL)
-      free_entry = g;
+    // An empty entry if there is one, else the one set longest ago
+    if(stalest == NULL || (stalest->channel != 0 && (g->channel == 0 || g->updated < stalest->updated)))
+      stalest = g;
   }
-  if(free_entry != NULL)
-    *free_entry = (struct signal){channel,frequency,bb_power,n0,low,high};
+  if(entry == NULL)
+    entry = stalest;
+  *entry = (struct signal){channel,frequency,bb_power,n0,low,high,++v->signal_updates};
   pthread_mutex_unlock(&v->lock);
 }
 
@@ -215,7 +224,8 @@ static void end_stream(struct dmr_voter *v,struct stream *s){
       if(!c->used)
         continue;
       int const n = r.sources++;
-      r.source[n].channel = c->channel;
+      r.source[n].channel = c->label;
+      r.source[n].receiver = c->channel;
       r.source[n].slot = c->slot;
       r.source[n].chosen = c->chosen;
       r.source[n].frames = c->offered;
@@ -230,7 +240,14 @@ static void end_stream(struct dmr_voter *v,struct stream *s){
 
 // Play every frame due by 'now'
 static void play(struct dmr_voter *v,struct stream *s,int64_t now){
+  bool all_ended = true;
+  for(int j=0; j < MAX_SOURCES; j++)
+    if(s->src[j].used && !s->src[j].ended)
+      all_ended = false;
   while(s->base + s->next_k * Frame_ns + v->delay <= now){
+    // Past the last frame offered with every source ended, nothing more is coming: not lost frames
+    if(all_ended && s->next_k > s->max_k)
+      break;
     int64_t const k = s->next_k++;
     struct candidate * const c = &s->ring[k % RING];
     if(!c->have || c->k != k){
@@ -365,22 +382,22 @@ static int find_source(struct stream *s,uint32_t channel,int slot,bool create){
 }
 
 static void frame(struct dmr_voter *v,uint32_t ssrc,uint32_t own_ssrc,char const *description,uint32_t channel,
-                  int slot,uint8_t const bits[DMR_VOICE_FRAME_BITS],int64_t when,int depth);
+                  uint32_t label,int slot,uint8_t const bits[DMR_VOICE_FRAME_BITS],int64_t when,int depth);
 
-void dmr_voter_frame(struct dmr_voter *v,uint32_t ssrc,uint32_t own_ssrc,char const *description,uint32_t channel,int slot,
+void dmr_voter_frame(struct dmr_voter *v,uint32_t ssrc,uint32_t own_ssrc,char const *description,uint32_t channel,uint32_t label,int slot,
                      uint8_t const bits[DMR_VOICE_FRAME_BITS],int64_t when){
   if(v == NULL || bits == NULL)
     return;
   if(when == 0)
     when = gps_time_ns();
   pthread_mutex_lock(&v->lock);
-  frame(v,ssrc,own_ssrc,description,channel,slot,bits,when,0);
+  frame(v,ssrc,own_ssrc,description,channel,label,slot,bits,when,0);
   pthread_mutex_unlock(&v->lock);
 }
 
 // Under the lock
 static void frame(struct dmr_voter *v,uint32_t ssrc,uint32_t own_ssrc,char const *description,uint32_t channel,
-                  int slot,uint8_t const bits[DMR_VOICE_FRAME_BITS],int64_t when,int depth){
+                  uint32_t label,int slot,uint8_t const bits[DMR_VOICE_FRAME_BITS],int64_t when,int depth){
   struct p25p2_ambe a;
   p25p2_ambe_decode(&a,bits);
   int const fec = a.errors[0] + a.errors[1];
@@ -405,14 +422,31 @@ static void frame(struct dmr_voter *v,uint32_t ssrc,uint32_t own_ssrc,char const
   if(si < 0)
     return;
   struct source * const src = &s->src[si];
+  src->label = label;
   if(description != NULL)
     strlcpy(src->description,description,sizeof src->description);
+  if(src->ended){
+    // The source's next transmission: what this one decided (given up, moved to its own stream, held
+    // frames) is not carried into it. Its counts, and its entry (candidates still to be played name it),
+    // stay. It keeps its place by time only while it is the stream's one live source; beside another it
+    // aligns afresh, by content
+    bool others = false;
+    for(int i=0; i < MAX_SOURCES && !others; i++)
+      others = i != si && s->src[i].used && !s->src[i].ended && s->src[i].aligned;
+    src->moved_to = 0;
+    src->given_up = false;
+    src->npending = 0;
+    src->tries = 0;
+    if(others)
+      src->aligned = false;
+  }
   if(src->moved_to != 0 && depth == 0){
-    frame(v,src->moved_to,src->moved_to,description,channel,slot,bits,when,1);
+    frame(v,src->moved_to,src->moved_to,description,channel,label,slot,bits,when,1);
     return;
   }
   src->ended = false;
   src->last_when = when;
+  src->own_ssrc = own_ssrc;
   if(when > s->last_frame)
     s->last_frame = when;
   if(fresh){
@@ -445,13 +479,14 @@ static void frame(struct dmr_voter *v,uint32_t ssrc,uint32_t own_ssrc,char const
     p->fec = fec;
     memcpy(p->bits,bits,DMR_VOICE_FRAME_BITS);
     src->offered++;
+    src->tries++;
     try_align(s,si);
     if(src->aligned){
       src->offered--; // try_align() offered (and counted) its pending frames
       if(when > s->last_aligned)
         s->last_aligned = when;
     }
-    else if(src->offered >= ALIGN_LIMIT){
+    else if(src->tries >= ALIGN_LIMIT){
       src->given_up = true;
       if(own_ssrc != 0 && own_ssrc != ssrc && depth == 0){
         // Another conversation: its own stream, its held frames first
@@ -459,7 +494,7 @@ static void frame(struct dmr_voter *v,uint32_t ssrc,uint32_t own_ssrc,char const
         int const n = src->npending;
         src->npending = 0;
         for(int i=0; i < n; i++)
-          frame(v,own_ssrc,own_ssrc,description,channel,slot,src->pend[i].bits,src->pend[i].when,1);
+          frame(v,own_ssrc,own_ssrc,description,channel,label,slot,src->pend[i].bits,src->pend[i].when,1);
         src->offered -= n;
       } else
         src->npending = 0;
@@ -476,6 +511,17 @@ void dmr_voter_source_end(struct dmr_voter *v,uint32_t ssrc,uint32_t channel,int
   if(s != NULL){
     int const si = find_source(s,channel,slot,false);
     if(si >= 0){
+      struct source * const src = &s->src[si];
+      // A transmission that ended before it either lined up or ran into the alignment limit is another
+      // conversation too short to tell: its held frames go to its own stream, as they would have
+      if(!src->aligned && !src->given_up && src->npending > 0 && src->own_ssrc != 0 && src->own_ssrc != ssrc){
+        int const n = src->npending;
+        src->npending = 0;
+        src->moved_to = src->own_ssrc;
+        for(int i=0; i < n; i++)
+          frame(v,src->own_ssrc,src->own_ssrc,src->description,channel,src->label,slot,src->pend[i].bits,src->pend[i].when,1);
+        src->offered -= n;
+      }
       s->src[si].ended = true;
       uint32_t const moved = s->src[si].moved_to;
       struct stream * const m = moved != 0 ? find_stream(v,moved,false) : NULL;

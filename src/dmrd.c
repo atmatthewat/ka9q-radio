@@ -111,6 +111,7 @@ struct decoder {
   char channel_id[DMR_CHANNEL_ID_MAX]; // the SSRC, or the configured channel's id
   uint64_t site_clock;     // the site's clock, us, never going back
   struct configured_site *configured; // the site from the sites file the carrier belongs to, else NULL
+  struct configured_channel *configured_channel; // its channel there
   char const *system_name; // "DMR", or the configured site's system
   uint64_t refresh_voice;  // voice bursts decoded when a followed channel was last kept alive
   uint64_t refresh_bursts; // bursts, likewise
@@ -150,6 +151,7 @@ struct session {
   struct session *next;
   struct sockaddr_storage sender; // radiod's address and port, the same for status and data
   uint32_t ssrc;
+  uint32_t receiver;              // unique among sessions (two radiods may send one SSRC): the voter's key
 
   // From the status stream. Written and read only by the input thread
   chan_t chan;
@@ -864,7 +866,9 @@ static struct session *create_session(struct sockaddr_storage const *sender,uint
   struct session * const sp = calloc(1,sizeof(*sp));
   if(sp == NULL)
     return NULL;
+  static uint32_t next_receiver; // the input thread's
   sp->ssrc = ssrc;
+  sp->receiver = ++next_receiver;
   memcpy(&sp->sender,sender,sizeof(sp->sender));
   memcpy(sp->pt_table,PT_table,sizeof(sp->pt_table));
   sp->last_status = sp->last_data = gps_time_ns();
@@ -983,9 +987,35 @@ static void *decode_task(void *arg){
       break;
 
     dec.block_time = bp->time; // the control plane's clocks read it from here on
+    if(dec.chan != NULL && (uint64_t)llrint(bp->frequency) != config.frequency_hz){
+      // Retuned: what was decided for the old frequency (its site, its LCN, its colour code, a site
+      // of its own) is not the new one's. The decoder goes first (it detaches from its site), then the
+      // rest, and the new frequency is looked up afresh below, configured or standalone
+      dmr_chan_destroy(dec.chan); // ends what is in progress: voice_event() runs in here
+      dec.chan = NULL;
+      dmr_site_destroy(dec.site);
+      dmr_control_log_destroy(dec.log);
+      dec.site = NULL;
+      dec.log = NULL;
+      if(dec.configured_channel != NULL){
+        uint32_t mine = sp->ssrc;
+        atomic_compare_exchange_strong(&dec.configured_channel->ssrc,&mine,0);
+      }
+      dec.configured = NULL;
+      dec.configured_channel = NULL;
+      snprintf(dec.channel_id,sizeof dec.channel_id,"%u",sp->ssrc);
+      dec.system_name = "DMR";
+      config.site = NULL;
+      config.log = NULL;
+      config.lcn = 0;
+      config.color_code = Color_code;
+      config.learn_crc_masks = Learn_crc_masks;
+      config.compressed_talkgroups = false;
+    }
     if(dec.configured == NULL && dec.site == NULL){
       struct configured_channel *ch = NULL;
       dec.configured = find_site((uint64_t)llrint(bp->frequency),&ch);
+      dec.configured_channel = ch;
       if(dec.configured != NULL){
         // One of the sites file's repeaters: the site and its log are shared with the site's other channels
         atomic_store(&ch->ssrc,sp->ssrc);
@@ -1049,7 +1079,7 @@ static void *decode_task(void *arg){
     dec.n0 = bp->n0;
     dec.low = bp->low;
     dec.high = bp->high;
-    dmr_voter_set_signal(Voter,sp->ssrc,dec.frequency,dec.bb_power,dec.n0,dec.low,dec.high);
+    dmr_voter_set_signal(Voter,sp->receiver,dec.frequency,dec.bb_power,dec.n0,dec.low,dec.high);
     if(dec.chan != NULL)
       dmr_chan_samples(dec.chan,bp->samples,bp->count,bp->time); // voice_frame(), voice_event() run in here
     if(Follow && dec.chan != NULL)
@@ -1103,12 +1133,12 @@ static void voice_frame(void *arg,struct dmr_chan_frame const *f){
   uint32_t const ssrc = frame_ssrc(dp,f);
   if(ssrc != s->ssrc){
     if(s->ssrc != 0)
-      dmr_voter_source_end(Voter,s->ssrc,dp->sp->ssrc,f->slot); // the identity changed: a new stream
+      dmr_voter_source_end(Voter,s->ssrc,dp->sp->receiver,f->slot); // the identity changed: a new stream
     s->ssrc = ssrc;
   }
   char desc[256];
   describe(desc,sizeof desc,dp,f);
-  dmr_voter_frame(Voter,ssrc,dp->sp->ssrc * 10 + f->slot,desc,dp->sp->ssrc,f->slot,f->bits,f->when);
+  dmr_voter_frame(Voter,ssrc,dp->sp->ssrc * 10 + f->slot,desc,dp->sp->receiver,dp->sp->ssrc,f->slot,f->bits,f->when);
 }
 
 // A transmission started or ended on a slot
@@ -1129,7 +1159,7 @@ static void voice_event(void *arg,struct dmr_chan_event const *e){
     if(e->slot >= 1 && e->slot <= 2){
       struct slot * const s = &dp->slot[e->slot - 1];
       if(s->ssrc != 0)
-        dmr_voter_source_end(Voter,s->ssrc,dp->sp->ssrc,e->slot);
+        dmr_voter_source_end(Voter,s->ssrc,dp->sp->receiver,e->slot);
       s->ssrc = 0;
     }
   }
