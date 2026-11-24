@@ -9,7 +9,7 @@ Matthew Kaufman, KA6SQG, November 2026
 - when several repeaters carry the same call at once, as the repeaters of a multi-site system do, makes one stream of it and takes each 20 ms of speech from whichever repeater received it best;
 - decodes control signalling (CSBKs and multi-block CSBKs, short link control) and logs it with what it says about the site: its identity, the rest channel, neighbours, channel grants and releases.
 
-Not yet: grouping the repeaters of a site and the sites of a system from a configuration (each channel is its own site for now), following trunked calls on Capacity Plus, Connect Plus or Tier III systems by asking *radiod* for granted channels, and data packets.
+Not yet: following trunked calls on Capacity Plus, Connect Plus or Tier III systems by asking *radiod* for granted channels, and data packets.
 
 ## Configuring *radiod*
 
@@ -50,6 +50,7 @@ dmrd [options] dmr-iq.local [more groups ...]
 - **-p**, **--tos** *tos*: IP type of service of the voice output (default 184, expedited forwarding)
 - **-c**, **--color-code** *n*|**any**|**track**: the colour code to decode, 0-15; **track** (the default) takes each channel's from its first strong sync and follows it; **any** decodes every one
 - **-M**, **--mobile**: also look for mobile station and direct mode syncs (simplex, talkaround), not only repeater outputs
+- **-f**, **--sites** *file*: which repeaters make up each site, and the system each site belongs to (see **Sites** below)
 - **-y**, **--system-type** *type*: the kind of system the channels belong to, which says how its signalling is read: **conventional** (the default; amateur repeaters, IP Site Connect), **tier3**, **capacity_plus**, **linked_capacity_plus**, **connect_plus**, **capacity_max**, **hytera_xpt** or **hytera_tier3**
 - **-v**, **--verbose**: more messages; at -v each channel also logs a status line, and link control, talker aliases and re-anchored clocks are logged
 - **-u**, **--update** *seconds*: interval between the -v status lines (default 10)
@@ -95,7 +96,27 @@ Mon 23 Nov 2026 21:25:30.149 UTC ssrc 453425 453.425000 MHz slot 1 cc 0 CSBK CAP
 Mon 23 Nov 2026 21:27:22.469 UTC ssrc 453425 453.425000 MHz slot 2 cc 0 CSBK CAP+ SITE STATUS rest LSN 1 LSN2:tg 1
 Mon 23 Nov 2026 21:27:22.469 UTC ssrc 453425 453.425000 MHz cc - REST channel moved: LSN 2 (LCN 1 TS2) -> LSN 1 (LCN 1 TS1) (NOT CONFIGURED: the plan lists no such repeater)
 ```
-The times in a count are local. Since each channel is its own site for now, a line about another repeater of the site says it is not configured. A channel release (P_CLEAR) heard on a slot ends the transmission there.
+The times in a count are local. Lines about a site rather than one of its channels (its identity, its rest channel) name it, e.g. **site SCMTD/1**. A channel release (P_CLEAR) heard on a slot ends the transmission there.
+
+## Sites
+
+A trunked or multi-site system's signalling is about the site: which of its repeaters is the rest channel, which carries a call, which sites neighbour it. Without being told which repeaters make up a site, *dmrd* treats each channel as a site of its own, of the type **-y** gives, and notes that the other repeaters a message names are not configured. A sites file (**-f**) says which they are, one section per site (see **config/examples/dmrd-sites.conf**):
+```
+[SCMTD 1]
+system = SCMTD
+site = 1
+type = capacity_plus
+color-code = 0
+freq = "453m4250"
+lcn = "1"
+```
+- **system**, **site**: names for the lines and the speech streams' descriptions (default: the section's name)
+- **type**: as **-y** (default: **-y**'s)
+- **color-code**: as **-c** (default: **-c**'s)
+- **freq**: the site's repeater outputs (the frequencies *radiod* sends them on)
+- **lcn**: each repeater's logical channel number, in the same order, as the system's signalling numbers them (Capacity Plus and Tier III name repeaters by LCN); none for a conventional site
+
+A channel joins the site that lists its frequency (to within 1 kHz), whichever *radiod* it comes from; one no site lists is a site of its own. The site's channels share its state and its control log, and their clocks are the signal's.
 
 ## Running as a service
 
@@ -109,7 +130,7 @@ The instance name is the multicast group. All instances append to **/var/log/dmr
 
 ### Things to know
 
-- **What has been tested.** On the air, from this tree's *radiod* with an Airspy R2: a Motorola Capacity Plus system of four repeaters on two sites (wide-area calls, beacons, both slots), and 67 amateur repeater outputs at once. From recordings of those repeaters and from generated signals (clear and encrypted calls, late entry, unit-to-unit calls, data, both slots, base station, mobile and direct mode, noise and fading): each layer checked frame for frame and field for field.
+- **What has been tested.** On the air, from this tree's *radiod* with an Airspy R2: a Motorola Capacity Plus system of three sites (wide-area calls, beacons, rest channel moves, both slots), with a sites file and without, and 67 amateur repeater outputs at once. From recordings of those repeaters and from generated signals (clear and encrypted calls, late entry, unit-to-unit calls, data, both slots, base station, mobile and direct mode, noise and fading): each layer checked frame for frame and field for field.
 - **CPU.** *dmrd* takes about a quarter of a core of an Apple M-series machine for 67 channels; *radiod* making 67 I/Q channels takes about three cores.
 - **One front end, for now.** The repeaters decoded must all be within what one *radiod* front end covers. Multi-site and trunked systems often span more than one tuner's bandwidth (e.g. 450-455 and 460-465 MHz); work with more than one *radiod*, choosing for each frequency the one that covers it, is planned.
 - **Talkgroup numbers.** A stream's SSRC is the talkgroup, and talkgroup numbers are unique only within one system: run one *dmrd*, with its own output group, per system, or accept that two systems' calls on the same number will be voted as one (they will not line up, and the second gets its own stream).

@@ -29,6 +29,7 @@
 #include "radio.h"
 #include "import.h"
 #include "timing.h"
+#include "config.h"
 #include "defaults.h"
 #include "p25audio.h"
 #include "dmr.h"
@@ -106,8 +107,31 @@ struct decoder {
   // repeaters into sites, and sites into a system, is the site's job once dmrd is told which they are
   struct dmr_site *site;
   struct dmr_control_log *log;
-  char channel_id[16];     // the SSRC
+  char channel_id[DMR_CHANNEL_ID_MAX]; // the SSRC, or the configured channel's id
   uint64_t site_clock;     // the site's clock, us, never going back
+  struct configured_site *configured; // the site from the sites file the carrier belongs to, else NULL
+  char const *system_name; // "DMR", or the configured site's system
+};
+
+// A site from the sites file (-f): its repeaters, the site state and control log they share, which
+// outlive the channels. Which channel is which is decided by frequency, so nothing here assumes the
+// channels come from one radiod
+struct configured_channel {
+  uint64_t frequency_hz;
+  uint16_t lcn;
+  char channel_id[DMR_CHANNEL_ID_MAX];
+  _Atomic uint32_t ssrc;   // of the session decoding it, 0 for none yet
+};
+struct configured_site {
+  char system_name[DMR_SITE_NAME_MAX];
+  char site_name[DMR_SITE_NAME_MAX];
+  int color_code;
+  struct dmr_site *site;
+  struct dmr_control_log *log;
+  _Atomic int64_t latest;  // the latest signal time any of its channels has decoded, ns since the GPS epoch
+  _Atomic uint64_t site_clock;
+  int nchannels;
+  struct configured_channel *channels;
 };
 
 // One for each channel (SSRC) being decoded
@@ -168,6 +192,9 @@ static int IP_tos = DEFAULT_IP_TOS;
 static int Color_code = -1;           // -c: pinned 0-15, -1 tracked, -2 any
 static bool Mobile;                   // -M: also MS and direct mode syncs (simplex, talkaround)
 static enum dmr_system_type System_type = DMR_SYSTEM_CONVENTIONAL; // -y
+static char const *Sites_file;        // -f
+static struct configured_site *Sites;
+static int Nsites;
 
 // Tuning constants
 static double const Max_fill = 1.0;   // Fill gaps up to this many seconds with zeroes; resynchronize on longer ones
@@ -215,10 +242,17 @@ static void control_line(void *arg,struct dmr_control_line const *line);
 static void control_clear(void *arg,struct dmr_site_context const *channel,uint8_t slot,char const *reason);
 static int64_t control_wall_clock(void *arg);
 static uint64_t control_site_clock(void *arg);
+static void load_sites(char const *file);
+static void free_sites(void);
+static struct configured_site *find_site(uint64_t frequency_hz,struct configured_channel **channel);
+static void site_line(void *arg,struct dmr_control_line const *line);
+static int64_t site_wall_clock(void *arg);
+static uint64_t site_site_clock(void *arg);
 
 static struct option Options[] = {
   {"iface", required_argument, NULL, 'A'},
   {"color-code", required_argument, NULL, 'c'},
+  {"sites", required_argument, NULL, 'f'},
   {"input", required_argument, NULL, 'I'},
   {"locale", required_argument, NULL, 'l'},
   {"mobile", no_argument, NULL, 'M'},
@@ -235,10 +269,10 @@ static struct option Options[] = {
   {"system-type", required_argument, NULL, 'y'},
   {NULL, 0, NULL, 0},
 };
-static char const Optstring[] = "A:c:I:l:MN:o:p:R:S:t:T:u:vVy:";
+static char const Optstring[] = "A:c:f:I:l:MN:o:p:R:S:t:T:u:vVy:";
 
 static void usage(void){
-  fprintf(stderr,"Usage: %s [-v|--verbose] [-V|--version] [-l|--locale locale] [-A|--iface interface] [-o|--source <source-name-or-address>] [-S|--ssrc ssrc] [-t|--timeout seconds] [-u|--update seconds] [-c|--color-code n|any|track] [-M|--mobile] [-y|--system-type conventional|capacity_plus|...] [-R|--pcm-out audio_mcast_address] [-N|--name service_name] [-T|--ttl ttl] [-p|--tos tos] [-I|--input] iq_mcast_address [iq_mcast_address ...]\n",App_path);
+  fprintf(stderr,"Usage: %s [-v|--verbose] [-V|--version] [-l|--locale locale] [-A|--iface interface] [-o|--source <source-name-or-address>] [-S|--ssrc ssrc] [-t|--timeout seconds] [-u|--update seconds] [-c|--color-code n|any|track] [-M|--mobile] [-y|--system-type conventional|capacity_plus|...] [-f|--sites sites_file] [-R|--pcm-out audio_mcast_address] [-N|--name service_name] [-T|--ttl ttl] [-p|--tos tos] [-I|--input] iq_mcast_address [iq_mcast_address ...]\n",App_path);
 }
 
 int main(int argc,char *argv[]){
@@ -265,6 +299,9 @@ int main(int argc,char *argv[]){
         }
         Color_code = (int)x;
       }
+      break;
+    case 'f':
+      Sites_file = optarg;
       break;
     case 'y':
       if(!dmr_system_type_from_name(optarg,&System_type)){
@@ -333,6 +370,8 @@ int main(int argc,char *argv[]){
   setlocale(LC_ALL,Locale);
   setlinebuf(stdout);
   setlinebuf(stderr);
+  if(Sites_file != NULL)
+    load_sites(Sites_file); // exits if it can't be read
 
   for(int i=optind; i < argc; i++){
     if(Ninputs == MAX_MCAST){
@@ -387,6 +426,7 @@ int main(int argc,char *argv[]){
 
   input_loop();
   cleanup();
+  free_sites(); // after every channel has gone: their pending counts are written here
   dmr_voter_destroy(Voter);
   p25_audio_close(Audio_group);
   if(Verbose)
@@ -779,6 +819,7 @@ static void *decode_task(void *arg){
     .arg = &dec,
   };
   snprintf(dec.channel_id,sizeof dec.channel_id,"%u",sp->ssrc);
+  dec.system_name = "DMR";
   struct dmr_chan_config config;
   dmr_chan_config_init(&config);
   config.color_code = Color_code;
@@ -803,7 +844,26 @@ static void *decode_task(void *arg){
       break;
 
     dec.block_time = bp->time; // the control plane's clocks read it from here on
-    if(dec.site == NULL){
+    if(dec.configured == NULL && dec.site == NULL){
+      struct configured_channel *ch = NULL;
+      dec.configured = find_site((uint64_t)llrint(bp->frequency),&ch);
+      if(dec.configured != NULL){
+        // One of the sites file's repeaters: the site and its log are shared with the site's other channels
+        atomic_store(&ch->ssrc,sp->ssrc);
+        strlcpy(dec.channel_id,ch->channel_id,sizeof dec.channel_id);
+        dec.system_name = dec.configured->system_name;
+        config.site = dec.configured->site;
+        config.log = dec.configured->log;
+        config.lcn = ch->lcn;
+        config.color_code = dec.configured->color_code;
+      }
+    }
+    if(dec.configured != NULL){
+      int64_t latest = atomic_load(&dec.configured->latest);
+      while(bp->time > latest && !atomic_compare_exchange_weak(&dec.configured->latest,&latest,bp->time))
+        ;
+    }
+    if(dec.configured == NULL && dec.site == NULL){
       // The site and its log: named after the carrier, its clocks the signal's
       struct dmr_control_log_options lo;
       dmr_control_log_options_init(&lo);
@@ -817,6 +877,7 @@ static void *decode_task(void *arg){
       strlcpy(sc.system_name,lo.system_name,sizeof sc.system_name);
       strlcpy(sc.site_name,lo.site_name,sizeof sc.site_name);
       sc.type = System_type;
+      // not a repeater of the sites file: a site of its own
       sc.system_color_code = Color_code; // -1 and -2 are the site's TRACK and ANY too
       struct dmr_site_options so;
       dmr_site_options_init(&so);
@@ -859,7 +920,7 @@ static void *decode_task(void *arg){
     }
   }
   dmr_chan_destroy(dec.chan); // ends what is in progress: voice_event() runs in here
-  dmr_site_destroy(dec.site);
+  dmr_site_destroy(dec.site);  // only a site of its own: a configured one outlives the channel
   dmr_control_log_destroy(dec.log); // its pending counts are written here
   return NULL;
 }
@@ -876,9 +937,9 @@ static uint32_t frame_ssrc(struct decoder const *dp,struct dmr_chan_frame const 
 static void describe(char *buf,size_t size,struct decoder const *dp,struct dmr_chan_frame const *f){
   int n;
   if(f->destination == 0)
-    n = snprintf(buf,size,"DMR");
+    n = snprintf(buf,size,"%s",dp->system_name);
   else
-    n = snprintf(buf,size,"DMR %s %u",f->group ? "TG" : "unit",f->destination);
+    n = snprintf(buf,size,"%s %s %u",dp->system_name,f->group ? "TG" : "unit",f->destination);
   if(n > 0 && (size_t)n < size && f->source != 0)
     n += snprintf(buf + n,size - n," src %u",f->source);
   if(n > 0 && (size_t)n < size && f->alias[0] != '\0')
@@ -934,21 +995,37 @@ static void voice_event(void *arg,struct dmr_chan_event const *e){
 // A line of the carrier's control log (CSBKs, link control, the site's identity, rest channel, grants
 // and warnings), on the channel's thread. Repeats are collapsed into counts by the log. Its own
 // timestamp is local time; ours is the signal's, as for every other line
-// Link control (LC, SLC) says again what the transmission lines say, so it is written only at -v
-static void control_line(void *arg,struct dmr_control_line const *line){
-  struct decoder const * const dp = arg;
+// A control log line as dmrd writes it after its own time and channel: slot, colour code, kind, text,
+// and a count line's "(xN since ..., last ...)". False for a line not written at this verbosity: link
+// control (LC, SLC) says again what the transmission lines say, so it is written only at -v
+static bool control_text(char *buf,size_t size,struct dmr_control_line const *line){
   if(!Verbose && (strcmp(line->kind,"LC") == 0 || strcmp(line->kind,"SLC") == 0))
-    return;
+    return false;
   char cc[8] = "-";
   if(line->color_code != DMR_NO_COLOR_CODE)
     snprintf(cc,sizeof cc,"%u",line->color_code);
   // "SLC NULL", not "SLC SLC NULL"
   size_t const k = strlen(line->kind);
   bool const named = strncmp(line->text,line->kind,k) == 0 && line->text[k] == ' ';
+  // The count is in the formatted line only, after the text
+  char const *count = "";
+  if(line->repeats != 0 && line->formatted != NULL){
+    char const * const t = strstr(line->formatted,line->text);
+    if(t != NULL)
+      count = t + strlen(line->text);
+  }
+  char slot[16] = "";
   if(line->slot != 0)
-    decoder_event(dp,dp->block_time,"slot %u cc %s %s%s%s",line->slot,cc,named ? "" : line->kind,named ? "" : " ",line->text);
-  else
-    decoder_event(dp,dp->block_time,"cc %s %s%s%s",cc,named ? "" : line->kind,named ? "" : " ",line->text);
+    snprintf(slot,sizeof slot,"slot %u ",line->slot);
+  snprintf(buf,size,"%scc %s %s%s%s%s",slot,cc,named ? "" : line->kind,named ? "" : " ",line->text,count);
+  return true;
+}
+
+static void control_line(void *arg,struct dmr_control_line const *line){
+  struct decoder const * const dp = arg;
+  char text[DMR_SITE_LINE_MAX + 64];
+  if(control_text(text,sizeof text,line))
+    decoder_event(dp,dp->block_time,"%s",text);
 }
 
 // A P_CLEAR: the site has released the slot, so its call has ended
@@ -970,6 +1047,193 @@ static uint64_t control_site_clock(void *arg){
   if((uint64_t)(gps / 1000) > dp->site_clock)
     dp->site_clock = (uint64_t)(gps / 1000);
   return dp->site_clock;
+}
+
+// ---------------------------------------------------------------------------
+// The sites file (-f): one section per site, e.g.
+//   [SCMTD 1]
+//   system = SCMTD          (default: the section's name)
+//   site = 1                (default: the section's name)
+//   type = capacity_plus    (default: -y's, else conventional)
+//   color-code = 0          (0-15, track, any; default: -c's)
+//   freq = "453m4250 460m1375"   the site's repeater outputs
+//   lcn = "1 2"             each one's logical channel number, in the same order (trunked systems)
+// A channel whose frequency the file lists joins that site; any other is a site of its own
+
+static char const *Site_keys[] = { "system", "site", "type", "color-code", "freq", "lcn", NULL };
+
+static int parse_color_code(char const *s,int def){
+  if(s == NULL)
+    return def;
+  if(strcmp(s,"any") == 0)
+    return -2;
+  if(strcmp(s,"track") == 0)
+    return -1;
+  char *ptr = NULL;
+  long const x = strtol(s,&ptr,0);
+  return (ptr == s || *ptr != '\0' || x < 0 || x > 15) ? -3 : (int)x;
+}
+
+static void load_sites(char const *file){
+  dictionary *table = iniparser_load(file);
+  if(table == NULL){
+    fprintf(stderr,"Can't load sites file %s\n",file);
+    exit(EX_NOINPUT);
+  }
+  int const nsect = iniparser_getnsec(table);
+  Sites = calloc(nsect > 0 ? (size_t)nsect : 1,sizeof *Sites);
+  assert(Sites != NULL);
+  for(int sect=0; sect < nsect; sect++){
+    char const * const name = iniparser_getsecname(table,sect);
+    config_validate_section(stderr,table,name,Site_keys,NULL);
+    struct configured_site * const cs = &Sites[Nsites];
+    strlcpy(cs->system_name,config_getstring(table,name,"system",name),sizeof cs->system_name);
+    strlcpy(cs->site_name,config_getstring(table,name,"site",name),sizeof cs->site_name);
+    cs->color_code = parse_color_code(config_getstring(table,name,"color-code",NULL),Color_code);
+    enum dmr_system_type type = System_type;
+    char const * const t = config_getstring(table,name,"type",NULL);
+    if(cs->color_code < -2 || (t != NULL && !dmr_system_type_from_name(t,&type))){
+      fprintf(stderr,"%s [%s]: bad %s\n",file,name,cs->color_code < -2 ? "color-code (0-15, track or any)" : "type");
+      exit(EX_USAGE);
+    }
+    // The frequencies, and their LCNs
+    char const * const freqs = config_getstring(table,name,"freq",NULL);
+    char const * const lcns = config_getstring(table,name,"lcn","");
+    if(freqs == NULL){
+      fprintf(stderr,"%s [%s]: no freq: skipped\n",file,name);
+      continue;
+    }
+    char fbuf[4096],lbuf[4096];
+    strlcpy(fbuf,freqs,sizeof fbuf);
+    strlcpy(lbuf,lcns,sizeof lbuf);
+    char *fsave = NULL,*lsave = NULL;
+    for(char *f = strtok_r(fbuf," \t,\"",&fsave); f != NULL; f = strtok_r(NULL," \t,\"",&fsave)){
+      char const * const l = strtok_r(cs->nchannels == 0 ? lbuf : NULL," \t,\"",&lsave);
+      double const hz = parse_frequency(f,false);
+      if(hz <= 0){
+        fprintf(stderr,"%s [%s]: bad frequency %s\n",file,name,f);
+        exit(EX_USAGE);
+      }
+      cs->channels = realloc(cs->channels,(size_t)(cs->nchannels + 1) * sizeof *cs->channels);
+      assert(cs->channels != NULL);
+      struct configured_channel * const ch = &cs->channels[cs->nchannels++];
+      memset(ch,0,sizeof *ch);
+      ch->frequency_hz = (uint64_t)llrint(hz);
+      ch->lcn = l != NULL ? (uint16_t)strtoul(l,NULL,0) : 0;
+      snprintf(ch->channel_id,sizeof ch->channel_id,"%.4lf",hz * 1e-6);
+    }
+    // The site, its plan and its log
+    struct dmr_site_channel_config *plan = calloc((size_t)cs->nchannels,sizeof *plan);
+    assert(plan != NULL);
+    for(int i=0; i < cs->nchannels; i++){
+      dmr_site_channel_config_init(&plan[i]);
+      plan[i].lcn = cs->channels[i].lcn;
+      plan[i].frequency_hz = cs->channels[i].frequency_hz;
+      strlcpy(plan[i].channel_id,cs->channels[i].channel_id,sizeof plan[i].channel_id);
+    }
+    struct dmr_control_log_options lo;
+    dmr_control_log_options_init(&lo);
+    strlcpy(lo.system_name,cs->system_name,sizeof lo.system_name);
+    strlcpy(lo.site_name,cs->site_name,sizeof lo.site_name);
+    lo.clock_us = site_wall_clock;
+    lo.clock_arg = cs;
+    cs->log = dmr_control_log_create(&lo,site_line,cs);
+    struct dmr_site_config sc;
+    dmr_site_config_init(&sc);
+    strlcpy(sc.system_name,cs->system_name,sizeof sc.system_name);
+    strlcpy(sc.site_name,cs->site_name,sizeof sc.site_name);
+    sc.type = type;
+    sc.system_color_code = cs->color_code;
+    sc.nchannels = cs->nchannels;
+    sc.channels = plan;
+    struct dmr_site_options so;
+    dmr_site_options_init(&so);
+    so.clock_us = site_site_clock;
+    so.clock_arg = cs;
+    so.warnings_to_stderr = false;
+    struct dmr_site_handlers const sh = {
+      .clear = control_clear,
+    };
+    cs->site = dmr_site_create(&sc,cs->log,&so,&sh);
+    free(plan);
+    if(cs->site == NULL || cs->log == NULL){
+      fprintf(stderr,"%s [%s]: can't create the site\n",file,name);
+      exit(EX_SOFTWARE);
+    }
+    if(Verbose)
+      fprintf(stderr,"site %s/%s: %s, %d channels\n",cs->system_name,cs->site_name,dmr_system_type_name(type),cs->nchannels);
+    Nsites++;
+  }
+  iniparser_freedict(table);
+}
+
+static void free_sites(void){
+  for(int i=0; i < Nsites; i++){
+    dmr_site_destroy(Sites[i].site);
+    dmr_control_log_destroy(Sites[i].log);
+    free(Sites[i].channels);
+  }
+  free(Sites);
+  Sites = NULL;
+  Nsites = 0;
+}
+
+// The configured site and channel of a carrier, by its frequency (within 1 kHz); NULL if none
+static struct configured_site *find_site(uint64_t frequency_hz,struct configured_channel **channel){
+  for(int i=0; i < Nsites; i++){
+    for(int j=0; j < Sites[i].nchannels; j++){
+      uint64_t const f = Sites[i].channels[j].frequency_hz;
+      if((f > frequency_hz ? f - frequency_hz : frequency_hz - f) <= 1000){
+        *channel = &Sites[i].channels[j];
+        return &Sites[i];
+      }
+    }
+  }
+  return NULL;
+}
+
+// A line of a configured site's control log, on the thread of the channel that wrote it. Lines about
+// a channel carry its SSRC and frequency, as every other line; lines about the site its name
+static void site_line(void *arg,struct dmr_control_line const *line){
+  struct configured_site const * const cs = arg;
+  int64_t const when = atomic_load(&cs->latest);
+  char text[DMR_SITE_LINE_MAX + 64];
+  if(!control_text(text,sizeof text,line))
+    return;
+  for(int j=0; j < cs->nchannels; j++){
+    struct configured_channel const * const ch = &cs->channels[j];
+    if(strcmp(ch->channel_id,line->channel_id) == 0){
+      char ts[100];
+      format_gpstime(ts,sizeof ts,when != 0 ? when : gps_time_ns());
+      pthread_mutex_lock(&Output_mutex);
+      fprintf(stdout,"%s ssrc %u %.6lf MHz %s\n",ts,atomic_load(&ch->ssrc),ch->frequency_hz * 1e-6,text);
+      pthread_mutex_unlock(&Output_mutex);
+      return;
+    }
+  }
+  char ts[100];
+  format_gpstime(ts,sizeof ts,when != 0 ? when : gps_time_ns());
+  pthread_mutex_lock(&Output_mutex);
+  fprintf(stdout,"%s site %s/%s %s\n",ts,cs->system_name,cs->site_name,text);
+  pthread_mutex_unlock(&Output_mutex);
+}
+
+// A configured site's clocks: the latest signal time its channels have decoded (they share radiod's
+// time base), so they run with the signal as a single channel's do
+static int64_t site_wall_clock(void *arg){
+  struct configured_site const * const cs = arg;
+  int64_t const latest = atomic_load(&cs->latest);
+  int64_t const gps = latest != 0 ? latest : gps_time_ns();
+  return gps / 1000 + ((int64_t)UNIX_EPOCH - GPS_UTC_OFFSET) * 1000000;
+}
+static uint64_t site_site_clock(void *arg){
+  struct configured_site * const cs = arg;
+  int64_t const latest = atomic_load(&cs->latest);
+  uint64_t const now = (uint64_t)((latest != 0 ? latest : gps_time_ns()) / 1000);
+  uint64_t prev = atomic_load(&cs->site_clock);
+  while(now > prev && !atomic_compare_exchange_weak(&cs->site_clock,&prev,now))
+    ;
+  return now > prev ? now : prev;
 }
 
 static void vote_end(void *arg,struct dmr_vote_result const *r){
