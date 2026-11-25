@@ -85,6 +85,15 @@
 // Chain_delay_samples (51) of a block: the receive lowpass (15 samples), the matched filter (32) and
 // the interpolator (4) lie between the correction and the symbol.
 //
+// Why the matched filter is not folded into the timing resampler as its prototype (dsync.c, "Symbol
+// timing", has the general argument). DMR has the strongest reason of the decoders to keep them
+// apart: its look-back (resample(), resample_rigid(), the sink's Look_back_periods and its half-symbol
+// search) computes past outputs again through symsync_near(), with the interpolator's 8-tap arms over
+// the input history. With the root raised cosine as the prototype, every output computed again would
+// need the raw discriminator samples over the filter's whole span, 16 symbols (64 samples), and the
+// arms and the history would have to grow to match. The saving would be small: the filter is 65 real
+// taps at 19.2 kHz, about 1.25 million multiply-adds a second per channel, so about 0.6 million.
+//
 // Arithmetic. Every stage keeps one order of operations, statement by statement (that is why it
 // uses run_rxfilter_parts() and run_symsync_real()): its tests compare the output bit for bit with
 // an independent implementation of the same design, built the same way. Built with contraction

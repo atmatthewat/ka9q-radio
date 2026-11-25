@@ -72,7 +72,9 @@
 // compute the matched filter only at the two outputs per symbol rather than at every input sample:
 // at four samples per symbol about half the filtering. That half is small: Phase 2's filter
 // (init_rrcfilter(), 8 symbols each side, 65 real taps on complex samples at 24 kHz) costs about
-// 3.1 million multiply-adds a second per carrier, so folding it in would save about 1.5 million.
+// 3.1 million multiply-adds a second per carrier, so folding it in would save about 1.5 million;
+// DMR's (init_rrc_realfilter(), 65 real taps on the discriminator's output at 19.2 kHz) about 1.25
+// million, so about 0.6 million (dmrrx.c says why DMR keeps them apart in any case).
 // Against that, each arm would span the filter's 16 symbols (64 input samples) instead of
 // SYMSYNC_TAPS, so the arm length would have to become a parameter, and the history
 // symsync_near() needs to compute a past output again would grow with it. So the filter runs on
