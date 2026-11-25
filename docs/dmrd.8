@@ -194,10 +194,13 @@ channel's SSRC times ten plus the timeslot. The status carries the frequency
 and signal figures of the repeater the speech came from and a description
 such as "SCMTD TG 3 src 1301 453.4250 MHz TS2 CC0".
 .PP
-Encrypted voice is not decoded: a transmission's voice is decoded only after a
-checked header or embedded link control word of that transmission has said it
-is unencrypted. Voice that arrives before that is held, then sent in order or
-dropped.
+Encrypted voice is not decoded, by p25d's rule: the last word wins, and
+nothing is held back. A transmission starts clear. A checked link control word
+with the privacy bit set, a PI header or burst F's encryption parameters make
+it encrypted; only a word of the same kind saying otherwise (a link control
+word with the bit clear; burst F carrying something else) undoes it. A damaged
+word mislabels the voice until the next word of its kind, at most a superframe
+(360 ms).
 .SH SIGNALS
 SIGUSR1 increases verbosity; SIGUSR2 decreases it. SIGINT, SIGTERM and SIGQUIT
 stop dmrd; transmissions in progress are ended and the repeaters it asked for

@@ -27,7 +27,7 @@
 //
 // Timing. The stream's RTP clock runs at 8 kHz from the sender time of its first frame, 160 a frame,
 // so a recording lines up with the I/Q. A frame later than the next one due means frames went
-// missing (a burst lost to a fade, or held back and never released): up to Max_fill of them are
+// missing (a burst lost to a fade, or labelled other than clear): up to Max_fill of them are
 // fed to the vocoder as lost, so the gap keeps its length in the speech (the vocoder repeats the
 // last good frame, then mutes); a longer gap, or a frame more than a frame early, ends the
 // transmission and starts a new one. A transmission whose next frame is Timeout late ends by itself

@@ -16,12 +16,10 @@
 // owner's end of a call (a P_CLEAR) or flush. The output is one record per voice frame, labelled,
 // in order within a slot, and a start and an end event per transmission.
 //
-// THE RULE. Audio of encrypted frames must never be put online; the archive keeps everything.
-// Voice is labelled clear only after something in its own transmission said clear; anything that
-// says encrypted holds for the rest of the transmission. Frames that wait are released in order or
-// written labelled encrypted, never dropped. Downstream trusts only the label of each record, so the
-// label is the whole of the rule's output. A short burst of mislabelled audio at low signal is
-// accepted; complicated enforcement is not wanted.
+// THE RULE: the last word wins, as in p25d (p25audio.c). Each voice frame goes out as it arrives,
+// labelled by the rule as it stands once its own burst's words have been taken in; nothing waits to
+// be confirmed. A transmission starts clear. Downstream trusts only the label of each record, so the
+// label is the whole of the rule's output.
 //
 // Transmissions start with a voice LC header that passed RS(12,9), a PI header with no header before
 // it, a voice burst with nothing in progress (a late entry), an embedded LC naming another source
@@ -41,128 +39,79 @@
 // Identity comes from the transmission's own LCs: group or unit-to-unit, source, destination,
 // service options, FID. Until one is read the records carry zeros and DMR_VF_IDENTITY_CARRIED; nothing
 // is carried over from the slot's previous transmission, because a record is filed under its
-// destination and a wrong one is worse than none. Held frames get the identity known when they are
-// released. A terminator's LC names a transmission that never read one. LCs of different address
+// destination and a wrong one is worse than none. A terminator's LC names a transmission that never
+// read one (for its end event: its frames have gone). LCs of different address
 // widths (the vendor short forms) are not compared; the widest is kept.
 //
-// Says encrypted, from that burst's frames on:
-//   strong, final at once (and "confirmed": the records are not marked unconfirmed)
-//     - a checked header, terminator or embedded LC with the privacy bit, a Capacity Plus encrypted
-//       voice LC, or a vendor encryption parameters LC;
-//     - a PI header (CRC-CCITT), with the algorithm, key and MI.
-//   weak: burst F's encryption parameters (confirmed only if its 32 bits arrived as a codeword),
-//     and EMB PI = 1 (unconfirmed). Both need two words, below.
-//   carried: "encrypted" left by the transmission before, when no boundary ended it (unconfirmed).
-// The EMB's PI bit is ETSI's pre-emption and power control indicator, not a privacy flag, so PI = 0
-// never says clear and PI = 1 is kept only in the cautious direction (emb_pi_mode: encrypted by
-// default; ignored; or nothing in a transmission already Clear on its own LC). It counts only from
-// an EMB received as a codeword (emb_pi_max_errors 0): the sink takes an EMB within one corrected bit,
-// and the noise of a lost burst is such an EMB with the channel's colour code often enough that, half
-// of those with PI = 1, it would mark clear transmissions encrypted; noise is an exact EMB with the
-// channel's colour code one time in 8,192 (8 codewords of the 65,536 words of 16 bits). A corrected
-// EMB still counts when its burst's three voice frames
-// needed at most emb_pi_clean_voice_max_fec (14) Golay corrections, which noise seldom does, or when
-// the transmission's EMB before it had PI = 1 too (a real PI = 1 is in every burst B-F).
-// Unconfirmed becomes confirmed when stronger evidence comes (records already written keep their
-// label). A later LC that says clear does not undo "encrypted": it is counted (contradictions).
+// Two kinds of word say encrypted, and each is undone only by a word of its own kind. The transmission
+// is Encrypted while either says so:
+//   The LC. A checked voice LC header, embedded LC or terminator LC with the privacy bit set, a
+//     Capacity Plus encrypted voice LC, or a vendor encryption parameters LC, says encrypted; a checked
+//     header or embedded LC with the privacy bit clear says clear. (A terminator ends the transmission
+//     anyway: its "clear" would change nothing.)
+//   The encryption parameters. A PI header (CRC-CCITT), with the algorithm, key and MI, or burst F's
+//     encryption parameters, says encrypted; burst F decoded as another message (null, TXI, reverse
+//     channel) says clear. On systems whose LCs do not carry the privacy bit, burst F says encrypted
+//     in every superframe, and the LCs saying clear between do not undo it.
+// Nothing else counts. The EMB's PI bit is ETSI's pre-emption and power control indicator, not a
+// privacy flag: some systems set it on clear calls, and under this rule that would mute them, so it
+// is only counted (emb_pi[][]). An LC valid only through a learned CRC residual (dmrmsg.h) gives
+// identity and may say encrypted, never clear. An embedded LC counts as saying clear only when its
+// four bursts B-E all belong to this transmission since its last gap (more than voice_gap_us without
+// a confirmed burst), so that one assembled across an unseen boundary cannot.
 //
-// Says clear, only from Unknown:
-//   - a voice LC header with the privacy bit 0 that passed RS(12,9) WITHOUT a correction. A random
-//     96-bit word passes RS uncorrected one time in 16.7 million but one time in 5,480 with the
-//     one-octet correction; and when BPTC(196,96) delivers the codeword that was sent RS has nothing
-//     to correct, so a correction means BPTC delivered another one. Refusing costs little: the
-//     embedded LC follows 300 ms later;
-//   - an embedded LC with the privacy bit 0 in which BPTC(128,77) changed at most
-//     embedded_clear_max_corrected (4) bits, which is everything the message layer delivers. Its
-//     5-bit checksum passes one wrong LC in 31, so everything rests on BPTC: a wrong codeword is at
-//     least 8 bits from the one sent, so one accepted with 4 changed bits needs at least 4 errors on
-//     the positions where it differs. A stricter limit is the safer direction but costs clear audio
-//     (a late entry waits longer, and a clear transmission that ends before a good enough LC is
-//     written encrypted); the preference here is for clear audio, since a wrong LC that says clear on
-//     an encrypted call is followed within a superframe by the next one, which says encrypted;
-//   - an LC that is not good enough alone (an RS-corrected header, an embedded LC with more changed
-//     bits) when it repeats, octet for octet, the transmission's last LC that said clear
-//     (clear_on_repeated_lc): a wrong one would have to be the same wrong codeword twice.
-// An embedded LC counts only when its four bursts B-E all belong to this transmission after its last
-// gap, so the LC that names a new talker gives the new transmission its identity, and can say
-// encrypted, but clear waits for the next one: a single wrong LC cannot turn an encrypted
-// transmission clear. Nothing else says clear: not a terminator's LC, not EMB PI = 0, not direct mode
-// (it carries LCs like any other), not the transmission before.
+// What that costs, accepted so that no clear voice is lost. A damaged word that passes its checks with
+// wrong contents mislabels the voice until the next word of its kind: an embedded LC or a burst F comes
+// once a superframe (360 ms). One saying encrypted in a clear transmission mutes that much speech; one
+// saying clear in an encrypted transmission lets that much through, decoded to noise. An encrypted
+// transmission entered late (its header missed) is decoded until its first embedded LC or burst F
+// says encrypted, up to a superframe. A rule that held voice until a word confirmed it clear, and asked
+// two words to agree before muting, lost clear voice at a weak signal, where the confirming word often
+// failed.
 //
-// Two words for a weak indicator (weak_indicators_need_two). On real air a decoded encryption word
-// sometimes has wrong contents (p25d found this on P25), and when one word is final a single bad one
-// mutes the rest of a clear transmission. Burst F is a (32,11) code with no CRC, so noise decodes as encryption
-// parameters now and then; PI = 1 comes from lost bursts' noise as above. So a weak word makes the
-// transmission encrypted only when a second word of the same kind agrees: another burst F with the
-// same algorithm and key (one that differs takes the first one's place), another PI = 1; or when a
-// strong indicator comes. A word of the other weak kind is not a second word. Until then the
-// transmission stays as it is (Unknown frames are held, Clear stays Clear), and its frames wait with
-// the word (hold_while_weak_pending), so the second word writes them encrypted from the first word's
-// burst on. A clear word of the same field forgets a waiting word (weak_forgotten_by_clear_word):
-// burst F decoded as a null, TXI or reverse channel message, or a valid EMB with PI = 0; the frames
-// that waited go out clear. A checked LC that says clear does not (weak_forgotten_by_clear_lc off):
-// where the LCs do not carry the privacy bit, burst E's LC says clear between every two bursts F, and
-// a call that says "encrypted" only in burst F would never get its second word. A word still waiting
-// at the end is not believed: frames of bursts up to the last confirmed one go out as the state says
-// (Clear: clear), the rest unconfirmed.
+// Noise is not speech. Before a transmission has an identity (a late entry, until its first embedded
+// LC), a burst whose three frames needed more than unidentified_clear_max_fec (9) Golay corrections is
+// written encrypted and unconfirmed: a false sync on noise starts a late entry of a burst or two, and
+// noise through the two Golay decodes needs about 17 (the code is perfect, so a random 23-bit word is
+// on average 2.85 bits from its codeword, about 5.7 a frame); a burst received at a 5 % bit error rate
+// needs about 7 (47 protected bits a frame). It labels each burst as it comes: nothing waits.
 //
-// Hold until first. Frames of a transmission in state Unknown are held, in order: Clear writes them
-// clear and the live frames follow; Encrypted writes them encrypted (confirmed or not, as the
-// evidence is), and the rest too; an end still Unknown writes them encrypted and unconfirmed. A
-// transmission caught at its header holds nothing; a late entry holds until burst E completes the
-// embedded LC. In a Clear transmission the frames of a burst nothing confirmed wait too, for the
-// next confirmed voice burst (written clear) or a gap or the end (unconfirmed); and so do the frames
-// while a weak word waits. At most max_held_frames (3,000, 60 s) wait per slot; beyond that the oldest
-// are written encrypted and unconfirmed. Nothing is dropped and the order within a slot is kept.
-//
-// Boundaries nobody saw. Apart from a system whose own LCs say clear on encrypted voice, a wrong LC
-// that passes its checks, and a weak word without its second, encrypted voice can be labelled clear
-// in one way: a boundary between two transmissions the tracker did not see, so that "clear" said by
-// one is applied to the other's frames (forwards: more voice after a clear transmission; backwards:
-// held frames released by the next one's LC). Four checks close it, none of which ends anything a
-// real boundary would not:
+// Boundaries the tracker can see split one transmission from the next, and a new transmission starts
+// clear. Four checks find boundaries that were not seen, so that "clear" said by one is not applied to
+// the other's frames: none ends anything a real boundary would not.
 //   The gap. A transmission's voice bursts are 60 ms apart, and between two transmissions there are
-//     at least two bursts that are not voice (a terminator, a header). So when voice resumes more than
-//     voice_gap_us (150 ms: two or more bursts missing) after the last confirmed burst, "clear" does not
-//     cross: held frames from before are written unconfirmed, Clear goes back to Unknown and the
-//     frames after wait for the next LC. The transmission goes on (identity, frame numbers, Encrypted
-//     if it was); a dropout costs a hold, not audio, unless the transmission ends before its next LC.
+//     at least two bursts that are not voice (a terminator, a header). A gap of more than voice_gap_us
+//     (150 ms) since the last confirmed burst ends nothing, but an embedded LC whose fragments span it
+//     does not say clear.
 //   Bursts nothing confirmed (unconfirmed_is_missing). Inside a call the sink hands on up to two
 //     periods in a row in which it found neither a sync nor an EMB, as the voice bursts its count
-//     expects. Such a burst is whatever was received there: voice whose EMB failed, noise, or a damaged
-//     terminator and header. It counts as missing for the gap (two in a row are a gap though the
-//     timestamps show none), and in a Clear transmission its frames wait for the next confirmed burst:
-//     with no gap between they are written clear, in place; with a gap or the end first, unconfirmed.
-//     Every frame is still written: most such bursts are real voice. A burst's own voice confirms it
-//     when its three frames needed at most clean_voice_confirms_max_fec (9) Golay corrections in all:
-//     noise through the two Golay decodes needs about 17: the code is perfect, so a random 23-bit word
-//     is on average 2.85 bits from its codeword (of the 2,048 syndromes 1, 23, 253 and 1,771 are
-//     patterns of 0, 1, 2 and 3 bits), about 5.7 a frame; a burst received at a 5 % bit error rate
-//     needs about 7 (47 protected bits a frame).
+//     expects. Such a burst counts as missing for the gap (two in a row are a gap though the timestamps
+//     show none), unless its own voice confirms it: its three frames needed at most
+//     clean_voice_confirms_max_fec (9) Golay corrections in all. Its frames are written as the rule
+//     stands: most such bursts are real voice.
 //   The superframe position. Superframes A-F follow each other without a break and a transmission
 //     starts at A, so a voice burst whose position is not the one the transmission's timing calls for
-//     is not that transmission's: it ends there and a new one starts, Unknown (Resync).
+//     is not that transmission's: it ends there and a new one starts (Resync).
 //   The slot grid. The bursts of one timeslot are a whole number of 60 ms periods apart and the other
 //     timeslot's are 30 ms from them. A voice burst (or a second header) more than
 //     slot_grid_tolerance_us (5 ms) off the grid of the transmission's last burst is not that
 //     transmission's: it ends there and a new one starts (Resync). This catches a sink that numbers a
 //     timeslot's bursts with the other's number for a while, and another transmitter's timing.
-// What is left: two transmissions in step (the next burst A exactly where the last superframe's
-// would have been) with nothing at all, or a single lost burst, between them. The one case in which
-// a transmission's records go from encrypted to clear: after a gap or the hold limit wrote held
-// frames unconfirmed, a later LC says clear.
+//
+// A new talker. An embedded LC naming another source or destination means one transmission ended and
+// another began unseen: the old one ends there, but the new one keeps the words where they were (as
+// p25d does), since the change is found only after it; the LC that named the new talker then says what
+// it says.
 //
 // Ends that are no boundary (carry_encrypted). The sink can cut one transmission in two without a
 // boundary: a noise window handed on as a data burst whose slot type does not decode, or a burst off
-// the slot grid. Where every LC carries the privacy bit that costs nothing, but where "encrypted" is
-// said once (a PI header on a system whose LCs lack the bit) the second part's own LC would say
-// clear. So such an end leaves "encrypted" behind for fade_us from the last burst: a transmission that
-// starts with a voice burst on the first one's 60 ms grid within that time, under either slot number,
-// starts encrypted, unconfirmed, with its algorithm and key; likewise one on the grid of an encrypted
-// transmission in progress under the other slot number. A boundary seen on the slot (a data burst
-// whose slot type decodes, a header, a PI header) clears it. A sync loss or a superframe resync leaves
-// nothing behind unless carry_encrypted_across_sync_loss: there the end is more often a real one, and
-// carrying would write a clear call that follows an encrypted one encrypted.
+// the slot grid. Such an end leaves the words behind for fade_us from the last burst: a transmission
+// that starts with a voice burst on the first one's 60 ms grid within that time, under either slot
+// number, starts with them (Encrypted, unconfirmed, with its algorithm and key, if they said so);
+// likewise one on the grid of an encrypted transmission in progress under the other slot number. A
+// boundary seen on the slot (a data burst whose slot type decodes, a header, a PI header) clears it.
+// A sync loss or a superframe resync leaves nothing behind unless carry_encrypted_across_sync_loss:
+// there the end is more often a real one.
 //
 // Time. Burst timestamps must be signal time (60 ms from one burst of a slot to the next, exactly),
 // not the time a burst was processed: the fade, the gap, the superframe position and the slot grid
@@ -172,18 +121,14 @@
 // which calls dmr_call_end_call() for a P_CLEAR and dmr_msg_reset_slot() from the end event of a fade,
 // no voice or release. Not thread safe: one tracker belongs to one channel's thread.
 
-uint64_t const Dmr_hold_bin_limit_us[DMR_HOLD_BINS - 1] = { 60000, 360000, 720000, 2000000 };
-
 enum {
   SLOTS = 3,               // 0 = slot not known, 1, 2
   SUPERFRAME_BURSTS = 6,
 };
 #define BURST_PERIOD_US 60000ull // between bursts of one timeslot
 
-// What an LC that says clear is worth: nothing, something when repeated, enough by itself
-enum clear_evidence { EVIDENCE_NONE, EVIDENCE_REPEATED, EVIDENCE_ALONE };
-enum indicator { BY_LC, BY_PI_HEADER, BY_BURST_F, BY_EMB_PI, BY_CARRIED };
-// What an end means for "encrypted" left behind on the slot
+enum indicator { BY_LC, BY_PI_HEADER, BY_BURST_F, BY_CARRIED };
+// What an end means for the words left behind on the slot
 enum end_kind {
   END_BOUNDARY,            // a boundary was seen, or time ran out: nothing is left behind
   END_NEUTRAL,             // sync loss, a superframe resync: what was left before stays, no more
@@ -216,36 +161,16 @@ char const *dmr_call_end_name(enum dmr_call_end r){
   default: return "?";
   }
 }
-char const *dmr_emb_pi_mode_name(enum dmr_emb_pi_mode m){
-  switch(m){
-  case DMR_EMB_PI_ENCRYPTED: return "encrypted";
-  case DMR_EMB_PI_IGNORE: return "ignore";
-  case DMR_EMB_PI_UNLESS_LC_CLEAR: return "unless-clear";
-  }
-  return "?";
-}
 
 void dmr_call_config_init(struct dmr_call_config *c){
   memset(c,0,sizeof *c);
   c->fade_us = 1000000;
   c->pre_voice_timeout_us = 360000;
-  c->max_held_frames = 3000;
   c->voice_gap_us = 150000;
-  c->embedded_clear_max_corrected = 4;
-  c->header_clear_needs_uncorrected = true;
-  c->clear_on_repeated_lc = true;
-  c->emb_pi_says_encrypted = true;
-  c->emb_pi_max_errors = 0;
-  c->emb_pi_repeat_counts = true;
-  c->emb_pi_clean_voice_max_fec = 14;
-  c->emb_pi_mode = DMR_EMB_PI_ENCRYPTED;
-  c->weak_indicators_need_two = true;
-  c->weak_forgotten_by_clear_word = true;
-  c->weak_forgotten_by_clear_lc = false;
-  c->hold_while_weak_pending = true;
   c->check_superframe_position = true;
   c->unconfirmed_is_missing = true;
   c->clean_voice_confirms_max_fec = 9;
+  c->unidentified_clear_max_fec = 9;
   c->slot_grid_tolerance_us = 5000;
   c->carry_encrypted = true;
   c->carry_encrypted_across_sync_loss = false;
@@ -258,6 +183,7 @@ void dmr_voice_record_init(struct dmr_voice_record *r){
   r->encryption_algorithm = DMR_VOICE_ALG_UNKNOWN;
   r->fec_errors = DMR_VOICE_FEC_NOT_COUNTED;
 }
+
 static void record_mark_clear(struct dmr_voice_record *r){
   r->flags = (uint8_t)(r->flags & ~(DMR_VF_ENCRYPTED | DMR_VF_UNCONFIRMED));
   r->encryption_algorithm = DMR_VOICE_ALG_CLEAR;
@@ -276,39 +202,8 @@ static void record_set_fec_errors(struct dmr_voice_record *r,int errors){
   r->fec_errors = errors < 0 ? DMR_VOICE_FEC_NOT_COUNTED : (uint8_t)(errors > DMR_VOICE_FEC_MAX ? DMR_VOICE_FEC_MAX : errors);
 }
 
-// ---------------- Held frames ----------------
-
-static struct dmr_voice_record *held_at(struct dmr_held_frames const *h,size_t i){
-  return &h->rec[(h->head + i) % h->capacity];
-}
-static bool held_push(struct dmr_held_frames *h,struct dmr_voice_record const *r){
-  if(h->count == h->capacity){
-    size_t const capacity = h->capacity == 0 ? 48 : 2 * h->capacity;
-    struct dmr_voice_record *rec = malloc(capacity * sizeof *rec);
-    if(rec == NULL)
-      return false;
-    for(size_t i=0; i < h->count; i++) // unroll the ring
-      rec[i] = *held_at(h,i);
-    free(h->rec);
-    h->rec = rec;
-    h->capacity = capacity;
-    h->head = 0;
-  }
-  h->rec[(h->head + h->count) % h->capacity] = *r;
-  h->count++;
-  return true;
-}
-static void held_pop(struct dmr_held_frames *h,size_t n){
-  if(n > h->count)
-    n = h->count;
-  if(h->capacity > 0)
-    h->head = (h->head + n) % h->capacity;
-  h->count -= n;
-}
-
-// A fresh transmission, keeping the held frames' buffer
+// A fresh transmission
 static void tx_clear(struct dmr_transmission *tx){
-  struct dmr_held_frames held = tx->held;
   memset(tx,0,sizeof *tx);
   tx->started_by = DMR_START_LATE_ENTRY;
   tx->id.group = true;
@@ -316,10 +211,6 @@ static void tx_clear(struct dmr_transmission *tx){
   tx->recorded = true;
   tx->state = DMR_ENC_UNKNOWN;
   tx->mode = DMR_STATION_UNKNOWN;
-  tx->held.rec = held.rec;
-  tx->held.capacity = held.capacity;
-  tx->held.head = 0;
-  tx->held.count = 0;
 }
 
 // ---------------- Channel ----------------
@@ -386,10 +277,10 @@ static int voice_fec_errors(struct dmr_voice_burst const *v){
 
 // Complete one frame's record with the transmission's identity and the label, count it, hand it on
 static void write_frame(struct dmr_call_tracker *t,struct dmr_transmission *tx,uint8_t slot,struct dmr_voice_record record,
-                        enum dmr_call_label label,bool was_held){
+                        enum dmr_call_label label){
   // A record is clear only out of a transmission in state Clear, whatever the caller asked for
   if(label == DMR_LABEL_CLEAR && tx->state != DMR_ENC_CLEAR)
-    label = DMR_LABEL_UNCONFIRMED_AT_END;
+    label = DMR_LABEL_ENCRYPTED;
 
   if(tx->identity_known){
     record.source_id = tx->id.source;
@@ -409,49 +300,36 @@ static void write_frame(struct dmr_call_tracker *t,struct dmr_transmission *tx,u
 
   bool const write = tx->identity_known ? tx->recorded : t->config.record_unidentified;
   struct dmr_call_counters *c = &t->counters;
+  bool unconfirmed = false;
   switch(label){
   case DMR_LABEL_CLEAR:
     record_mark_clear(&record);
     tx->frames_clear++;
     if(write)
       c->frames_clear++;
-    if(was_held)
-      c->held_released_clear++;
     break;
   case DMR_LABEL_ENCRYPTED:
     record.dmr_algorithm_id = tx->algorithm;
     record.key_id = tx->key_id;
     record.message_indicator = tx->mi;
-    record_mark_encrypted(&record,!tx->confirmed);
-    if(tx->confirmed)
-      tx->frames_encrypted++;
-    else
+    unconfirmed = !tx->confirmed;
+    break;
+  case DMR_LABEL_NOISE:
+    unconfirmed = true;
+    break;
+  }
+  if(label != DMR_LABEL_CLEAR){
+    record_mark_encrypted(&record,unconfirmed);
+    if(unconfirmed)
       tx->frames_unconfirmed++;
+    else
+      tx->frames_encrypted++;
     if(write){
-      if(tx->confirmed)
-        c->frames_encrypted++;
-      else
+      if(unconfirmed)
         c->frames_unconfirmed++;
-    }
-    if(was_held)
-      c->held_released_encrypted++;
-    break;
-  case DMR_LABEL_UNCONFIRMED_AT_END:
-  case DMR_LABEL_UNCONFIRMED_AT_CAP:
-  case DMR_LABEL_UNCONFIRMED_AT_GAP:
-    record_mark_encrypted(&record,true);
-    tx->frames_unconfirmed++;
-    if(write)
-      c->frames_unconfirmed++;
-    if(was_held){
-      if(label == DMR_LABEL_UNCONFIRMED_AT_END)
-        c->held_unconfirmed_at_end++;
-      else if(label == DMR_LABEL_UNCONFIRMED_AT_CAP)
-        c->held_unconfirmed_at_cap++;
       else
-        c->held_unconfirmed_at_gap++;
+        c->frames_encrypted++;
     }
-    break;
   }
   if(!write){
     c->frames_not_recorded++;
@@ -459,31 +337,6 @@ static void write_frame(struct dmr_call_tracker *t,struct dmr_transmission *tx,u
   }
   if(t->on_voice != NULL)
     t->on_voice(t->voice_arg,t->system_name,t->site_name,&record);
-}
-
-// Write the transmission's held frames (or the first count of them), oldest first, with one label
-static void release_held(struct dmr_call_tracker *t,struct dmr_transmission *tx,uint8_t slot,enum dmr_call_label label,
-                         uint64_t now,size_t count){
-  struct dmr_call_counters *c = &t->counters;
-  uint64_t const held_since = held_at(&tx->held,0)->timestamp_us;
-  uint64_t const hold_us = now > held_since ? now - held_since : 0;
-  c->holds++;
-  if(hold_us > c->longest_hold_us)
-    c->longest_hold_us = hold_us;
-  int bin = 0;
-  while(bin < DMR_HOLD_BINS - 1 && hold_us > Dmr_hold_bin_limit_us[bin])
-    bin++;
-  c->hold_bins[bin]++;
-  if(count > tx->held.count)
-    count = tx->held.count;
-  for(size_t i=0; i < count; i++)
-    write_frame(t,tx,slot,*held_at(&tx->held,i),label,true);
-  held_pop(&tx->held,count);
-  tx->held_through_confirmed = tx->held_through_confirmed > count ? tx->held_through_confirmed - count : 0;
-}
-static void release_all(struct dmr_call_tracker *t,struct dmr_transmission *tx,uint8_t slot,enum dmr_call_label label,
-                        uint64_t now){
-  release_held(t,tx,slot,label,now,SIZE_MAX);
 }
 
 // ---------------- Events ----------------
@@ -495,7 +348,7 @@ static void fill_meta(struct dmr_call_tracker const *t,struct dmr_transmission c
   m->call_key = t->keys[slot];
   m->talkgroup_id = tx->identity_known ? tx->id.destination : 0;
   m->source_id = tx->identity_known ? tx->id.source : 0;
-  m->encrypted = tx->state != DMR_ENC_CLEAR; // not shown to be clear counts as encrypted
+  m->encrypted = tx->state == DMR_ENC_ENCRYPTED;
   m->emergency = tx->identity_known && dmr_so_emergency(tx->id.options);
   m->start_timestamp_us = tx->start_us;
 }
@@ -533,27 +386,59 @@ static void announce_start(struct dmr_call_tracker *t,struct dmr_transmission *t
   }
 }
 
-// ---------------- Start and end ----------------
+// ---------------- Encryption ----------------
 
-// Clear, its frames held for a weak word that never got a second: one word is not believed
-static bool holding_for_weak(struct dmr_call_tracker const *t,struct dmr_transmission const *tx){
-  return t->config.hold_while_weak_pending && (tx->pending_pi || tx->pending_f);
+// The state from the two kinds of word
+static void update_state(struct dmr_call_tracker *t,struct dmr_transmission *tx,enum indicator by){
+  bool const encrypted = tx->lc_encrypted || tx->parameters_encrypted;
+  struct dmr_call_counters *c = &t->counters;
+  if(encrypted && tx->state != DMR_ENC_ENCRYPTED){
+    if(tx->frames_clear > 0)
+      c->clear_then_encrypted++;
+    switch(by){
+    case BY_LC: c->encrypted_by_lc++; break;
+    case BY_PI_HEADER: c->encrypted_by_pi_header++; break;
+    case BY_BURST_F: c->encrypted_by_burst_f++; break;
+    case BY_CARRIED: c->encrypted_carried++; break;
+    }
+    tx->state = DMR_ENC_ENCRYPTED;
+  } else if(!encrypted && tx->state != DMR_ENC_CLEAR){
+    if(tx->state == DMR_ENC_ENCRYPTED)
+      c->encrypted_then_clear++;
+    tx->state = DMR_ENC_CLEAR;
+  }
+}
+static void lc_says(struct dmr_call_tracker *t,struct dmr_transmission *tx,bool encrypted){
+  tx->lc_encrypted = encrypted;
+  if(encrypted){
+    tx->confirmed = true;
+    t->counters.lc_encrypted++;
+  } else {
+    t->counters.lc_clear++;
+  }
+  update_state(t,tx,BY_LC);
+}
+static void parameters_say(struct dmr_call_tracker *t,struct dmr_transmission *tx,bool encrypted,enum indicator by){
+  tx->parameters_encrypted = encrypted;
+  if(encrypted){
+    tx->confirmed = true;
+    t->counters.parameters_encrypted++;
+  } else {
+    t->counters.parameters_clear++;
+  }
+  update_state(t,tx,by);
 }
 
+// ---------------- Start and end ----------------
+
 static void end(struct dmr_call_tracker *t,uint8_t slot,enum dmr_call_end reason,uint64_t now,enum end_kind kind){
+  (void)now;
   struct dmr_transmission *tx = &t->slots[slot];
   if(!tx->active)
     return;
-  // Clear, with frames held for a weak word that got no second: those of bursts up to the last
-  // confirmed one are clear
-  if(tx->state == DMR_ENC_CLEAR && holding_for_weak(t,tx) && tx->held_through_confirmed > 0)
-    release_held(t,tx,slot,DMR_LABEL_CLEAR,now,tx->held_through_confirmed);
-  // Still Unknown: nothing in the transmission said clear, so its frames are not
-  if(tx->held.count > 0)
-    release_all(t,tx,slot,DMR_LABEL_UNCONFIRMED_AT_END,now);
 
-  // A boundary clears what was left behind on the slot; an end that is none leaves "encrypted",
-  // or leaves what was there
+  // A boundary clears what was left behind on the slot; an end that is none leaves the words that
+  // say encrypted, or leaves what was there
   if(kind == END_BOUNDARY){
     memset(&t->carry[slot],0,sizeof t->carry[slot]);
   } else if(kind == END_NOT_ONE && t->config.carry_encrypted && tx->state == DMR_ENC_ENCRYPTED){
@@ -561,6 +446,8 @@ static void end(struct dmr_call_tracker *t,uint8_t slot,enum dmr_call_end reason
     c->active = true;
     c->last_us = tx->last_activity_us;
     c->until_us = tx->last_activity_us + t->config.fade_us;
+    c->lc_encrypted = tx->lc_encrypted;
+    c->parameters_encrypted = tx->parameters_encrypted;
     c->algorithm = tx->algorithm;
     c->key_id = tx->key_id;
     c->mi = tx->mi;
@@ -572,7 +459,6 @@ static void end(struct dmr_call_tracker *t,uint8_t slot,enum dmr_call_end reason
     c->without_voice++;
   else if(!tx->identity_known)
     c->never_identified++;
-  c->weak_never_confirmed += (tx->pending_pi ? 1u : 0u) + (tx->pending_f ? 1u : 0u);
   int const lc = tx->lc_said_encrypted ? 2 : tx->lc_said_clear ? 1 : 0;
   c->emb_pi[0][lc] += tx->emb_pi0_bursts;
   c->emb_pi[1][lc] += tx->emb_pi1_bursts;
@@ -612,13 +498,11 @@ static struct dmr_transmission *start(struct dmr_call_tracker *t,uint8_t slot,en
   tx->start_us = now;
   tx->last_activity_us = now;
   tx->last_confirmed_us = now;
+  tx->state = DMR_ENC_CLEAR;
   t->counters.transmissions++;
   t->counters.started[reason]++;
   return tx;
 }
-
-static void say_encrypted(struct dmr_call_tracker *t,struct dmr_transmission *tx,uint8_t slot,uint64_t now,bool strong,
-                          enum indicator by);
 
 // The encrypted transmission a voice burst at now on slot may continue: one that an end that is no
 // boundary ended, under any slot number, less than the fade ago, or one in progress under another
@@ -644,6 +528,8 @@ static struct dmr_carry const *encrypted_before(struct dmr_call_tracker *t,uint8
       c->active = true;
       c->last_us = other->last_activity_us;
       c->until_us = other->last_activity_us + t->config.fade_us;
+      c->lc_encrypted = other->lc_encrypted;
+      c->parameters_encrypted = other->parameters_encrypted;
       c->algorithm = other->algorithm;
       c->key_id = other->key_id;
       c->mi = other->mi;
@@ -653,8 +539,8 @@ static struct dmr_carry const *encrypted_before(struct dmr_call_tracker *t,uint8
   return NULL;
 }
 
-// A transmission that starts with a voice burst takes "encrypted" from an encrypted transmission it
-// may be the continuation of
+// A transmission that starts with a voice burst takes the words of an encrypted transmission it may
+// be the continuation of. Encrypted so, it is not confirmed: no word of its own said so yet
 static struct dmr_transmission *start_with_voice(struct dmr_call_tracker *t,uint8_t slot,enum dmr_call_start reason,
                                                  uint64_t now){
   struct dmr_transmission *tx = start(t,slot,reason,now);
@@ -663,7 +549,9 @@ static struct dmr_transmission *start_with_voice(struct dmr_call_tracker *t,uint
     tx->algorithm = from->algorithm;
     tx->key_id = from->key_id;
     tx->mi = from->mi;
-    say_encrypted(t,tx,slot,now,false,BY_CARRIED);
+    tx->lc_encrypted = from->lc_encrypted;
+    tx->parameters_encrypted = from->parameters_encrypted;
+    update_state(t,tx,BY_CARRIED);
   }
   return tx;
 }
@@ -694,73 +582,22 @@ static void adopt_identity(struct dmr_call_tracker *t,struct dmr_transmission *t
   }
 }
 
-// ---------------- Encryption ----------------
-
-static void say_clear(struct dmr_call_tracker *t,struct dmr_transmission *tx,uint8_t slot,uint64_t now){
-  if(tx->state != DMR_ENC_UNKNOWN)
-    return;
-  tx->state = DMR_ENC_CLEAR;
-  if(tx->held.count > 0 && !holding_for_weak(t,tx))
-    release_all(t,tx,slot,DMR_LABEL_CLEAR,now);
-}
-
-static void say_encrypted(struct dmr_call_tracker *t,struct dmr_transmission *tx,uint8_t slot,uint64_t now,bool strong,
-                          enum indicator by){
-  if(tx->state == DMR_ENC_ENCRYPTED){
-    if(strong)
-      tx->confirmed = true;
-    return;
-  }
-  struct dmr_call_counters *c = &t->counters;
-  if(tx->state == DMR_ENC_CLEAR)
-    c->clear_then_encrypted++;
-  tx->state = DMR_ENC_ENCRYPTED;
-  tx->confirmed = strong;
-  tx->pending_pi = tx->pending_f = false; // nothing waits any more
-  switch(by){
-  case BY_LC: c->encrypted_by_lc++; break;
-  case BY_PI_HEADER: c->encrypted_by_pi_header++; break;
-  case BY_BURST_F: c->encrypted_by_burst_f++; break;
-  case BY_EMB_PI: c->encrypted_by_emb_pi++; break;
-  case BY_CARRIED: c->encrypted_carried++; break;
-  }
-  if(tx->held.count > 0)
-    release_all(t,tx,slot,DMR_LABEL_ENCRYPTED,now);
-}
-
-// A weak indicator waits for its second word unless the transmission is already encrypted or this
-// word agrees with the one waiting
-static bool weak_waits(struct dmr_call_tracker const *t,struct dmr_transmission const *tx,bool agrees){
-  return t->config.weak_indicators_need_two && tx->state != DMR_ENC_ENCRYPTED && !agrees;
-}
-
-// The transmission's bursts stopped for longer than voice_gap_us and voice is here again: a
-// boundary may be hidden in the gap, so "clear" does not cross it. Encrypted does
-static void after_gap(struct dmr_call_tracker *t,struct dmr_transmission *tx,uint8_t slot,uint64_t now,
-                      bool unconfirmed_between){
+// The transmission's bursts stopped for longer than voice_gap_us and voice is here again: a boundary
+// may be hidden in the gap, so an embedded LC assembled across it does not say clear
+static void after_gap(struct dmr_call_tracker *t,struct dmr_transmission *tx){
   tx->bursts_since_gap = 0;
-  if(tx->state == DMR_ENC_ENCRYPTED)
-    return;
   t->counters.gaps++;
-  if(unconfirmed_between)
-    t->counters.gaps_unconfirmed++;
-  if(tx->held.count > 0)
-    release_all(t,tx,slot,DMR_LABEL_UNCONFIRMED_AT_GAP,now);
-  if(tx->state == DMR_ENC_CLEAR){
-    tx->state = DMR_ENC_UNKNOWN;
-    t->counters.clear_lost_at_gap++;
-  }
 }
 
-// What a checked LC of this transmission says: identity, then privacy. evidence: what the LC is
-// worth if it says clear
-// learned_mask: the LC is valid only through a learned CRC residual (dmrmsg.h): it gives identity and may
-// say encrypted, never clear (its evidence is NONE)
-// dmr_lc_voice_identity() with the system's talkgroup form applied (config.compressed_talkgroups): every
-// identity the tracker reads comes through here, so two LCs of one call compare alike
-// A voice LC naming source 0 says nothing of the call yet: Capacity Plus sends a wide-area voice header
-// with source 0 and, 120 ms later, one naming the radio. Taken as an identity it opened a transmission of
-// its own, ended empty by the next header; as none, the next header joins its transmission
+// What a checked LC of this transmission says: identity, then privacy. may_say_clear: false for an LC
+// valid only through a learned CRC residual (dmrmsg.h), and an embedded LC whose fragments may span a
+// gap: they give identity and may say encrypted, never clear
+// identity_of(): dmr_lc_voice_identity() with the system's talkgroup form applied
+// (config.compressed_talkgroups): every identity the tracker reads comes through here, so two LCs of
+// one call compare alike. A voice LC naming source 0 says nothing of the call yet: Capacity Plus sends
+// a wide-area voice header with source 0 and, 120 ms later, one naming the radio. Taken as an identity
+// it opened a transmission of its own, ended empty by the next header; as none, the next header joins
+// its transmission
 static bool identity_of(struct dmr_call_tracker const *t,struct dmr_lc const *lc,struct dmr_voice_identity *id){
   if(!dmr_lc_voice_identity(lc,id) || id->source == 0)
     return false;
@@ -769,9 +606,8 @@ static bool identity_of(struct dmr_call_tracker const *t,struct dmr_lc const *lc
   return true;
 }
 
-static void apply_lc(struct dmr_call_tracker *t,struct dmr_transmission *tx,uint8_t slot,uint64_t now,struct dmr_lc const *lc,
-                     enum clear_evidence evidence,bool header,bool learned_mask){
-  struct dmr_call_counters *c = &t->counters;
+static void apply_lc(struct dmr_call_tracker *t,struct dmr_transmission *tx,uint8_t slot,struct dmr_lc const *lc,
+                     bool may_say_clear,bool learned_mask){
   struct dmr_voice_identity id;
   if(identity_of(t,lc,&id))
     adopt_identity(t,tx,&id,lc->fid);
@@ -783,40 +619,16 @@ static void apply_lc(struct dmr_call_tracker *t,struct dmr_transmission *tx,uint
       tx->key_id = lc->u.encryption.key_id;
       tx->mi = lc->u.encryption.mi;
     }
-    say_encrypted(t,tx,slot,now,true,BY_LC);
+    lc_says(t,tx,true);
     break;
   case DMR_LC_CLEAR:
     tx->lc_said_clear = true;
-    if(t->config.weak_forgotten_by_clear_lc && (tx->pending_pi || tx->pending_f)){
-      c->weak_forgotten_by_lc += (tx->pending_pi ? 1u : 0u) + (tx->pending_f ? 1u : 0u);
-      tx->pending_pi = tx->pending_f = false;
-    }
-    if(tx->state == DMR_ENC_ENCRYPTED){
-      c->contradictions++;
-    } else if(tx->state == DMR_ENC_UNKNOWN){
-      if(evidence == EVIDENCE_ALONE){
-        if(header)
-          c->clear_by_header++;
-        else
-          c->clear_by_embedded_lc++;
-        say_clear(t,tx,slot,now);
-      } else if(evidence == EVIDENCE_REPEATED && t->config.clear_on_repeated_lc && tx->have_clear_lc
-                && memcmp(tx->clear_lc,lc->bytes,sizeof tx->clear_lc) == 0){
-        c->clear_by_repeated_lc++;
-        say_clear(t,tx,slot,now);
-      } else if(evidence == EVIDENCE_NONE && learned_mask){
-        c->clear_refused_learned_mask++;
-      } else {
-        if(header)
-          c->clear_refused_header++;
-        else
-          c->clear_refused_embedded++;
-      }
-    }
-    if(evidence != EVIDENCE_NONE){
-      tx->have_clear_lc = true;
-      memcpy(tx->clear_lc,lc->bytes,sizeof tx->clear_lc);
-    }
+    if(may_say_clear)
+      lc_says(t,tx,false);
+    else if(learned_mask)
+      t->counters.learned_mask_clear_ignored++;
+    else
+      t->counters.lc_span_gap_ignored++;
     break;
   case DMR_LC_NO_STATEMENT:
     break;
@@ -846,11 +658,9 @@ static void on_header(struct dmr_call_tracker *t,uint8_t slot,struct dmr_burst c
   tx->last_activity_us = now;
   tx->last_confirmed_us = now;
   note_burst(tx,b);
-  bool const alone = data->lc_uncorrected || !t->config.header_clear_needs_uncorrected;
   if(data->learned_mask)
     t->counters.learned_mask_lcs++;
-  apply_lc(t,tx,slot,now,lc,data->learned_mask ? EVIDENCE_NONE : alone ? EVIDENCE_ALONE : EVIDENCE_REPEATED,true,
-           data->learned_mask);
+  apply_lc(t,tx,slot,lc,!data->learned_mask,data->learned_mask);
 }
 
 static void on_pi_header(struct dmr_call_tracker *t,uint8_t slot,struct dmr_burst const *b,struct dmr_pi_header const *pi,
@@ -867,13 +677,11 @@ static void on_pi_header(struct dmr_call_tracker *t,uint8_t slot,struct dmr_burs
   tx->algorithm = pi->algorithm_id;
   tx->key_id = pi->key_id;
   tx->mi = pi->mi;
-  say_encrypted(t,tx,slot,now,true,BY_PI_HEADER);
+  parameters_say(t,tx,true,BY_PI_HEADER);
 }
 
-// A terminator's LC names a transmission that never read an LC (for the frames still held, written
-// encrypted whatever it says: a terminator does not say clear), and it can say encrypted
-static void on_terminator_lc(struct dmr_call_tracker *t,struct dmr_transmission *tx,uint8_t slot,struct dmr_lc const *lc,
-                             uint64_t now){
+// A terminator's LC names a transmission that never read an LC, and it can say encrypted
+static void on_terminator_lc(struct dmr_call_tracker *t,struct dmr_transmission *tx,struct dmr_lc const *lc){
   struct dmr_voice_identity id;
   bool const has_id = identity_of(t,lc,&id);
   if(has_id && tx->identity_known && id.address_bits == tx->id.address_bits && !same_call(&tx->id,&id))
@@ -884,7 +692,7 @@ static void on_terminator_lc(struct dmr_call_tracker *t,struct dmr_transmission 
     if(tx->state == DMR_ENC_CLEAR)
       t->counters.terminator_says_encrypted++;
     tx->lc_said_encrypted = true;
-    say_encrypted(t,tx,slot,now,true,BY_LC);
+    lc_says(t,tx,true);
   }
 }
 
@@ -919,7 +727,7 @@ static void on_data(struct dmr_call_tracker *t,uint8_t slot,struct dmr_burst con
   if(typed && b->data_type == DMR_DT_TERMINATOR_LC){
     reason = DMR_END_TERMINATOR;
     if(data != NULL && dmr_data_lc_usable(data))
-      on_terminator_lc(t,tx,slot,&data->lc,now);
+      on_terminator_lc(t,tx,&data->lc);
   } else if(typed && b->data_type == DMR_DT_IDLE){
     reason = DMR_END_IDLE;
   } else if(typed && b->data_type == DMR_DT_VOICE_LC_HEADER){
@@ -930,12 +738,16 @@ static void on_data(struct dmr_call_tracker *t,uint8_t slot,struct dmr_burst con
 
 // ---------------- Voice bursts ----------------
 
+// The burst's three frames, labelled as the rule now stands; before the transmission has an identity,
+// a burst whose voice looks like noise is not labelled clear
 static void add_frames(struct dmr_call_tracker *t,struct dmr_transmission *tx,uint8_t slot,struct dmr_burst const *b,
-                       struct dmr_voice_burst const *voice,uint64_t now,bool confirmed){
-  // Unknown: every frame waits. Clear: the frames of a burst nothing confirmed wait for the next
-  // confirmed burst (whatever still waits then goes first, so the order holds)
-  bool const wait = tx->state == DMR_ENC_UNKNOWN
-    || (tx->state == DMR_ENC_CLEAR && (!confirmed || tx->held.count > 0 || holding_for_weak(t,tx)));
+                       struct dmr_voice_burst const *voice,int fec){
+  enum dmr_call_label label = tx->state == DMR_ENC_CLEAR ? DMR_LABEL_CLEAR : DMR_LABEL_ENCRYPTED;
+  if(label == DMR_LABEL_CLEAR && !tx->identity_known && t->config.unidentified_clear_max_fec >= 0
+     && fec > t->config.unidentified_clear_max_fec){
+    label = DMR_LABEL_NOISE;
+    t->counters.unidentified_noisy_bursts++;
+  }
   for(int k=0; k < DMR_VOICE_FRAMES; k++){
     struct dmr_voice_frame const *frame = &voice->frames[k];
     struct dmr_voice_record record;
@@ -945,30 +757,7 @@ static void add_frames(struct dmr_call_tracker *t,struct dmr_transmission *tx,ui
     tx->frames++;
     memcpy(record.voice,frame->bytes,sizeof record.voice);
     record_set_fec_errors(&record,frame->fec_errors);
-    if(wait){
-      if(held_push(&tx->held,&record)){
-        t->counters.frames_held++;
-        continue;
-      }
-      // Out of memory: what waits goes out unconfirmed, in order, and this frame after it
-      if(tx->held.count > 0)
-        release_all(t,tx,slot,DMR_LABEL_UNCONFIRMED_AT_CAP,now);
-      write_frame(t,tx,slot,record,DMR_LABEL_UNCONFIRMED_AT_CAP,false);
-    } else {
-      write_frame(t,tx,slot,record,tx->state == DMR_ENC_CLEAR ? DMR_LABEL_CLEAR : DMR_LABEL_ENCRYPTED,false);
-    }
-  }
-  if(wait && confirmed)
-    tx->held_through_confirmed = tx->held.count;
-  while(tx->held.count > t->config.max_held_frames){
-    struct dmr_voice_record const first = *held_at(&tx->held,0);
-    uint64_t const held_since = first.timestamp_us;
-    if(now > held_since && now - held_since > t->counters.longest_hold_us)
-      t->counters.longest_hold_us = now - held_since;
-    write_frame(t,tx,slot,first,DMR_LABEL_UNCONFIRMED_AT_CAP,true);
-    held_pop(&tx->held,1);
-    if(tx->held_through_confirmed > 0)
-      tx->held_through_confirmed--;
+    write_frame(t,tx,slot,record,label);
   }
 }
 
@@ -1013,15 +802,25 @@ static void on_voice(struct dmr_call_tracker *t,uint8_t slot,struct dmr_burst co
   }
   if(tx->active && cfg->voice_gap_us != 0 && confirmed && now > tx->last_confirmed_us
      && now - tx->last_confirmed_us > cfg->voice_gap_us)
-    after_gap(t,tx,slot,now,now - tx->last_activity_us <= cfg->voice_gap_us);
+    after_gap(t,tx);
 
-  // A new talker: an LC of this voice names another call than the one established
+  // A new talker: an LC of this voice names another call than the one established. The new
+  // transmission keeps the words where they were
   struct dmr_voice_identity embedded_id;
   bool const has_embedded_id = m->has_embedded_lc && identity_of(t,&m->embedded_lc.lc,&embedded_id);
   if(tx->active && tx->identity_known && has_embedded_id && embedded_id.address_bits == tx->id.address_bits
      && !same_call(&tx->id,&embedded_id)){
+    bool const lc_encrypted = tx->lc_encrypted,parameters_encrypted = tx->parameters_encrypted;
+    uint8_t const algorithm = tx->algorithm,key_id = tx->key_id;
+    uint32_t const mi = tx->mi;
     end(t,slot,DMR_END_NEW_TALKER,now,END_BOUNDARY);
     tx = start(t,slot,DMR_START_NEW_TALKER,now);
+    tx->lc_encrypted = lc_encrypted;
+    tx->parameters_encrypted = parameters_encrypted;
+    tx->algorithm = algorithm;
+    tx->key_id = key_id;
+    tx->mi = mi;
+    update_state(t,tx,BY_CARRIED);
   }
   if(!tx->active)
     tx = start_with_voice(t,slot,DMR_START_LATE_ENTRY,now);
@@ -1039,76 +838,37 @@ static void on_voice(struct dmr_call_tracker *t,uint8_t slot,struct dmr_burst co
     tx->position_us = now;
   }
 
-  // What this burst says, the encrypted side first: it applies to the burst's own frames too
+  // What this burst says: it applies to the burst's own frames too
   if(b->kind != DMR_KIND_VOICE_A && b->emb_valid){
-    if(b->emb_pi){
-      tx->emb_pi1_bursts++;
-      enum dmr_emb_pi_mode const mode = dmr_call_effective_emb_pi_mode(cfg);
-      bool const repeated = cfg->emb_pi_repeat_counts && tx->last_emb_pi;
-      bool const clean = cfg->emb_pi_clean_voice_max_fec >= 0 && fec <= cfg->emb_pi_clean_voice_max_fec;
-      if(b->emb_errors > cfg->emb_pi_max_errors && !repeated && !clean){
-        c->emb_pi_over_errors++; // a corrected EMB: its PI bit says nothing
-      } else if(mode == DMR_EMB_PI_IGNORE){
-        c->emb_pi_ignored++;
-      } else if(mode == DMR_EMB_PI_UNLESS_LC_CLEAR && tx->state == DMR_ENC_CLEAR){
-        c->emb_pi_with_clear_lc++;
-      } else if(weak_waits(t,tx,tx->pending_pi)){
-        tx->pending_pi = true; // the first word: the next PI = 1 says encrypted
-        c->weak_pending++;
-      } else {
-        say_encrypted(t,tx,slot,now,false,BY_EMB_PI);
-      }
-    } else {
+    if(b->emb_pi)
+      tx->emb_pi1_bursts++; // counted only: not a privacy flag
+    else
       tx->emb_pi0_bursts++;
-      if(tx->pending_pi && cfg->weak_forgotten_by_clear_word){ // a clear word of the same field
-        tx->pending_pi = false;
-        c->weak_forgotten_by_word++;
-      }
-    }
-    tx->last_emb_pi = b->emb_pi;
   }
   if(m->has_single_burst && m->single_burst.kind == DMR_SB_ENCRYPTION_PARAMETERS){
     struct dmr_single_burst const *f = &m->single_burst;
-    bool const agrees = tx->pending_f && tx->pending_f_algorithm == f->algorithm_id && tx->pending_f_key == f->key_id;
-    if(weak_waits(t,tx,agrees)){
-      // The first word, or one that does not agree with the one waiting: it waits in its place
-      tx->pending_f = true;
-      tx->pending_f_algorithm = f->algorithm_id;
-      tx->pending_f_key = f->key_id;
-      c->weak_pending++;
-    } else {
-      if(tx->algorithm == 0 && tx->key_id == 0){ // a PI header's parameters stand
-        tx->algorithm = f->algorithm_id;
-        tx->key_id = f->key_id;
-      }
-      say_encrypted(t,tx,slot,now,f->corrected == 0,BY_BURST_F);
+    if(tx->algorithm == 0 && tx->key_id == 0){ // a PI header's parameters stand
+      tx->algorithm = f->algorithm_id;
+      tx->key_id = f->key_id;
     }
-  } else if(m->has_single_burst && m->single_burst.kind != DMR_SB_UNKNOWN && tx->pending_f
-            && cfg->weak_forgotten_by_clear_word){
-    tx->pending_f = false; // burst F decoded as another message: a clear word of the same field
-    c->weak_forgotten_by_word++;
+    parameters_say(t,tx,true,BY_BURST_F);
+  } else if(m->has_single_burst && m->single_burst.kind != DMR_SB_UNKNOWN){
+    parameters_say(t,tx,false,BY_BURST_F); // burst F decoded as another message: no parameters
   }
   if(m->has_embedded_lc){
     // The LC's four fragments came in the slot's last four voice bursts: all this transmission's,
     // and after its last gap, when it has had four since
-    enum clear_evidence evidence = EVIDENCE_NONE;
-    if(tx->bursts_since_gap >= 4 && !m->embedded_lc.learned_mask) // a learned residual never says clear
-      evidence = m->embedded_lc.corrected <= cfg->embedded_clear_max_corrected ? EVIDENCE_ALONE : EVIDENCE_REPEATED;
-    if(m->embedded_lc.learned_mask)
+    bool const learned = m->embedded_lc.learned_mask;
+    if(learned)
       c->learned_mask_lcs++;
-    apply_lc(t,tx,slot,now,&m->embedded_lc.lc,evidence,false,m->embedded_lc.learned_mask);
+    apply_lc(t,tx,slot,&m->embedded_lc.lc,tx->bursts_since_gap >= 4 && !learned,learned);
   }
   if(m->has_hidden_iv && tx->state == DMR_ENC_ENCRYPTED && tx->confirmed){
     tx->mi = m->hidden_iv.iv;
     c->hidden_ivs_used++;
   }
 
-  // Frames of unconfirmed bursts that waited in a clear transmission (or for a weak word this burst's
-  // clear word forgot): this confirmed burst follows them without a gap and said nothing encrypted
-  if(confirmed && tx->state == DMR_ENC_CLEAR && tx->held.count > 0 && !holding_for_weak(t,tx))
-    release_all(t,tx,slot,DMR_LABEL_CLEAR,now);
-
-  add_frames(t,tx,slot,b,&m->voice,now,confirmed);
+  add_frames(t,tx,slot,b,&m->voice,fec);
 }
 
 // ---------------- The API ----------------
@@ -1127,14 +887,7 @@ int dmr_call_init(struct dmr_call_tracker *t,struct dmr_call_config const *confi
 }
 
 void dmr_call_free(struct dmr_call_tracker *t){
-  for(uint8_t slot=0; slot < SLOTS; slot++){
-    struct dmr_transmission *tx = &t->slots[slot];
-    if(tx->active && tx->held.count > 0)
-      release_all(t,tx,slot,DMR_LABEL_UNCONFIRMED_AT_END,tx->last_activity_us);
-    free(tx->held.rec);
-    tx->held.rec = NULL;
-    tx->held.capacity = tx->held.count = tx->held.head = 0;
-  }
+  (void)t; // nothing is allocated
 }
 
 void dmr_call_set_voice_sink(struct dmr_call_tracker *t,dmr_voice_fn fn,void *arg){
@@ -1195,10 +948,7 @@ bool dmr_call_active(struct dmr_call_tracker const *t,uint8_t slot){
   return slot < SLOTS && t->slots[slot].active;
 }
 enum dmr_encryption dmr_call_encryption(struct dmr_call_tracker const *t,uint8_t slot){
-  return slot < SLOTS ? t->slots[slot].state : DMR_ENC_UNKNOWN;
-}
-size_t dmr_call_held_frames(struct dmr_call_tracker const *t,uint8_t slot){
-  return slot < SLOTS ? t->slots[slot].held.count : 0;
+  return slot < SLOTS && t->slots[slot].active ? t->slots[slot].state : DMR_ENC_UNKNOWN;
 }
 
 // ---------------- The summary line ----------------
@@ -1227,27 +977,22 @@ int dmr_call_summary(char *buf,size_t size,char const *channel_id,struct dmr_cal
   for(int i=0; i < DMR_CALL_ENDS; i++)
     put(buf,size,&len," %s=%llu",dmr_call_end_name((enum dmr_call_end)i),N(c->ended[i]));
   put(buf,size,&len," | no_voice=%llu never_identified=%llu not_recorded=%llu"
-      " | frames clear=%llu encrypted=%llu unconfirmed=%llu skipped=%llu"
-      " | held=%llu released clear=%llu encrypted=%llu at_end=%llu at_gap=%llu at_cap=%llu longest_ms=%llu",
+      " | frames clear=%llu encrypted=%llu unconfirmed=%llu skipped=%llu noisy_unidentified_bursts=%llu",
       N(c->without_voice),N(c->never_identified),N(c->not_recorded),N(c->frames_clear),N(c->frames_encrypted),
-      N(c->frames_unconfirmed),N(c->frames_not_recorded),N(c->frames_held),N(c->held_released_clear),
-      N(c->held_released_encrypted),N(c->held_unconfirmed_at_end),N(c->held_unconfirmed_at_gap),
-      N(c->held_unconfirmed_at_cap),N(c->longest_hold_us / 1000));
-  put(buf,size,&len," | clear_by header=%llu lc=%llu repeated_lc=%llu refused header=%llu lc=%llu gaps=%llu (unconfirmed=%llu)"
-      " clear_lost_at_gap=%llu unconfirmed_bursts=%llu (clean_voice=%llu) off_grid=%llu"
-      " | encrypted_by lc=%llu pi_header=%llu burst_f=%llu emb_pi=%llu carried=%llu"
-      " | weak_waited=%llu forgotten word=%llu lc=%llu never_confirmed=%llu"
-      " | clear_then_encrypted=%llu contradictions=%llu terminator_encrypted=%llu",
-      N(c->clear_by_header),N(c->clear_by_embedded_lc),N(c->clear_by_repeated_lc),N(c->clear_refused_header),
-      N(c->clear_refused_embedded),N(c->gaps),N(c->gaps_unconfirmed),N(c->clear_lost_at_gap),N(c->unconfirmed_voice_bursts),
+      N(c->frames_unconfirmed),N(c->frames_not_recorded),N(c->unidentified_noisy_bursts));
+  put(buf,size,&len," | lc clear=%llu encrypted=%llu clear_ignored learned=%llu gap=%llu | parameters encrypted=%llu clear=%llu"
+      " | gaps=%llu unconfirmed_bursts=%llu (clean_voice=%llu) off_grid=%llu"
+      " | encrypted_by lc=%llu pi_header=%llu burst_f=%llu carried=%llu"
+      " | clear_then_encrypted=%llu encrypted_then_clear=%llu terminator_encrypted=%llu",
+      N(c->lc_clear),N(c->lc_encrypted),N(c->learned_mask_clear_ignored),N(c->lc_span_gap_ignored),
+      N(c->parameters_encrypted),N(c->parameters_clear),N(c->gaps),N(c->unconfirmed_voice_bursts),
       N(c->unconfirmed_clean_voice),N(c->off_grid),N(c->encrypted_by_lc),N(c->encrypted_by_pi_header),
-      N(c->encrypted_by_burst_f),N(c->encrypted_by_emb_pi),N(c->encrypted_carried),N(c->weak_pending),
-      N(c->weak_forgotten_by_word),N(c->weak_forgotten_by_lc),N(c->weak_never_confirmed),N(c->clear_then_encrypted),
-      N(c->contradictions),N(c->terminator_says_encrypted));
+      N(c->encrypted_by_burst_f),N(c->encrypted_carried),N(c->clear_then_encrypted),N(c->encrypted_then_clear),
+      N(c->terminator_says_encrypted));
   put(buf,size,&len," | emb_pi=1 bursts: lc_encrypted=%llu lc_clear=%llu no_lc=%llu; emb_pi=0 bursts: lc_encrypted=%llu"
-      " lc_clear=%llu no_lc=%llu | emb_pi=1 not counted: corrected_emb=%llu ignored=%llu clear_lc=%llu",
+      " lc_clear=%llu no_lc=%llu",
       N(c->emb_pi[1][2]),N(c->emb_pi[1][1]),N(c->emb_pi[1][0]),N(c->emb_pi[0][2]),N(c->emb_pi[0][1]),
-      N(c->emb_pi[0][0]),N(c->emb_pi_over_errors),N(c->emb_pi_ignored),N(c->emb_pi_with_clear_lc));
+      N(c->emb_pi[0][0]));
 #undef N
   return (int)len;
 }

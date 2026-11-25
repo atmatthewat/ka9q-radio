@@ -46,8 +46,8 @@
 // keeps the repeater the last frame came from, so the stream does not hop for nothing. A frame no
 // source has supplied by then is lost: dmraudio fills it (the vocoder repeats, then mutes), and a copy
 // that comes later is dropped. Delay (120 ms) covers the spread between repeaters and the blocks the
-// channel threads work in; frames a tracker held until a later word said clear may come later still,
-// and are then played at once if their frame is not yet past, or dropped.
+// channel threads work in; a frame later still is played at once if its frame is not yet past, or
+// dropped.
 //
 // Only clear frames come in (dmrd passes nothing else), so voting never lets a frame through that its
 // own repeater's tracker had not labelled clear.

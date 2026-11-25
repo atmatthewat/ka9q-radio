@@ -57,8 +57,7 @@
 // burst whose slot type names another colour code than the one the sink requires is another system
 // on the frequency, and reaches the tracker as a data burst that did not decode, which ends a
 // transmission in progress on its slot and can neither start one nor say clear; at the end the sink
-// is reset (its held bursts come out), the tracker flushed (held frames go out unconfirmed), and the
-// message state dropped.
+// is reset (its held bursts come out), the tracker flushed, and the message state dropped.
 //
 // What leaves. Each voice record the tracker writes becomes one struct dmr_chan_frame with its label:
 // clear only when the tracker labelled it clear (no encrypted flag and the clear algorithm), else
@@ -358,8 +357,8 @@ static void on_voice(void *arg,char const *system,char const *site,struct dmr_vo
 
 static char const *label_name(struct dmr_call_info const *info){
   switch(info->encryption){
-  case DMR_ENC_CLEAR:
-    return "clear";
+  case DMR_ENC_CLEAR: // frames that only looked like noise, and none clear: say so
+    return info->frames_clear == 0 && info->frames_unconfirmed > 0 ? "unconfirmed" : "clear";
   case DMR_ENC_ENCRYPTED:
     return info->encryption_confirmed ? "encrypted" : "encrypted (unconfirmed)";
   default:
