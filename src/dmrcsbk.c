@@ -64,7 +64,7 @@
 //     are kept raw, and the sixth is available from them.
 //   - Connect Plus data grants say they are data. sdrtrunk's ignore_data_calls misses them: the opcode
 //     is not in its data grant set (Opcode.java:170-172).
-//   Checked against TS 102 361-2 V2.5.1 and -4 V1.12.1 (the reference decoder's audit of 2026-11-23):
+//   Checked against TS 102 361-2 V2.5.1 and -4 V1.12.1 (an audit of 2026-11-23):
 //   - Data grants: HI_RATE is bit 29; bit 31 is offset timing (sdrtrunk reads 31 as "high rate").
 //     TV_GRANT and BTV_GRANT carry Late_Entry at bit 29 (tables 7.9-7.15).
 //   - Ann_WD_TSCC: AW_FLAG 0 = add the channel, 1 = withdraw it (table 7.69; sdrtrunk inverts it).
