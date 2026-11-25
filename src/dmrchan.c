@@ -230,6 +230,8 @@ static void on_data_packet(void *arg,struct dmr_data_packet const *p){
     snprintf(text,sizeof text,"slot %u %s",(unsigned)p->slot,line);
     c->h.log(c->h.arg,when,text);
   }
+  if(c->h.packet != NULL)
+    c->h.packet(c->h.arg,p);
 }
 static void on_data_header(void *arg,struct dmr_data_header const *hd){
   struct dmr_chan * const c = arg;
@@ -242,12 +244,14 @@ static void on_data_header(void *arg,struct dmr_data_header const *hd){
 }
 static void on_data_usbd(void *arg,struct dmr_usbd const *u){
   struct dmr_chan * const c = arg;
-  if(c->h.data == NULL)
-    return;
-  char line[DMR_DATA_DESCRIBE_MAX],text[DMR_DATA_DESCRIBE_MAX + 16];
-  dmr_usbd_describe(line,sizeof line,u);
-  snprintf(text,sizeof text,"slot %u DATA %s",(unsigned)u->slot,line);
-  c->h.data(c->h.arg,(int64_t)u->timestamp_us * 1000,text);
+  if(c->h.data != NULL){
+    char line[DMR_DATA_DESCRIBE_MAX],text[DMR_DATA_DESCRIBE_MAX + 16];
+    dmr_usbd_describe(line,sizeof line,u);
+    snprintf(text,sizeof text,"slot %u DATA %s",(unsigned)u->slot,line);
+    c->h.data(c->h.arg,(int64_t)u->timestamp_us * 1000,text);
+  }
+  if(c->h.single_block != NULL)
+    c->h.single_block(c->h.arg,u);
 }
 
 // A data burst of another colour code than the one the sink requires

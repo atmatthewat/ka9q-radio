@@ -37,6 +37,7 @@
 #include "dmrsite.h"
 #include "dmraudio.h"
 #include "dmrvote.h"
+#include "dmrpacket.h"
 #include "chanctl.h"
 
 // Theory of operation
@@ -199,6 +200,7 @@ static int64_t Timeout = 20;
 static int Update = 10;
 static char const *Output;            // speech output group (--pcm-out), NULL for none
 static char const *Name;              // service name the speech is advertised under; NULL: not advertised
+static char const *Packet_output;     // packet stream group (--data-out), NULL for none
 static int Mcast_ttl = DEFAULT_TTL;
 static int IP_tos = DEFAULT_IP_TOS;
 static int Color_code = -1;           // -c: pinned 0-15, -1 tracked, -2 any
@@ -253,6 +255,7 @@ static pthread_mutex_t Output_mutex = PTHREAD_MUTEX_INITIALIZER;
 static volatile sig_atomic_t Terminate;
 static volatile sig_atomic_t Signal;
 static struct p25_audio_group *Audio_group;
+static struct p25_audio_group *Packet_group; // NULL without --data-out
 static struct dmr_voter *Voter;       // NULL without --pcm-out or a vocoder
 
 static void closedown(int);
@@ -282,6 +285,8 @@ static void voice_frame(void *arg,struct dmr_chan_frame const *f);
 static void voice_event(void *arg,struct dmr_chan_event const *e);
 static void voice_log(void *arg,int64_t when,char const *text);
 static void voice_notice(void *arg,int64_t when,char const *text);
+static void data_packet(void *arg,struct dmr_data_packet const *p);
+static void data_single_block(void *arg,struct dmr_usbd const *u);
 static void status_line(struct decoder const *dp);
 static void vote_end(void *arg,struct dmr_vote_result const *r);
 static void control_line(void *arg,struct dmr_control_line const *line);
@@ -320,6 +325,7 @@ static struct option Options[] = {
   {"source", required_argument, NULL, 'o'},
   {"tos", required_argument, NULL, 'p'},
   {"pcm-out", required_argument, NULL, 'R'},
+  {"data-out", required_argument, NULL, 'D'},
   {"ssrc", required_argument, NULL, 'S'},
   {"timeout", required_argument, NULL, 't'},
   {"ttl", required_argument, NULL, 'T'},
@@ -329,10 +335,10 @@ static struct option Options[] = {
   {"system-type", required_argument, NULL, 'y'},
   {NULL, 0, NULL, 0},
 };
-static char const Optstring[] = "A:c:f:g:H:I:l:Lm:MnN:o:p:R:s:S:t:T:u:vVx:y:";
+static char const Optstring[] = "A:c:D:f:g:H:I:l:Lm:MnN:o:p:R:s:S:t:T:u:vVx:y:";
 
 static void usage(void){
-  fprintf(stderr,"Usage: %s [-v|--verbose] [-V|--version] [-l|--locale locale] [-A|--iface interface] [-o|--source <source-name-or-address>] [-S|--ssrc ssrc] [-t|--timeout seconds] [-u|--update seconds] [-c|--color-code n|any|track] [-M|--mobile] [-s|--stations bs|ms|direct|all|auto] [-L|--learn-crc-masks] [-y|--system-type conventional|capacity_plus|...] [-f|--sites sites_file] [-n|--no-follow] [-H|--hold seconds] [-g|--talkgroups list] [-x|--exclude list] [-m|--max-calls n] [-R|--pcm-out audio_mcast_address] [-N|--name service_name] [-T|--ttl ttl] [-p|--tos tos] [-I|--input] iq_mcast_address [iq_mcast_address ...]\n",App_path);
+  fprintf(stderr,"Usage: %s [-v|--verbose] [-V|--version] [-l|--locale locale] [-A|--iface interface] [-o|--source <source-name-or-address>] [-S|--ssrc ssrc] [-t|--timeout seconds] [-u|--update seconds] [-c|--color-code n|any|track] [-M|--mobile] [-s|--stations bs|ms|direct|all|auto] [-L|--learn-crc-masks] [-y|--system-type conventional|capacity_plus|...] [-f|--sites sites_file] [-n|--no-follow] [-H|--hold seconds] [-g|--talkgroups list] [-x|--exclude list] [-m|--max-calls n] [-R|--pcm-out audio_mcast_address] [-D|--data-out packet_mcast_address] [-N|--name service_name] [-T|--ttl ttl] [-p|--tos tos] [-I|--input] iq_mcast_address [iq_mcast_address ...]\n",App_path);
 }
 
 int main(int argc,char *argv[]){
@@ -430,6 +436,9 @@ int main(int argc,char *argv[]){
     case 'R':
       Output = optarg;
       break;
+    case 'D':
+      Packet_output = optarg;
+      break;
     case 'S':
       {
         char *ptr = NULL;
@@ -518,6 +527,12 @@ int main(int argc,char *argv[]){
     if(Verbose)
       fprintf(stderr,"%s: voice to %s (%s)\n",App_path,Output,p25_vocoder_name(P25_CODEC_AMBE2));
   }
+  if(Packet_output != NULL){
+    if((Packet_group = p25_datagrams_open(Packet_output,Default_mcast_iface,Mcast_ttl,IP_tos,DMR_PACKET_PT)) == NULL)
+      exit(EX_TEMPFAIL);
+    if(Verbose)
+      fprintf(stderr,"%s: packet data to %s\n",App_path,Packet_output);
+  }
   signal(SIGINT,closedown);
   signal(SIGQUIT,closedown);
   signal(SIGTERM,closedown);
@@ -533,6 +548,7 @@ int main(int argc,char *argv[]){
     chanctl_destroy(Radios[i].ctl); // the channels followed are released
   dmr_voter_destroy(Voter);
   p25_audio_close(Audio_group);
+  p25_audio_close(Packet_group);
   if(Verbose)
     fprintf(stderr,"%s: caught signal %d: %s\n",App_path,(int)Signal,strsignal(Signal));
   exit((Signal == SIGTERM || Signal == SIGINT) ? EX_OK : EX_SOFTWARE);
@@ -955,6 +971,8 @@ static void *decode_task(void *arg){
     .log = voice_log,
     .notice = voice_notice,
     .data = voice_notice, // packet data lines: always written
+    .packet = Packet_group != NULL ? data_packet : NULL,
+    .single_block = Packet_group != NULL ? data_single_block : NULL,
     .arg = &dec,
   };
   snprintf(dec.channel_id,sizeof dec.channel_id,"%u",sp->ssrc);
@@ -1801,6 +1819,23 @@ static void voice_log(void *arg,int64_t when,char const *text){
   if(Verbose)
     decoder_event(dp,when,"%s",text);
 }
+// The packet stream (--data-out): each packet that ended, and each unified single block, as one
+// datagram (dmrpacket.h) on the channel's SSRC; the RTP timestamp is the first burst's time in ms
+static void send_packet_datagram(struct decoder const *dp,uint8_t const *buf,size_t len,uint64_t when_us){
+  if(len > 0)
+    p25_datagram_send(Packet_group,dp->sp->ssrc,(uint32_t)(when_us / 1000),false,buf,len);
+}
+static void data_packet(void *arg,struct dmr_data_packet const *p){
+  struct decoder const * const dp = arg;
+  static _Thread_local uint8_t buf[DMR_PACKET_MAX];
+  send_packet_datagram(dp,buf,dmr_packet_encode(buf,sizeof buf,p,(uint32_t)llround(dp->frequency)),p->first_timestamp_us);
+}
+static void data_single_block(void *arg,struct dmr_usbd const *u){
+  struct decoder const * const dp = arg;
+  uint8_t buf[DMR_PACKET_HEADER + 16];
+  send_packet_datagram(dp,buf,dmr_packet_encode_single_block(buf,sizeof buf,u,(uint32_t)llround(dp->frequency)),u->timestamp_us);
+}
+
 static void voice_notice(void *arg,int64_t when,char const *text){
   decoder_event(arg,when,"%s",text);
 }

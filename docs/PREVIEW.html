@@ -2174,10 +2174,17 @@ freq = &quot;857m98125&quot;</pre>
       Needs a dmrd built with mbelib.</dd>
   <dt id="N"><a class="permalink" href="#N"><b>-N name, --name name</b></a></dt>
   <dd>Name the voice output is advertised under. Default: not advertised.</dd>
+  <dt id="D"><a class="permalink" href="#D"><b>-D group, --data-out
+    group</b></a></dt>
+  <dd>Send every packet data packet, with the octets it carried, and every
+      unified single block to this multicast group: one RTP datagram each,
+      payload type 98, a 48-octet header and the data (layout in dmrd.md).
+      Without it packet data is only logged.</dd>
   <dt id="T"><a class="permalink" href="#T"><b>-T ttl, --ttl ttl</b></a></dt>
-  <dd>Multicast TTL of the voice output. Default 0: this host only.</dd>
+  <dd>Multicast TTL of the voice and packet output. Default 0: this host
+    only.</dd>
   <dt id="p"><a class="permalink" href="#p"><b>-p tos, --tos tos</b></a></dt>
-  <dd>IP type of service of the voice output. Default 184 (expedited
+  <dd>IP type of service of the voice and packet output. Default 184 (expedited
       forwarding).</dd>
   <dt id="f"><a class="permalink" href="#f"><b>-f file, --sites
     file</b></a></dt>
@@ -2318,7 +2325,8 @@ lcn = &quot;1 2&quot;</pre>
     counted. Each packet data packet gets a line naming its application (IP and
     UDP, LRRP location, ARS registration, TMS text, Hytera messages, short data)
     and its fields, never a message's text, a position or a password; at -v its
-    data header and its assembly and CRC evidence get lines too.</p>
+    data header and its assembly and CRC evidence get lines too. The packet
+    stream (-D) carries the contents.</p>
 <p class="Pp">The voice stream (-R) is 8 kHz mono 16-bit audio, one RTP packet
     per 20 ms, with status packets as radiod sends them. A group call's stream
     has the talkgroup as its SSRC, whichever repeater carries it; any other

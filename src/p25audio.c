@@ -403,6 +403,14 @@ struct p25_audio_group *p25_frames_open(char const *target,char const *iface,int
   return g;
 }
 
+struct p25_audio_group *p25_datagrams_open(char const *target,char const *iface,int ttl,int tos,uint8_t pt){
+  struct p25_audio_group * const g = open_group(target,iface,ttl,tos,NULL);
+  if(g == NULL)
+    return NULL;
+  g->pt = pt;
+  return g;
+}
+
 void p25_audio_close(struct p25_audio_group *g){
   if(g == NULL)
     return;
@@ -444,6 +452,30 @@ static void put_seq(struct p25_audio_group *g,uint32_t ssrc,uint16_t seq){
   g->seqs[slot].seq = seq;
   g->seqs[slot].used = true;
   pthread_mutex_unlock(&g->lock);
+}
+
+void p25_datagram_send(struct p25_audio_group *g,uint32_t ssrc,uint32_t timestamp,bool marker,uint8_t const *payload,size_t len){
+  if(g == NULL)
+    return;
+  uint8_t packet[RTP_MIN_SIZE + 4096];
+  if(len > sizeof packet - RTP_MIN_SIZE)
+    return;
+  uint16_t const seq = get_seq(g,ssrc);
+  struct rtp_header rtp = {
+    .version = RTP_VERS,
+    .type = g->pt,
+    .seq = seq,
+    .timestamp = timestamp,
+    .ssrc = ssrc,
+    .marker = marker,
+  };
+  uint8_t *dp = hton_rtp(packet,&rtp);
+  memcpy(dp,payload,len);
+  dp += len;
+  put_seq(g,ssrc,(uint16_t)(seq + 1));
+  if(sendto(g->fd,packet,dp - packet,0,(struct sockaddr const *)&g->data,socklen(&g->data)) < 0
+     && !atomic_flag_test_and_set(&g->send_error_logged))
+    fprintf(stderr,"p25 audio: datagram send failed: %s (reported once)\n",strerror(errno));
 }
 
 

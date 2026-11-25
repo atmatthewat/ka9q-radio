@@ -12,6 +12,8 @@
 
 struct dmr_site;
 struct dmr_control_log;
+struct dmr_data_packet;
+struct dmr_usbd;
 
 // What a voice frame's label says. Only DMR_CHAN_CLEAR may ever be heard
 enum dmr_chan_label { DMR_CHAN_CLEAR = 0, DMR_CHAN_ENCRYPTED, DMR_CHAN_UNCONFIRMED };
@@ -50,6 +52,10 @@ struct dmr_chan_handlers {
   void (*log)(void *arg,int64_t when,char const *text); // other decoded messages worth a line (-v)
   void (*notice)(void *arg,int64_t when,char const *text); // a line always worth writing (a CRC mask learned)
   void (*data)(void *arg,int64_t when,char const *text); // a packet data line (a packet, a short data burst)
+  // Every packet that ended, complete or not, with its octets (dmrdata.h; valid only during the call),
+  // and every unified single block: for a packet stream. Either may be NULL
+  void (*packet)(void *arg,struct dmr_data_packet const *p);
+  void (*single_block)(void *arg,struct dmr_usbd const *u);
   void *arg;
 };
 

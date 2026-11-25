@@ -70,6 +70,12 @@ struct p25_audio_group *p25_audio_open(char const *target,char const *iface,int 
 // The same for vocoder frames. 'encrypted': also send the frames of voice units known to be
 // encrypted, flagged so (never decoded here)
 struct p25_audio_group *p25_frames_open(char const *target,char const *iface,int ttl,int tos,char const *service_name,bool encrypted);
+// The same for datagrams of another kind (dmrd's packet stream): RTP to port 5004 with payload type
+// pt, no status, not advertised. Send them with p25_datagram_send()
+struct p25_audio_group *p25_datagrams_open(char const *target,char const *iface,int ttl,int tos,uint8_t pt);
+// One RTP packet on stream ssrc, numbered after the stream's last. Safe from several threads, each
+// sending on streams of its own
+void p25_datagram_send(struct p25_audio_group *g,uint32_t ssrc,uint32_t timestamp,bool marker,uint8_t const *payload,size_t len);
 void p25_audio_close(struct p25_audio_group *g);
 
 struct p25_audio_stats {

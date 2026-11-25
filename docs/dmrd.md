@@ -46,8 +46,9 @@ dmrd [options] dmr-iq.local [more groups ...]
 - **-I**, **--input** *group*: add an input group (groups may also be given without -I)
 - **-R**, **--pcm-out** *group*: send voice to this multicast group (e.g. **dmr-pcm.local**); without it, no audio
 - **-N**, **--name** *name*: name the voice output is advertised under (default: not advertised)
-- **-T**, **--ttl** *ttl*: multicast TTL of the voice output (default 0: this host only)
-- **-p**, **--tos** *tos*: IP type of service of the voice output (default 184, expedited forwarding)
+- **-D**, **--data-out** *group*: send each packet data packet, with what it carries, to this multicast group (see **Packet stream** below); without it, packet data is only logged
+- **-T**, **--ttl** *ttl*: multicast TTL of the voice and packet output (default 0: this host only)
+- **-p**, **--tos** *tos*: IP type of service of the voice and packet output (default 184, expedited forwarding)
 - **-c**, **--color-code** *n*|**any**|**track**: the colour code to decode, 0-15; **track** (the default) takes each channel's from its first strong sync and follows it; **any** decodes every one
 - **-M**, **--mobile**: also look for mobile station and direct mode syncs (simplex, talkaround), not only repeater outputs (**-s all**)
 - **-s**, **--stations** **bs**|**ms**|**direct**|**all**|**auto**: which stations' syncs to look for: **bs** (the default) a repeater output, **ms** a repeater input or simplex, **direct** TDMA direct mode, **all** every family, **auto** every family until one family's synced bursts lead each other's by more than 10, then that one only (logged)
@@ -97,6 +98,38 @@ Each packet, once its last block has come (or when the carrier has been quiet fo
 ... ssrc 453425 453.425000 MHz slot 1 DATA [DMR data] slot=1 motorola-tms src=7002 dst=5001 udp 4007->4007: TMS text chars=19 seq=3 len=48
 ```
 The line names the application and its fields; it never shows a message's text, a position's coordinates or a password. A packet that is not complete (a block missing, a CRC failed) says INCOMPLETE. At **-v** each data header gets a line too, and each packet a second one with its assembly and CRC evidence (blocks received and good, retries, the CRC-32 as received and the readings that would make it pass). Encrypted packets are marked and left as they are. The **-v** status lines count the packets. On generated signals, a confirmed rate 1/2 packet came through whole at an Es/N0 of 9 dB, a rate 3/4 one at 12 dB, and a rate 1 one (which has no error correction) only above that.
+
+### Packet stream
+
+With **-D** *group*, every packet data packet that ends (complete or not) and every unified single block goes to *group* as one RTP datagram: a 48-octet header and the octets the packet carried, the message text, position or whatever else it holds included. That is the way to hand packet data to a program of your own (a map of LRRP positions, a log of text messages, a gateway): the log lines name a packet's contents but never show them. Give the stream a group of its own: nothing else in ka9q-radio reads it. **-T** and **-p** apply to it as to speech; at TTL 0 (the default) it is sent on the loopback interface only, so a reader on the same host joins the group there.
+
+Datagrams go to port 5004 of the group, payload type **98**, one stream (SSRC) per channel: the channel's SSRC. The RTP timestamp is the packet's time in milliseconds, modulo 2^32; the sequence number goes up by one per datagram of the stream. There are no status packets: the header says everything. All numbers are big-endian:
+
+| Octet | Field |
+|---|---|
+| 0 | Version, 1 |
+| 1 | Protocol: 1 DMR |
+| 2 | Record: 1 a packet (data header(s) and blocks, short data, UDT), 2 a unified single block |
+| 3 | Flags: 0x01 complete (every block arrived and every check passed), 0x02 encrypted (the octets are ciphertext), 0x04 the destination is a talkgroup, 0x08 confirmed delivery, 0x10 trimmed (pad and packet CRC removed: the octets are the user data), 0x20 the packet CRC could be checked (every block arrived), 0x40 it passed, 0x80 a retransmission of the previous packet |
+| 4 | Slot: 1 or 2, 0 not known |
+| 5 | Reserved, 0 |
+| 6-7 | Colour code |
+| 8 | Format. A packet: its data header, 1 unconfirmed, 2 confirmed, 3 response, 4 defined short data, 5 raw short data, 6 status / precoded short data, 7 UDT, 8 another proprietary header, 9 Motorola encryption, 10 Motorola MNIS, 11 Hytera encryption. A single block: its service type |
+| 9 | SAP, the data header's service access point: 0 UDT, 1 Motorola MNIS, 2 and 3 compressed TCP/IP and UDP/IP, 4 IP, 5 ARP, 9 proprietary, 10 short data |
+| 10 | What the packet carries, as dmrd classified it: 0x00 not known, 0x01 encrypted; 0x10 Motorola LRRP location, 0x11 Hytera location, 0x12 UDT location; 0x20 Motorola ARS registration, 0x21 Hytera RRS; 0x30 Motorola TMS text, 0x31 Hytera SMS, 0x32 short data text, 0x33 UDT text; 0x40-0x47 other vendor traffic (Motorola XCMP, telemetry, OTAP, battery management, job tickets, MNIS, Cellocator, other Hytera); 0x50 ICMP, 0x51 UDP on another port, 0x52 other IP, 0x53 compressed IP, 0x54 ARP; 0x60 short data, 0x61 UDT, 0x62 a response |
+| 11-13 | Blocks expected, received, and good (received and, for confirmed delivery, CRC-9 passed); 255 at most |
+| 14-17 | Source (24 bits); 0 in a single block |
+| 18-21 | Destination (24 bits); a single block's target |
+| 22-29 | Time of the first burst, nanoseconds since the GPS epoch (*radiod*'s clock) |
+| 30-33 | The channel's frequency, Hz |
+| 34 | Encryption: the encryption header's manufacturer ID (0 if none) |
+| 35 | Algorithm |
+| 36-37 | Key ID |
+| 38-46 | Message indicator, 72 bits: DMR's 32-bit IV in octets 43-46, the rest 0 |
+| 47 | Reserved, 0 |
+| 48- | The octets. Trimmed: the user data (for SAP 4, an IPv4 datagram). Otherwise (a block missing, a CRC failed, an encrypted packet) every block's data octets in place, pad and CRC included, missing blocks zero-filled. A single block: its 12 octets |
+
+A receiver should check the version and ignore datagrams it doesn't understand; a change to this layout gets a new version. The layout leaves room for other modes (the protocol octet, a 16-bit network code, a 72-bit message indicator), though only *dmrd* sends it so far. A packet can be up to 3,048 octets, more than one Ethernet frame, so a large one leaves as fragments if the stream goes beyond this host.
 
 ## Output
 

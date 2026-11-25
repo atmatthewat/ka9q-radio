@@ -42,11 +42,17 @@ Needs a dmrd built with mbelib.
 .B "\-N name, \-\-name name"
 Name the voice output is advertised under. Default: not advertised.
 .TP
+.B "\-D group, \-\-data\-out group"
+Send every packet data packet, with the octets it carried, and every unified
+single block to this multicast group: one RTP datagram each, payload type 98,
+a 48-octet header and the data (layout in dmrd.md). Without it packet data is
+only logged.
+.TP
 .B "\-T ttl, \-\-ttl ttl"
-Multicast TTL of the voice output. Default 0: this host only.
+Multicast TTL of the voice and packet output. Default 0: this host only.
 .TP
 .B "\-p tos, \-\-tos tos"
-IP type of service of the voice output. Default 184 (expedited forwarding).
+IP type of service of the voice and packet output. Default 184 (expedited forwarding).
 .TP
 .B "\-f file, \-\-sites file"
 The sites file: one section per site, naming its system, type, colour code,
@@ -189,7 +195,8 @@ message repeated many times is written once and then counted. Each packet data
 packet gets a line naming its application (IP and UDP, LRRP location, ARS
 registration, TMS text, Hytera messages, short data) and its fields, never a
 message's text, a position or a password; at \-v its data header and its
-assembly and CRC evidence get lines too.
+assembly and CRC evidence get lines too. The packet stream (\-D) carries the
+contents.
 .PP
 The voice stream (\-R) is 8 kHz mono 16-bit audio, one RTP packet per 20 ms,
 with status packets as radiod sends them. A group call's stream has the
