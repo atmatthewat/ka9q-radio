@@ -124,7 +124,7 @@ endif
 
 CFLAGS += $(DOPTS) $(ARCHOPTS) $(COPTS) $(INCLUDES)
 
-DAEMONS = aprs aprsfeed cwd p25d packetd radiod wait-for-lan
+DAEMONS = aprs aprsfeed cwd dmrd p25d packetd radiod wait-for-lan
 EXECS = ctcss control fft-gen jt-decoded metadump monitor opussend pcmrecord pcmsend powers tune wd-record
 
 ## library elements
@@ -132,7 +132,7 @@ LIBRADIO = parse.o timing.o misc.o multicast.o rtp.o config.o sched.o
 LIBDSP = kernels.o filter.o iir.o window.o osc.o pll.o sine.o sincospi.o sincospif.o
 LIBSTATUS = status.o decode_status.o
 # shared by the digital mode decoders
-LIBDIGITAL = dsync.o dfec.o rs63.o p25p1.o p25p1unit.o p25msg.o p25p1msg.o p25trunk.o p25p2.o p25p2unit.o p25p2mac.o p25alias.o
+LIBDIGITAL = dsync.o dfec.o rs63.o dmrfec.o dmrtypes.o dmrrx.o dmrsink.o dmrmsg.o dmrcall.o dmrcsbk.o dmrsite.o dmrdata.o dmrdataapp.o p25p1.o p25p1unit.o p25msg.o p25p1msg.o p25trunk.o p25p2.o p25p2unit.o p25p2mac.o p25alias.o
 
 # radiod uses a lot of unique objects. It should probably move to its own directory
 RADIOD_OBJECTS = main.o audio.o avahi.o modes.o fm.o wfm.o linear.o spectrum.o radio.o n0.o radio_status.o rtcp.o libdsp.a libstatus.a libradio.a
@@ -142,9 +142,9 @@ RADIOD_OBJECTS = main.o audio.o avahi.o modes.o fm.o wfm.o linear.o spectrum.o r
 # header-change rebuild dependencies even for optional drivers
 # (bladerf, fobos, hackrf, hydrasdr, sdrplay, ...) whose targets
 # are gated by ENABLE_*.
-CFILES = airspy.c airspyhf.c aprs.c aprsfeed.c attr.c audio.c avahi.c avahi_browse.c ax25.c bandplan.c bladerf.c chanctl.c config.c control.c cwd.c decimate.c decode_status.c dump.c ezusb.c fcd.c fft-gen.c filter.c fm.c fobos.c funcube.c hackrf.c hid-libusb.c hydrasdr.c iir.c jt-decoded.c linear.c main.c makesine.c metadump.c misc.c modes.c monitor.c monitor-data.c monitor-display.c monitor-repeater.c morse.c multicast.c n0.c opusd.c opussend.c osc.c packetd.c pcmcat.c pcmrecord.c pcmsend.c pcmspawn.c pll.c rv.c ctcss.c powers.c radio.c radio_status.c rdsd.c rtcp.c rtlsdr.c rtp.c rx888.c rx888_boot.c sdrplay.c set_xcvr.c setfilt.c show-pkt.c show-sig.c si5351.c sig_gen.c sine.c spectrum.c status.c stereod.c sincospi.c sincospif.c tune.c wd-record.c wfm.c window.c dfec.c dsync.c rs63.c p25audio.c p25d.c p25msg.c p25p1.c p25p1msg.c p25p1unit.c p25trunk.c p25p2.c p25p2unit.c p25p2mac.c p25alias.c
+CFILES = airspy.c airspyhf.c aprs.c aprsfeed.c attr.c audio.c avahi.c avahi_browse.c ax25.c bandplan.c bladerf.c chanctl.c config.c control.c cwd.c decimate.c decode_status.c dump.c ezusb.c fcd.c fft-gen.c filter.c fm.c fobos.c funcube.c hackrf.c hid-libusb.c hydrasdr.c iir.c jt-decoded.c linear.c main.c makesine.c metadump.c misc.c modes.c monitor.c monitor-data.c monitor-display.c monitor-repeater.c morse.c multicast.c n0.c opusd.c opussend.c osc.c packetd.c pcmcat.c pcmrecord.c pcmsend.c pcmspawn.c pll.c rv.c ctcss.c powers.c radio.c radio_status.c rdsd.c rtcp.c rtlsdr.c rtp.c rx888.c rx888_boot.c sdrplay.c set_xcvr.c setfilt.c show-pkt.c show-sig.c si5351.c sig_gen.c sine.c spectrum.c status.c stereod.c sincospi.c sincospif.c tune.c wd-record.c wfm.c window.c dfec.c dmrfec.c dmrtypes.c dmrrx.c dmrsink.c dmrmsg.c dmrcall.c dmrcsbk.c dmrsite.c dmrdata.c dmrdataapp.c dmrchan.c dmraudio.c dmrvote.c dmrd.c dsync.c rs63.c p25audio.c p25d.c p25msg.c p25p1.c p25p1msg.c p25p1unit.c p25trunk.c p25p2.c p25p2unit.c p25p2mac.c p25alias.c
 
-HFILES = attr.h ax25.h bandplan.h chanctl.h conf.h config.h decimate.h defaults.h ezusb.h fcd.h fcdhidcmd.h filter.h hidapi.h iir.h misc.h monitor.h morse.h multicast.h nco.h osc.h pll.h radio.h rational.h rx888.h si5351.h status.h timing.h config_paths.h dfec.h digital.h rs63.h p25p1.h p25audio.h p25msg.h p25p1msg.h p25p1unit.h p25trunk.h p25p2.h p25p2unit.h p25p2mac.h p25alias.h
+HFILES = attr.h ax25.h bandplan.h chanctl.h conf.h config.h decimate.h defaults.h ezusb.h fcd.h fcdhidcmd.h filter.h hidapi.h iir.h misc.h monitor.h morse.h multicast.h nco.h osc.h pll.h radio.h rational.h rx888.h si5351.h status.h timing.h config_paths.h dfec.h dmrfec.h dmr.h dmrrx.h dmrsink.h dmrmsg.h dmrcall.h dmrcsbk.h dmrsite.h dmrdata.h dmrdataapp.h dmrchan.h dmraudio.h dmrvote.h digital.h rs63.h p25p1.h p25audio.h p25msg.h p25p1msg.h p25p1unit.h p25trunk.h p25p2.h p25p2unit.h p25p2mac.h p25alias.h
 
 ## hardware plug-in module enables
 # The software signal generator front end is build by default. Others are added by the ENABLE_* options below
@@ -293,6 +293,9 @@ opussend: opussend.o libradio.a
 
 p25d: p25d.o p25audio.o chanctl.o avahi.o libdigital.a libdsp.a libstatus.a libradio.a
 	$(CC) $(LDFLAGS) -o $@ $^ $(MBELIB_LIBS) $(LDLIBS)
+
+dmrd: dmrd.o dmrchan.o dmraudio.o dmrvote.o p25audio.o chanctl.o avahi.o libdigital.a libdsp.a libstatus.a libradio.a
+	$(CC) $(LDFLAGS) -o $@ $^ $(MBELIB_LIBS) -liniparser $(LDLIBS)
 
 p25audio.o: CPPFLAGS += $(MBELIB_CPPFLAGS)
 

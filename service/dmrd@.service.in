@@ -1,0 +1,26 @@
+# systemd unit for the DMR decoder
+# The instance is the I/Q multicast group to decode, e.g., systemctl enable --now dmrd@dmr-iq.local
+# Every channel (SSRC) on the group is decoded; events from all instances are appended to /var/log/dmrd.log
+# For voice output add -R, e.g. with systemctl edit: ExecStart= then ExecStart=@sbindir@/dmrd -R dmr-pcm.local %i
+
+[Unit]
+Description=DMR decoder %i
+Wants=lan.target
+After=lan.target
+
+[Service]
+User=radio
+Group=radio
+Type=simple
+StandardOutput=append:/var/log/dmrd.log
+StandardError=journal
+ExecStart=@sbindir@/dmrd %i
+Restart=always
+RestartSec=5
+TimeoutStopSec=5
+SyslogIdentifier=dmrd@%i
+LogRateLimitBurst=200
+LogRateLimitIntervalSec=20
+
+[Install]
+WantedBy=multi-user.target

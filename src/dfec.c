@@ -213,7 +213,8 @@ static uint8_t const Trellis_12[4][4] = {
   {0x9, 0x7, 0xA, 0x4},
   {0x5, 0xB, 0x6, 0x8}
 };
-static uint8_t const Trellis_34[8][8] = {
+// Also DMR's rate 3/4 trellis (TS 102 361-1 B.2.4), which dmrfec.c decodes with its own metric
+uint8_t const Trellis_34[8][8] = {
   {2, 13, 14, 1, 7, 8, 11, 4},
   {14, 1, 7, 8, 11, 4, 2, 13},
   {10, 5, 6, 9, 15, 0, 3, 12},
@@ -388,19 +389,24 @@ float trellis_34_decode_soft(uint8_t *out,float const *phase,int nsyms){
 }
 
 // ---------------------------------------------------------------------------
-// CRCs: msb first, zero preset, the remainder of M(x) x^width inverted
-// (the feedback is the register's top bit XOR the next message bit, so no zeros need be appended)
+// CRCs: msb first, the remainder of M(x) x^width (the feedback is the register's top bit XOR the
+// next message bit, so no zeros need be appended). P25's are zero preset and inverted
 
-static unsigned crc_bits(uint8_t const *bits,int n,unsigned poly,int width){
-  unsigned const mask = (1u << width) - 1;
-  unsigned reg = 0;
+uint32_t crc_remainder(uint8_t const *bits,int n,uint32_t poly,int width,uint32_t preset){
+  assert(bits != NULL || n == 0);
+  assert(width >= 1 && width <= 32);
+  uint32_t const mask = width == 32 ? 0xffffffff : (1u << width) - 1;
+  uint32_t reg = preset & mask;
   for(int i = 0; i < n; i++){
-    unsigned const fb = ((reg >> (width - 1)) ^ bits[i]) & 1;
+    uint32_t const fb = ((reg >> (width - 1)) ^ bits[i]) & 1;
     reg = (reg << 1) & mask;
     if(fb)
       reg ^= poly;
   }
-  return reg ^ mask;
+  return reg;
+}
+static unsigned crc_bits(uint8_t const *bits,int n,unsigned poly,int width){
+  return crc_remainder(bits,n,poly,width,0) ^ ((1u << width) - 1);
 }
 static unsigned get_field(uint8_t const *bits,int n){
   unsigned v = 0;

@@ -37,6 +37,21 @@ void select_rxfilter(struct rxfilter *f,int response); // from the next sample
 int init_rrcfilter(struct rxfilter *f,double samprate,double symrate,double alpha,double span);
 void free_rxfilter(struct rxfilter *f);
 void run_rxfilter(struct rxfilter *f,float complex *buffer,int count); // in place
+// The same, the real and imaginary parts summed as two real dot products (they round differently
+// with fused multiply-adds; see dsync.c)
+void run_rxfilter_parts(struct rxfilter *f,float complex *buffer,int count);
+
+// FIR on a real signal, e.g. the matched filter after an FM discriminator
+struct realfilter {
+  int ntaps;
+  int pos;
+  float *taps;
+  float *history; // Stored twice, as rxfilter's
+};
+// Root raised cosine, the taps of init_rrcfilter()
+int init_rrc_realfilter(struct realfilter *f,double samprate,double symrate,double alpha,double span);
+void free_realfilter(struct realfilter *f);
+float realfilter_sample(struct realfilter *f,float x); // one in, one out
 
 // Envelope ripple at the symbol rate: |mean of |x|^2 e^(-j 2 pi symrate t)| / mean of |x|^2
 // A linear modulation (pi/4 DQPSK, QPSK) dips between symbols and so has a strong component at
@@ -100,10 +115,28 @@ void update_freqtrack(struct freqtrack *ft,bool valid,float residual,int count);
 void shift_freqtrack(struct freqtrack *ft,float complex *buffer,int count,float offset);
 // Move the estimate by delta Hz, e.g. a residual from the decoder's decisions
 void adjust_freqtrack(struct freqtrack *ft,float delta);
+// freqtrack_residual() and update_freqtrack() in one, the residual kept in double precision: for a
+// decoder whose frequency comes from its corrected, receive-filtered blocks alone
+void update_freqtrack_block(struct freqtrack *ft,float complex const *buffer,int count);
+
+// Frequency shift by a double precision phasor, phase continuous across blocks and frequency
+// changes: an alternative to the nco correct_freqtrack() uses
+struct rotator {
+  double complex phasor;
+  double complex step;
+  int count;              // samples since the phasor's magnitude was last checked
+};
+void init_rotator(struct rotator *r);
+void set_rotator(struct rotator *r,double samprate,double frequency); // Hz; the phase carries on
+void run_rotator(struct rotator *r,float complex *buffer,int count);  // multiply in place
 
 // Symbol timing: polyphase interpolator to two samples per symbol, Gardner detector, PI loop
 // Wide loop until told the signal is locked (e.g. by frame sync), narrow after
-enum { SYMSYNC_TAPS = 8, SYMSYNC_HISTORY = 1024, SYMSYNC_OUTPUTS = 512 }; // history sizes are powers of two
+// History sizes are powers of two. symsync_near() reaches back SYMSYNC_HISTORY input samples and
+// SYMSYNC_OUTPUTS outputs (two a symbol): 512 symbols, so that DMR's look-back can re-time the burst two
+// slot periods (288 symbols, 382 from the burst's head to the acquiring sync's end) ahead of a sync.
+// P25 looks back only one sync window
+enum { SYMSYNC_TAPS = 8, SYMSYNC_HISTORY = 2048, SYMSYNC_OUTPUTS = 1024 };
 
 typedef void (*symsync_output)(void *arg,float complex sample,bool is_symbol);
 
@@ -142,7 +175,12 @@ struct symsync {
 int init_symsync(struct symsync *s,double samprate,double symrate,int nphases,
 		 float acquire_bw,float track_bw,float damping,float error_gain,float rate_limit);
 void free_symsync(struct symsync *s);
+// Redesign the interpolator with every tap rounded to 'digits' significant figures (GNU Radio's
+// published table has six); call before the first sample. Returns 0, or -1
+int set_symsync_digits(struct symsync *s,int digits);
 void run_symsync(struct symsync *s,float complex const *buffer,int count,symsync_output out,void *arg);
+// The same loop on a real signal; outputs are passed on with a zero imaginary part
+void run_symsync_real(struct symsync *s,float const *buffer,int count,symsync_output out,void *arg);
 void lock_symsync(struct symsync *s,bool locked); // narrow or widen the loop
 void set_symsync_bandwidth(struct symsync *s,float bw); // until the next lock_symsync() change
 void reset_symsync_rate(struct symsync *s);       // forget the symbol rate error estimate
