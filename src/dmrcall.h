@@ -243,6 +243,7 @@ struct dmr_transmission {
 
   bool identity_known;
   struct dmr_voice_identity id;
+  bool source_known;           // id.source was read (an LC may name source 0: not known yet)
   uint8_t fid;
   bool recorded;
   bool start_announced;

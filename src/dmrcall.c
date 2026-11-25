@@ -558,27 +558,61 @@ static struct dmr_transmission *start_with_voice(struct dmr_call_tracker *t,uint
 
 // ---------------- Identity ----------------
 
-static bool same_call(struct dmr_voice_identity const *a,struct dmr_voice_identity const *b){
-  return a->group == b->group && a->source == b->source && a->destination == b->destination;
+// Does an LC name another call than the transmission's? Only LCs of the transmission's address width
+// are compared (the vendor short forms are not). Another group flag or destination is always another
+// call, whatever the source; another talker only when the transmission's is known and the LC names one,
+// since an LC may name source 0 (Capacity Plus's wide-area header does, for the same call, 120 ms
+// before one naming the radio). That source 0 once hid a change of talkgroup: such an LC was no
+// identity at all, so another talkgroup's audio went on under the first one's
+static bool other_call(struct dmr_transmission const *tx,struct dmr_voice_identity const *id){
+  if(!tx->identity_known || id->address_bits != tx->id.address_bits)
+    return false;
+  if(id->group != tx->id.group || id->destination != tx->id.destination)
+    return true;
+  return tx->source_known && id->source != 0 && id->source != tx->id.source;
 }
-// The identity an LC of this transmission carries; a different talker is the caller's to have handled
+// Whether the call's records are written: the talkgroup predicate's answer for the identity adopted,
+// asked again whenever the destination or call type changes (a vendor short form replaced by the full
+// addresses), with the not-recorded count following it. Records already written stay as they were
+static void decide_recorded(struct dmr_call_tracker *t,struct dmr_transmission *tx,bool first){
+  bool const was = first ? true : tx->recorded;
+  tx->recorded = t->predicate == NULL || t->predicate(t->predicate_arg,tx->id.destination,!tx->id.group);
+  if(was && !tx->recorded)
+    t->counters.not_recorded++;
+  else if(!was && tx->recorded && t->counters.not_recorded > 0)
+    t->counters.not_recorded--;
+}
+// The identity an LC of this transmission carries; another call is the caller's to have handled
 static void adopt_identity(struct dmr_call_tracker *t,struct dmr_transmission *tx,struct dmr_voice_identity const *id,
                            uint8_t fid){
   if(!tx->identity_known){
     tx->identity_known = true;
     tx->id = *id;
+    tx->source_known = id->source != 0;
     tx->fid = fid;
-    tx->recorded = t->predicate == NULL || t->predicate(t->predicate_arg,id->destination,!id->group);
-    if(!tx->recorded)
-      t->counters.not_recorded++;
+    decide_recorded(t,tx,true);
   } else if(id->address_bits == tx->id.address_bits){
-    if(same_call(&tx->id,id)){
+    if(!other_call(tx,id)){
       tx->id.options = id->options; // the same call: its service options may have changed
       tx->fid = fid;
+      if(!tx->source_known && id->source != 0){
+        tx->id.source = id->source; // the talker, named at last
+        tx->source_known = true;
+      }
     }
   } else if(id->address_bits > tx->id.address_bits){
-    tx->id = *id; // a vendor short form first, the full addresses now
+    // A vendor short form first, the full addresses now (sdrtrunk's short forms; the filter is asked
+    // again, since the talkgroup it was asked about was the short one)
+    bool const changed = id->destination != tx->id.destination || id->group != tx->id.group;
+    uint32_t const source = tx->id.source;
+    tx->id = *id;
+    if(id->source == 0 && tx->source_known)
+      tx->id.source = source;
+    else
+      tx->source_known = id->source != 0;
     tx->fid = fid;
+    if(changed)
+      decide_recorded(t,tx,false);
   }
 }
 
@@ -594,12 +628,10 @@ static void after_gap(struct dmr_call_tracker *t,struct dmr_transmission *tx){
 // gap: they give identity and may say encrypted, never clear
 // identity_of(): dmr_lc_voice_identity() with the system's talkgroup form applied
 // (config.compressed_talkgroups): every identity the tracker reads comes through here, so two LCs of
-// one call compare alike. A voice LC naming source 0 says nothing of the call yet: Capacity Plus sends
-// a wide-area voice header with source 0 and, 120 ms later, one naming the radio. Taken as an identity
-// it opened a transmission of its own, ended empty by the next header; as none, the next header joins
-// its transmission
+// one call compare alike. An LC naming source 0 is an identity whose talker is not known yet
+// (other_call(), adopt_identity())
 static bool identity_of(struct dmr_call_tracker const *t,struct dmr_lc const *lc,struct dmr_voice_identity *id){
-  if(!dmr_lc_voice_identity(lc,id) || id->source == 0)
+  if(!dmr_lc_voice_identity(lc,id))
     return false;
   if(t->config.compressed_talkgroups && id->group && id->address_bits == 24)
     id->destination = dmr_hytera_dialable_talkgroup(id->destination);
@@ -633,8 +665,10 @@ static void apply_lc(struct dmr_call_tracker *t,struct dmr_transmission *tx,uint
   case DMR_LC_NO_STATEMENT:
     break;
   }
-  if(tx->identity_known)
-    announce_start(t,tx,slot); // after the privacy bit: the event says what the LC said
+  // After the privacy bit, so the event says what the LC said; before voice, only once the talker is
+  // named (a source-0 header is followed by one naming the radio)
+  if(tx->identity_known && (tx->source_known || tx->voice_bursts > 0))
+    announce_start(t,tx,slot);
 }
 
 // ---------------- Data bursts ----------------
@@ -647,7 +681,7 @@ static void on_header(struct dmr_call_tracker *t,uint8_t slot,struct dmr_burst c
   struct dmr_transmission *tx = &t->slots[slot];
   // Another header of the transmission that has not begun its voice yet?
   bool const join = tx->active && tx->voice_bursts == 0 && tx->started_by == DMR_START_HEADER
-    && !(tx->identity_known && has_id && !same_call(&tx->id,&id)) && !off_grid(t,tx,now);
+    && !(has_id && other_call(tx,&id)) && !off_grid(t,tx,now);
   if(!join){
     if(tx->active && tx->voice_bursts == 0 && tx->started_by == DMR_START_PI_HEADER)
       t->counters.pi_headers_superseded++;
@@ -684,7 +718,7 @@ static void on_pi_header(struct dmr_call_tracker *t,uint8_t slot,struct dmr_burs
 static void on_terminator_lc(struct dmr_call_tracker *t,struct dmr_transmission *tx,struct dmr_lc const *lc){
   struct dmr_voice_identity id;
   bool const has_id = identity_of(t,lc,&id);
-  if(has_id && tx->identity_known && id.address_bits == tx->id.address_bits && !same_call(&tx->id,&id))
+  if(has_id && other_call(tx,&id))
     return; // not ours
   if(has_id)
     adopt_identity(t,tx,&id,lc->fid);
@@ -808,8 +842,7 @@ static void on_voice(struct dmr_call_tracker *t,uint8_t slot,struct dmr_burst co
   // transmission keeps the words where they were
   struct dmr_voice_identity embedded_id;
   bool const has_embedded_id = m->has_embedded_lc && identity_of(t,&m->embedded_lc.lc,&embedded_id);
-  if(tx->active && tx->identity_known && has_embedded_id && embedded_id.address_bits == tx->id.address_bits
-     && !same_call(&tx->id,&embedded_id)){
+  if(tx->active && has_embedded_id && other_call(tx,&embedded_id)){
     bool const lc_encrypted = tx->lc_encrypted,parameters_encrypted = tx->parameters_encrypted;
     uint8_t const algorithm = tx->algorithm,key_id = tx->key_id;
     uint32_t const mi = tx->mi;
@@ -863,6 +896,8 @@ static void on_voice(struct dmr_call_tracker *t,uint8_t slot,struct dmr_burst co
       c->learned_mask_lcs++;
     apply_lc(t,tx,slot,&m->embedded_lc.lc,tx->bursts_since_gap >= 4 && !learned,learned);
   }
+  if(tx->identity_known)
+    announce_start(t,tx,slot); // voice has begun: the talker may never be named
   if(m->has_hidden_iv && tx->state == DMR_ENC_ENCRYPTED && tx->confirmed){
     tx->mi = m->hidden_iv.iv;
     c->hidden_ivs_used++;
