@@ -1987,7 +1987,8 @@ OPTIONS
 	      output; ms, a repeater input or simplex; direct, TDMA direct
 	      mode; all, every family; auto, every family until one family's
 	      synced bursts lead each other's by more than 10, then that one
-	      only.
+	      only, until 5 seconds pass without a sync. A synced burst counts
+	      only within 400 ms of the one before.
 
        -M, --mobile
 	      The same as -s all.

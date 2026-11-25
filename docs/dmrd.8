@@ -73,7 +73,8 @@ its first strong sync and follows it; any decodes every one.
 Which stations' syncs to look for: bs (the default), a repeater output; ms, a
 repeater input or simplex; direct, TDMA direct mode; all, every family; auto,
 every family until one family's synced bursts lead each other's by more than
-10, then that one only.
+10, then that one only, until 5 seconds pass without a sync. A synced burst
+counts only within 400 ms of the one before.
 .TP
 .B "\-M, \-\-mobile"
 The same as \-s all.

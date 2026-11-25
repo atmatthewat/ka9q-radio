@@ -55,7 +55,8 @@
 //   FID 0x00   group voice 0x00, unit-to-unit voice 0x03, talker alias header and blocks 0x04-0x07,
 //              GPS 0x08, terminator data 0x30
 //   FID 0x10   group voice 0x00, Capacity Plus wide-area voice with the rest LSN 0x04, Capacity Max
-//              group voice 0x10 and talker alias 0x14 / 0x15, Capacity Plus encrypted voice 0x20,
+//              group voice 0x10 and talker alias header and blocks 0x14-0x17 (the standard's layout:
+//              sdrtrunk 9359f523, GPL-3, Dennis Sheirer, issue #2421), Capacity Plus encrypted voice 0x20,
 //              encryption parameters 0x21
 //   FID 0x68   group voice 0x00, unit-to-unit 0x03, talker alias 0x04-0x07, GPS 0x08, XPT channel
 //              grant 0x09, terminator 0x30
@@ -124,6 +125,10 @@
 // to three blocks (0x05-0x07, 56 bits each) in the embedded LCs of a transmission; 217 bits that run
 // on. 7-bit characters start at the first bit (up to 31); in the 8-bit formats (ISO 8859-1, UTF-8)
 // and UTF-16BE the first bit is unused and the rest are octets (up to 27) or 16-bit units (up to 13).
+// Capacity Max sends the same header and blocks under FID 0x10 at FLCO 0x14-0x17. In UTF-8 the standard's
+// length counts code units, octets (TS 102 361-2 3.1, 7.2.19), but Motorola's radios count characters:
+// so every octet received is decoded, up to padding (NUL), and the text is cut at the length in
+// characters, which serves both (both from sdrtrunk 9359f523, GPL-3, Dennis Sheirer, issue #2421).
 // Layout and the one-bit offset as sdrtrunk (TalkerAliasHeader.java, TalkerAliasAssembler.java,
 // TalkerAliasComplete.java), one source. sdrtrunk clears its assembler only on an idle or terminator
 // burst, so a block from one transmission can complete the next one's header, and it reports again on
@@ -220,7 +225,6 @@ char const *dmr_lc_kind_name(enum dmr_lc_kind k){
   case DMR_LC_MOTOROLA_GROUP_VOICE: return "MOTOROLA GROUP VOICE";
   case DMR_LC_CAP_PLUS_WIDE_AREA_VOICE: return "CAP+ WIDE-AREA VOICE";
   case DMR_LC_CAP_MAX_GROUP_VOICE: return "CAPMAX GROUP VOICE";
-  case DMR_LC_CAP_MAX_TALKER_ALIAS: return "CAPMAX TALKER ALIAS";
   case DMR_LC_CAP_PLUS_ENCRYPTED_VOICE: return "CAP+ ENCRYPTED VOICE";
   case DMR_LC_MOTOROLA_ENCRYPTION_PARAMETERS: return "MOTOROLA ENCRYPTION PARAMETERS";
   case DMR_LC_HYTERA_GROUP_VOICE: return "HYTERA GROUP VOICE";
@@ -251,8 +255,9 @@ static void lc_hytera_voice(struct dmr_lc *lc,uint8_t const *lc9,enum dmr_lc_kin
   lc->kind = kind;
   lc->body = DMR_LCB_HYTERA_VOICE;
 }
-static void lc_talker_alias(struct dmr_lc *lc,uint8_t const *lc9){
-  if(lc->flco == 0x04){
+// The header at FLCO base, blocks 1-3 at base + 1 to base + 3 (standard: 0x04; Capacity Max: 0x14)
+static void lc_talker_alias(struct dmr_lc *lc,uint8_t const *lc9,uint8_t base){
+  if(lc->flco == base){
     struct dmr_lc_talker_alias_header *h = &lc->u.alias_header;
     h->format = (enum dmr_ta_format)octet_field(lc9,16,2);
     h->length = (uint8_t)octet_field(lc9,18,5);
@@ -262,7 +267,7 @@ static void lc_talker_alias(struct dmr_lc *lc,uint8_t const *lc9){
     lc->body = DMR_LCB_TALKER_ALIAS_HEADER;
   } else {
     struct dmr_lc_talker_alias_block *b = &lc->u.alias_block;
-    b->block = (uint8_t)(lc->flco - 0x04);
+    b->block = (uint8_t)(lc->flco - base);
     for(int i=0; i < 56; i++)
       b->data[i] = (uint8_t)octet_field(lc9,16 + i,1);
     lc->kind = DMR_LC_TALKER_ALIAS_BLOCK;
@@ -305,7 +310,7 @@ void dmr_lc_parse(struct dmr_lc *lc,uint8_t const lc9[9]){
     switch(lc->flco){
     case 0x00: lc_voice_user(lc,lc9,DMR_LC_GROUP_VOICE,true); break;
     case 0x03: lc_voice_user(lc,lc9,DMR_LC_UNIT_TO_UNIT_VOICE,false); break;
-    case 0x04: case 0x05: case 0x06: case 0x07: lc_talker_alias(lc,lc9); break;
+    case 0x04: case 0x05: case 0x06: case 0x07: lc_talker_alias(lc,lc9,0x04); break;
     case 0x08: lc_gps(lc,lc9); break;
     case 0x30: {
       struct dmr_lc_terminator_data *t = &lc->u.terminator_data;
@@ -338,23 +343,7 @@ void dmr_lc_parse(struct dmr_lc *lc,uint8_t const lc9[9]){
       break;
     }
     case 0x10: lc_voice_user(lc,lc9,DMR_LC_CAP_MAX_GROUP_VOICE,true); break;
-    case 0x14: case 0x15: {
-      struct dmr_lc_cap_max_talker_alias *a = &lc->u.cap_max_alias;
-      a->continuation = lc->flco == 0x15;
-      if(a->continuation){
-        a->count = 7;
-        for(int i=0; i < 7; i++)
-          a->text[i] = lc9[2 + i];
-      } else {
-        a->length = (uint8_t)octet_field(lc9,19,4);
-        a->count = 6;
-        for(int i=0; i < 6; i++)
-          a->text[i] = lc9[3 + i];
-      }
-      lc->kind = DMR_LC_CAP_MAX_TALKER_ALIAS;
-      lc->body = DMR_LCB_CAP_MAX_TALKER_ALIAS;
-      break;
-    }
+    case 0x14: case 0x15: case 0x16: case 0x17: lc_talker_alias(lc,lc9,0x14); break;
     case 0x20: {
       struct dmr_lc_cap_plus_encrypted_voice *v = &lc->u.cap_plus_encrypted;
       v->options = lc9[2];
@@ -387,7 +376,7 @@ void dmr_lc_parse(struct dmr_lc *lc,uint8_t const lc9[9]){
     default:
       if(lc->fid == DMR_FID_HYTERA_68){
         if(lc->flco >= 0x04 && lc->flco <= 0x07)
-          lc_talker_alias(lc,lc9);
+          lc_talker_alias(lc,lc9,0x04);
         else if(lc->flco == 0x08)
           lc_gps(lc,lc9);
         else if(lc->flco == 0x30)
@@ -539,18 +528,6 @@ int dmr_lc_describe(char *buf,size_t size,struct dmr_lc const *lc){
   case DMR_LCB_TALKER_ALIAS_BLOCK:
     append(buf,size,&len," block=%u",(unsigned)lc->u.alias_block.block);
     break;
-  case DMR_LCB_CAP_MAX_TALKER_ALIAS: {
-    struct dmr_lc_cap_max_talker_alias const *a = &lc->u.cap_max_alias;
-    char text[8];
-    int n = 0;
-    for(int i=0; i < a->count && i < 7; i++){
-      uint8_t const c = a->text[i];
-      text[n++] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
-    }
-    text[n] = '\0';
-    append(buf,size,&len,"%s text=\"%s\"",a->continuation ? " continuation" : "",text);
-    break;
-  }
   }
   if(lc->protect)
     append(buf,size,&len," pf");
@@ -1493,12 +1470,20 @@ static void ta_emit(char *text,size_t *len,uint32_t cp){
   *len += n;
 }
 
-// UTF-8 octets to code points: U+FFFD for each octet that does not start a well-formed sequence
-// (overlong forms, surrogates and values past U+10FFFF included)
-static void ta_decode_utf8(char *text,size_t *len,uint8_t const *s,int n){
-  int i = 0;
-  while(i < n){
+// UTF-8 octets to code points, at most max_cp of them: U+FFFD for each octet that does not start a
+// well-formed sequence (overlong forms, surrogates and values past U+10FFFF included). A NUL octet is
+// padding and ends the text (*nul); a sequence cut off by the end of the octets is dropped
+// (*incomplete), since its other octets are in a block not yet received. Returns the code points
+static int ta_decode_utf8(char *text,size_t *len,uint8_t const *s,int n,int max_cp,bool *nul,bool *incomplete){
+  int i = 0,cps = 0;
+  *nul = *incomplete = false;
+  while(i < n && cps < max_cp){
     uint8_t const c = s[i];
+    if(c == 0){
+      *nul = true;
+      break;
+    }
+    cps++;
     int extra;
     uint32_t cp,minimum;
     if(c < 0x80u){
@@ -1517,7 +1502,12 @@ static void ta_decode_utf8(char *text,size_t *len,uint8_t const *s,int n){
       i++;
       continue;
     }
-    bool ok = i + extra <= n - 1; // the whole sequence is inside the buffer
+    if(i + extra > n - 1){ // the rest of the sequence is not here
+      cps--;
+      *incomplete = true;
+      break;
+    }
+    bool ok = true;
     for(int k=1; ok && k <= extra; k++){
       if((s[i + k] & 0xc0u) != 0x80u)
         ok = false;
@@ -1532,6 +1522,7 @@ static void ta_decode_utf8(char *text,size_t *len,uint8_t const *s,int n){
     ta_emit(text,len,cp);
     i += extra + 1;
   }
+  return cps;
 }
 
 void dmr_ta_reset(struct dmr_ta_assembler *a){
@@ -1539,52 +1530,6 @@ void dmr_ta_reset(struct dmr_ta_assembler *a){
   memset(a->have_block,0,sizeof a->have_block);
   a->reported[0] = '\0';
   a->have_reported = false;
-  a->have_cap_max_first = a->have_cap_max_continuation = false;
-}
-
-// Capacity Max fragments (see dmrmsg.h)
-static bool ta_cap_max(struct dmr_ta_assembler *a,struct dmr_talker_alias *alias,struct dmr_lc_cap_max_talker_alias const *f){
-  if(f->continuation){
-    a->cap_max_continuation = *f;
-    a->have_cap_max_continuation = true;
-  } else {
-    if(a->have_cap_max_first && (f->length != a->cap_max_first.length || f->count != a->cap_max_first.count
-                                 || memcmp(f->text,a->cap_max_first.text,sizeof f->text) != 0))
-      a->have_cap_max_continuation = false; // another alias: the continuation held was the old one's
-    a->cap_max_first = *f;
-    a->have_cap_max_first = true;
-  }
-  if(!a->have_cap_max_first)
-    return false;
-  bool const whole = a->cap_max_first.length != 0 && a->cap_max_first.length <= a->cap_max_first.count;
-  if(!whole && !a->have_cap_max_continuation)
-    return false;
-  char text[DMR_TALKER_ALIAS_TEXT];
-  size_t len = 0;
-  for(int part=0; part < (whole ? 1 : 2); part++){
-    struct dmr_lc_cap_max_talker_alias const *p = part == 0 ? &a->cap_max_first : &a->cap_max_continuation;
-    for(int i=0; i < p->count && i < (int)sizeof p->text; i++)
-      if(p->text[i] != 0) // padding
-        ta_emit(text,&len,p->text[i]);
-  }
-  text[len] = '\0';
-  while(len > 0 && text[len - 1] == ' ')
-    text[--len] = '\0';
-  size_t lead = 0;
-  while(lead < len && text[lead] == ' ')
-    lead++;
-  if(lead == len)
-    return false;
-  if(a->have_reported && strcmp(text + lead,a->reported) == 0)
-    return false;
-  strlcpy(a->reported,text + lead,sizeof a->reported);
-  a->have_reported = true;
-  memset(alias,0,sizeof *alias);
-  strlcpy(alias->text,text + lead,sizeof alias->text);
-  alias->format = DMR_TA_ISO8859_1;
-  alias->length = a->cap_max_first.length;
-  alias->blocks = whole ? 0 : 1;
-  return true;
 }
 
 // Unit `index` of the alias: unit_bits bits from bit offset + index * unit_bits
@@ -1603,12 +1548,23 @@ static bool ta_assemble(struct dmr_ta_assembler *a,struct dmr_talker_alias *alia
   int const unit_bits = seven_bit ? 7 : wide ? 16 : 8;
   int const offset = seven_bit ? 0 : 1;
   int const max_units = (217 - offset) / unit_bits; // 31, 27, 13
-  int const units = a->header.length < max_units ? a->header.length : max_units;
-  int const total_bits = offset + units * unit_bits;
-  int const blocks_needed = total_bits <= 49 ? 0 : (total_bits - 49 + 55) / 56;
-  for(int b=0; b < blocks_needed; b++){
-    if(!a->have_block[b])
-      return false;
+  int units = a->header.length < max_units ? a->header.length : max_units;
+  int blocks_needed = 0;
+  bool const utf8 = a->header.format == DMR_TA_UTF8;
+  if(utf8){
+    // Motorola's length counts characters, which in UTF-8 may take two or more octets each (sdrtrunk
+    // 9359f523, GPL-3, Dennis Sheirer, issue #2421: Cyrillic aliases cut short), so every octet of the
+    // blocks received in order is decoded and the text cut at the length in characters, below
+    while(blocks_needed < 3 && a->have_block[blocks_needed])
+      blocks_needed++;
+    units = (49 + 56 * blocks_needed - offset) / 8; // 6, 13, 20, 27
+  } else {
+    int const total_bits = offset + units * unit_bits;
+    blocks_needed = total_bits <= 49 ? 0 : (total_bits - 49 + 55) / 56;
+    for(int b=0; b < blocks_needed; b++){
+      if(!a->have_block[b])
+        return false;
+    }
   }
   uint8_t bits[217] = {0};
   for(int i=0; i < 49; i++)
@@ -1630,7 +1586,12 @@ static bool ta_assemble(struct dmr_ta_assembler *a,struct dmr_talker_alias *alia
     uint8_t octets[27];
     for(int i=0; i < units; i++)
       octets[i] = (uint8_t)UNIT(i);
-    ta_decode_utf8(text,&len,octets,units);
+    bool nul,incomplete;
+    int const cps = ta_decode_utf8(text,&len,octets,units,a->header.length,&nul,&incomplete);
+    // Whole when the length is reached, padding is seen, every block has come, or the length read as
+    // octets is covered with no character cut off (a radio that counts octets sends no more blocks)
+    if(!(cps >= a->header.length || nul || blocks_needed == 3 || (units >= a->header.length && !incomplete)))
+      return false;
     break;
   }
   case DMR_TA_UTF16BE:
@@ -1680,8 +1641,6 @@ bool dmr_ta_on_lc(struct dmr_ta_assembler *a,struct dmr_talker_alias *alias,stru
       return false;
     memcpy(a->blocks[b->block - 1],b->data,sizeof b->data);
     a->have_block[b->block - 1] = true;
-  } else if(lc->body == DMR_LCB_CAP_MAX_TALKER_ALIAS){
-    return ta_cap_max(a,alias,&lc->u.cap_max_alias);
   } else {
     return false;
   }

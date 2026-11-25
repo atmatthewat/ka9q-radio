@@ -51,7 +51,7 @@ dmrd [options] dmr-iq.local [more groups ...]
 - **-p**, **--tos** *tos*: IP type of service of the voice and packet output (default 184, expedited forwarding)
 - **-c**, **--color-code** *n*|**any**|**track**: the colour code to decode, 0-15; **track** (the default) takes each channel's from its first strong sync and follows it; **any** decodes every one
 - **-M**, **--mobile**: also look for mobile station and direct mode syncs (simplex, talkaround), not only repeater outputs (**-s all**)
-- **-s**, **--stations** **bs**|**ms**|**direct**|**all**|**auto**: which stations' syncs to look for: **bs** (the default) a repeater output, **ms** a repeater input or simplex, **direct** TDMA direct mode, **all** every family, **auto** every family until one family's synced bursts lead each other's by more than 10, then that one only (logged)
+- **-s**, **--stations** **bs**|**ms**|**direct**|**all**|**auto**: which stations' syncs to look for: **bs** (the default) a repeater output, **ms** a repeater input or simplex, **direct** TDMA direct mode, **all** every family, **auto** every family until one family's synced bursts lead each other's by more than 10, then that one only, until 5 seconds pass without a sync (logged); a synced burst counts only within 400 ms of the one before, so that noise's stray syncs do not add up
 - **-L**, **--learn-crc-masks**: accept messages whose check fails with a residual seen twice (see **CRC masks** below); also **learn-crc-masks** in a sites file
 - **-f**, **--sites** *file*: which repeaters make up each site, and the system each site belongs to (see **Sites** below)
 - **-n**, **--no-follow**: don't ask *radiod* for the repeaters calls are announced on

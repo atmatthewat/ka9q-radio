@@ -2206,7 +2206,8 @@ freq = &quot;857m98125&quot;</pre>
   <dd>Which stations' syncs to look for: bs (the default), a repeater output;
       ms, a repeater input or simplex; direct, TDMA direct mode; all, every
       family; auto, every family until one family's synced bursts lead each
-      other's by more than 10, then that one only.</dd>
+      other's by more than 10, then that one only, until 5 seconds pass without
+      a sync. A synced burst counts only within 400 ms of the one before.</dd>
   <dt id="M,"><a class="permalink" href="#M,"><b>-M, --mobile</b></a></dt>
   <dd>The same as -s all.</dd>
   <dt id="L,"><a class="permalink" href="#L,"><b>-L,

@@ -65,9 +65,9 @@ struct dmr_chan_config {
   bool mobile_station;             // and MS syncs
   bool direct;                     // and direct mode syncs
   bool learn_crc_masks;            // accept messages whose CRC fails with a residual seen twice (dmrmsg.h)
-  // Look for every family enabled above until one family's synced bursts lead each other's by more
-  // than 10, then for that one only, for the channel's life (sdrtrunk's automatic mode,
-  // DMRSyncModeMonitor.java, GPL-3, Dennis Sheirer). A notice says which
+  // Look for every family enabled above until one family's synced bursts (each within 400 ms of the
+  // one before) lead each other's by more than 10, then for that one only, until 5 s pass without a
+  // sync (sdrtrunk's automatic mode, DMRSyncModeMonitor.java, GPL-3, Dennis Sheirer). Notices say so
   bool auto_stations;
   bool compressed_talkgroups;      // the system's talkgroups in the dialable form (dmrcall.h)
   bool decode_data;                // packet data (dmrdata.h; default true)

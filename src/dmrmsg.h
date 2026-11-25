@@ -39,7 +39,6 @@ enum dmr_lc_kind {
   DMR_LC_MOTOROLA_GROUP_VOICE,           // FID 0x10 FLCO 0x00
   DMR_LC_CAP_PLUS_WIDE_AREA_VOICE,       // FID 0x10 FLCO 0x04
   DMR_LC_CAP_MAX_GROUP_VOICE,            // FID 0x10 FLCO 0x10
-  DMR_LC_CAP_MAX_TALKER_ALIAS,           // FID 0x10 FLCO 0x14, 0x15
   DMR_LC_CAP_PLUS_ENCRYPTED_VOICE,       // FID 0x10 FLCO 0x20
   DMR_LC_MOTOROLA_ENCRYPTION_PARAMETERS, // FID 0x10 FLCO 0x21
   DMR_LC_HYTERA_GROUP_VOICE,             // FID 0x68 / 0x08 FLCO 0x00
@@ -62,7 +61,6 @@ enum dmr_lc_body {
   DMR_LCB_GPS_INFO,
   DMR_LCB_TALKER_ALIAS_HEADER,
   DMR_LCB_TALKER_ALIAS_BLOCK,
-  DMR_LCB_CAP_MAX_TALKER_ALIAS,
 };
 
 // The standard voice channel user layout: service options 16-23, destination 24-47, source 48-71
@@ -138,13 +136,6 @@ struct dmr_lc_talker_alias_block {
   uint8_t block;           // 1-3
   uint8_t data[56];        // bits 16-71
 };
-// Capacity Max talker alias: first fragment (FLCO 0x14, up to 6 octets) or continuation (0x15, 7)
-struct dmr_lc_cap_max_talker_alias {
-  bool continuation;
-  uint8_t length;          // first fragment: bits 19-22
-  uint8_t count;           // octets in text[]
-  uint8_t text[7];
-};
 
 struct dmr_lc {
   uint8_t bytes[9];        // the 72 bits, first sent = top bit of bytes[0]
@@ -165,7 +156,6 @@ struct dmr_lc {
     struct dmr_lc_gps_info gps;
     struct dmr_lc_talker_alias_header alias_header;
     struct dmr_lc_talker_alias_block alias_block;
-    struct dmr_lc_cap_max_talker_alias cap_max_alias;
   } u;
 };
 // Parse nine LC octets (or 72 bits). Never fails: an unknown (FID, FLCO) gives DMR_LC_UNKNOWN.
@@ -579,12 +569,6 @@ struct dmr_ta_assembler {
   uint8_t blocks[3][56];
   bool have_reported;
   char reported[DMR_TALKER_ALIAS_TEXT];
-  // Capacity Max (FID 0x10 FLCO 0x14 first fragment, 0x15 continuation): joined, first then continuation,
-  // as sdrtrunk's DMRDecoderState does (GPL-3, Dennis Sheirer, :1196-1262); reported when both have come
-  // in the transmission, or the first alone when its length says it holds the whole alias. ISO 8859-1;
-  // the length's unit is not established, so it does not cut the text
-  bool have_cap_max_first,have_cap_max_continuation;
-  struct dmr_lc_cap_max_talker_alias cap_max_first,cap_max_continuation;
 };
 void dmr_ta_reset(struct dmr_ta_assembler *a);
 // Feed an LC that passed its check. True (and *alias) when it completes an alias not reported

@@ -36,7 +36,11 @@
 // token, nothing was understood and the message stays identified), where sdrtrunk steps one octet and
 // reads the unknown token's payload as more tokens; token 0x22 is the request's ID (sdrtrunk's
 // "IDENTITY"), kept as sent; speed is given raw and at sdrtrunk's 1/100 scale, its unit not known;
-// latitude is a sign bit and 31 bits, longitude 32 bits two's complement, sdrtrunk's reading.
+// latitude is a sign bit and 31 bits, longitude 32 bits two's complement, sdrtrunk's reading. The
+// request parameters are sdrtrunk's corrected ones (fbc54a38, from an on-air capture): the trigger
+// interval (0x31), the trigger distance (0x78) and the unknown parameters 0x42 and 0x44 carry 7-bit
+// variable length integers, 0x34 in a request is the periodic flag (in a response it is the time),
+// and 0x4A is the trigger condition (emergency, pin status change, PTT, PTT emergency).
 //
 // Motorola ARS (UDP 4005, or MNIS application 0x33), from sdrtrunk module/decode/ip/mototrbo/ars/:
 //   length (16)                          the octets that follow
@@ -586,8 +590,46 @@ static void lrrp_position(struct reader *r,struct dmr_lrrp *m,enum dmr_lrrp_shap
   m->has_altitude_accuracy = false;
 }
 
-// One token whose id has been read. TOKEN_UNKNOWN: the id has no layout here (nothing consumed)
+char const *dmr_lrrp_condition_name(uint8_t condition){
+  // sdrtrunk TriggerCondition (fbc54a38)
+  switch(condition){
+  case DMR_LRRP_CONDITION_EMERGENCY: return "emergency";
+  case DMR_LRRP_CONDITION_PIN_STATUS_CHANGE: return "pin-status-change";
+  case DMR_LRRP_CONDITION_PTT: return "ptt";
+  case DMR_LRRP_CONDITION_PTT_EMERGENCY: return "ptt-emergency";
+  default: return NULL;
+  }
+}
+
+// A 7-bit variable length integer (sdrtrunk VarInt, fbc54a38): seven value bits an octet, most
+// significant group first, the high bit set on every octet but the last; at most 5 octets. NONE when no
+// octet remains (the value is absent); BAD, where sdrtrunk takes what there is, when it runs past the
+// end, past 5 octets or past 32 bits
+enum varint_result { VARINT_OK, VARINT_NONE, VARINT_BAD };
+static enum varint_result lrrp_varint(struct reader *r,uint32_t *value){
+  if(remaining(r) == 0)
+    return VARINT_NONE;
+  uint32_t v = 0;
+  for(int i=0; i < 5; i++){
+    if(remaining(r) == 0 || v > (UINT32_MAX >> 7))
+      return VARINT_BAD;
+    uint8_t const b = u8(r);
+    v = (v << 7) | (b & 0x7Fu);
+    if((b & 0x80u) == 0){
+      *value = v;
+      return VARINT_OK;
+    }
+  }
+  return VARINT_BAD;
+}
+
+// One token whose id has been read, in a request or a response (0x34 means one thing in each).
+// TOKEN_UNKNOWN: the id has no layout here (nothing consumed)
 static enum token_result lrrp_token(uint8_t id,struct reader *r,struct dmr_lrrp *m){
+  if(id == DMR_LRRP_TOKEN_TIME && !m->response){
+    m->trigger_periodic = true; // the periodic flag: no value
+    return TOKEN_OK;
+  }
   switch(id){
   case DMR_LRRP_TOKEN_REQUEST_ID: {
     size_t const n = u8(r);
@@ -606,21 +648,31 @@ static enum token_result lrrp_token(uint8_t id,struct reader *r,struct dmr_lrrp 
     if(m->other_count < sizeof m->other_tokens)
       m->other_tokens[m->other_count++] = id;
     break;
-  case DMR_LRRP_TOKEN_TRIGGER_PERIODIC:
-    m->trigger_seconds = u8(r);
-    m->has_trigger_periodic = true;
+  case DMR_LRRP_TOKEN_TRIGGER_INTERVAL:
+    if(lrrp_varint(r,&m->trigger_seconds) != VARINT_OK)
+      return TOKEN_BAD;
+    m->has_trigger_interval = true;
     break;
   case DMR_LRRP_TOKEN_TRIGGER_DISTANCE:
-    m->trigger_distance = u8(r);
+    if(lrrp_varint(r,&m->trigger_distance) != VARINT_OK)
+      return TOKEN_BAD;
     m->has_trigger_distance = true;
     break;
-  case DMR_LRRP_TOKEN_TRIGGER_ON_MOVE:
-    m->trigger_on_move = u8(r);
-    m->has_trigger_on_move = true;
+  case DMR_LRRP_TOKEN_TRIGGER_CONDITION:
+    m->trigger_condition = u8(r);
+    m->has_trigger_condition = true;
     break;
-  case DMR_LRRP_TOKEN_TRIGGER_GPIO:
-    m->trigger_gpio = true;
+  case DMR_LRRP_TOKEN_PARAMETER_42:
+  case DMR_LRRP_TOKEN_PARAMETER_44: {
+    // A bare flag when nothing follows it
+    bool const is42 = id == DMR_LRRP_TOKEN_PARAMETER_42;
+    enum varint_result const v = lrrp_varint(r,is42 ? &m->parameter_42 : &m->parameter_44);
+    if(v == VARINT_BAD)
+      return TOKEN_BAD;
+    *(is42 ? &m->has_parameter_42 : &m->has_parameter_44) = true;
+    *(is42 ? &m->has_parameter_42_value : &m->has_parameter_44_value) = v == VARINT_OK;
     break;
+  }
   case DMR_LRRP_TOKEN_TIME: {
     // year (14) month (4) day (5) hour (5) minute (6) second (6)
     uint64_t const high = be32(r);
@@ -701,19 +753,19 @@ static bool lrrp_is_bare_token(uint8_t id){
 static bool lrrp_is_known_token(uint8_t id){
   switch(id){
   case 0x22: case 0x23: case 0x31: case 0x34: case 0x36: case 0x37: case 0x38: case 0x3A: case 0x42:
-  case 0x4A: case 0x50: case 0x51: case 0x52: case 0x54: case 0x55: case 0x56: case 0x57: case 0x61:
+  case 0x44: case 0x4A: case 0x50: case 0x51: case 0x52: case 0x54: case 0x55: case 0x56: case 0x57: case 0x61:
   case 0x62: case 0x64: case 0x66: case 0x69: case 0x6C: case 0x73: case 0x78:
     return true;
   default:
     return false;
   }
 }
-// In a request these ids carry a parameter; every other octet is the id of something asked for
-// (sdrtrunk TokenType.isRequestParameterToken)
+// In a request these ids carry a parameter (or, 0x34, are a flag); every other octet is the id of
+// something asked for (sdrtrunk TokenType.isRequestParameterToken, fbc54a38)
 static bool lrrp_is_request_parameter(uint8_t id){
-  return id == DMR_LRRP_TOKEN_REQUEST_ID || id == DMR_LRRP_TOKEN_TRIGGER_DISTANCE || id == DMR_LRRP_TOKEN_TRIGGER_GPIO
-    || id == DMR_LRRP_TOKEN_TRIGGER_ON_MOVE || id == DMR_LRRP_TOKEN_TRIGGER_PERIODIC || id == DMR_LRRP_TOKEN_REQUEST_61
-    || id == DMR_LRRP_TOKEN_REQUEST_73;
+  return id == DMR_LRRP_TOKEN_REQUEST_ID || id == DMR_LRRP_TOKEN_TIME || id == DMR_LRRP_TOKEN_TRIGGER_INTERVAL
+    || id == DMR_LRRP_TOKEN_TRIGGER_CONDITION || id == DMR_LRRP_TOKEN_TRIGGER_DISTANCE || id == DMR_LRRP_TOKEN_PARAMETER_42
+    || id == DMR_LRRP_TOKEN_PARAMETER_44 || id == DMR_LRRP_TOKEN_REQUEST_61 || id == DMR_LRRP_TOKEN_REQUEST_73;
 }
 
 // The fields a failed parse keeps: type and length only
@@ -805,14 +857,31 @@ int dmr_lrrp_describe(char *buf,size_t size,struct dmr_lrrp const *m){
     append(buf,size,&len," heading");
   if(m->has_version)
     append(buf,size,&len," version=%u",(unsigned)m->version);
-  if(m->has_trigger_periodic)
+  if(m->trigger_periodic)
+    append(buf,size,&len," periodic");
+  if(m->has_trigger_interval)
     append(buf,size,&len," every=%us",(unsigned)m->trigger_seconds);
+  if(m->has_trigger_condition){
+    char const *name = dmr_lrrp_condition_name(m->trigger_condition);
+    if(name != NULL)
+      append(buf,size,&len," condition=%s",name);
+    else
+      append(buf,size,&len," condition=%02X",(unsigned)m->trigger_condition);
+  }
   if(m->has_trigger_distance)
     append(buf,size,&len," distance-trigger=%u",(unsigned)m->trigger_distance);
-  if(m->trigger_gpio)
-    append(buf,size,&len," gpio-trigger");
-  if(m->has_trigger_on_move)
-    append(buf,size,&len," on-move-trigger");
+  if(m->has_parameter_42){
+    if(m->has_parameter_42_value)
+      append(buf,size,&len," param-42=%u",(unsigned)m->parameter_42);
+    else
+      append(buf,size,&len," param-42");
+  }
+  if(m->has_parameter_44){
+    if(m->has_parameter_44_value)
+      append(buf,size,&len," param-44=%u",(unsigned)m->parameter_44);
+    else
+      append(buf,size,&len," param-44");
+  }
   if(m->requested_count > 0){
     append(buf,size,&len," asks=");
     hex_octets(buf,size,&len,m->requested_tokens,m->requested_count);

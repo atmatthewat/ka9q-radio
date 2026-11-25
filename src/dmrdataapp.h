@@ -106,17 +106,19 @@ enum {
   DMR_LRRP_PROTOCOL_VERSION_REQUEST = 0x14,
   DMR_LRRP_PROTOCOL_VERSION_RESPONSE = 0x15,
 };
-// Token ids (sdrtrunk TokenType)
+// Token ids (sdrtrunk TokenType, with its corrections of fbc54a38). "varint": a 7-bit variable length
+// integer, most significant group first, the high bit of each octet saying another follows
 enum {
   DMR_LRRP_TOKEN_REQUEST_ID = 0x22,        // a length octet, then that many
   DMR_LRRP_TOKEN_UNKNOWN_23 = 0x23,        // 1
-  DMR_LRRP_TOKEN_TRIGGER_PERIODIC = 0x31,  // 1: seconds
-  DMR_LRRP_TOKEN_TIME = 0x34,              // 5
+  DMR_LRRP_TOKEN_TRIGGER_INTERVAL = 0x31,  // varint: seconds
+  DMR_LRRP_TOKEN_TIME = 0x34,              // 5 in a response; in a request, the periodic flag (0)
   DMR_LRRP_TOKEN_VERSION = 0x36,           // 1
   DMR_LRRP_TOKEN_RESULT = 0x37,            // 1 or 2
   DMR_LRRP_TOKEN_SUCCESS = 0x38,           // 0
-  DMR_LRRP_TOKEN_TRIGGER_GPIO = 0x42,      // 0
-  DMR_LRRP_TOKEN_TRIGGER_DISTANCE = 0x4A,  // 1
+  DMR_LRRP_TOKEN_PARAMETER_42 = 0x42,      // varint, may be absent: meaning not known (3600 seen)
+  DMR_LRRP_TOKEN_PARAMETER_44 = 0x44,      // varint, may be absent: meaning not known (100 seen)
+  DMR_LRRP_TOKEN_TRIGGER_CONDITION = 0x4A, // 1: DMR_LRRP_CONDITION_*
   DMR_LRRP_TOKEN_CIRCLE_2D = 0x51,         // 10
   DMR_LRRP_TOKEN_CIRCLE_3D = 0x55,         // 15
   DMR_LRRP_TOKEN_HEADING = 0x56,           // 1
@@ -125,8 +127,16 @@ enum {
   DMR_LRRP_TOKEN_POINT_3D = 0x69,          // 11
   DMR_LRRP_TOKEN_SPEED = 0x6C,             // 2
   DMR_LRRP_TOKEN_REQUEST_73 = 0x73,        // 1
-  DMR_LRRP_TOKEN_TRIGGER_ON_MOVE = 0x78,   // 1
+  DMR_LRRP_TOKEN_TRIGGER_DISTANCE = 0x78,  // varint
 };
+// Trigger conditions (token 0x4A)
+enum {
+  DMR_LRRP_CONDITION_EMERGENCY = 0x02,
+  DMR_LRRP_CONDITION_PIN_STATUS_CHANGE = 0x42,
+  DMR_LRRP_CONDITION_PTT = 0x50,
+  DMR_LRRP_CONDITION_PTT_EMERGENCY = 0x51,
+};
+char const *dmr_lrrp_condition_name(uint8_t condition); // NULL for one not listed
 // Result codes (sdrtrunk ResponseCode)
 enum {
   DMR_LRRP_RESULT_SUCCESS = 0x0000,
@@ -185,13 +195,17 @@ struct dmr_lrrp {
   uint8_t version;
 
   // Requests
-  bool has_trigger_periodic;
-  uint8_t trigger_seconds;
+  bool trigger_periodic;       // token 0x34 in a request
+  bool has_trigger_interval;
+  uint32_t trigger_seconds;
+  bool has_trigger_condition;
+  uint8_t trigger_condition;
   bool has_trigger_distance;
-  uint8_t trigger_distance;
-  bool trigger_gpio;
-  bool has_trigger_on_move;
-  uint8_t trigger_on_move;
+  uint32_t trigger_distance;
+  bool has_parameter_42,has_parameter_42_value;
+  uint32_t parameter_42;
+  bool has_parameter_44,has_parameter_44_value;
+  uint32_t parameter_44;
   uint8_t requested_count;
   uint8_t requested_tokens[255]; // the ids of what the request asks for
 

@@ -82,6 +82,7 @@ struct dmr_chan {
   bool auto_stations;
   enum dmr_station family;         // the family locked to (auto_stations); UNKNOWN: not yet
   uint64_t family_syncs[3];        // synced bursts: bs, ms, direct
+  uint64_t last_sync_us;           // auto_stations: the last synced burst's time, 0 none yet
   struct dmr_site *site;
   struct dmr_channel channel;
   char channel_id[32];
@@ -183,6 +184,8 @@ static uint64_t sink_clock(void *arg,uint64_t index){
 // Each symbol, after the sink: the tracker's timeouts
 enum { DATA_IDLE_FLUSH_US = 500000 }; // a packet left open this long on a quiet carrier is delivered
 
+static void family_idle(struct dmr_chan *c,uint64_t now_us);
+
 static void on_symbol(void *arg,uint64_t index){
   struct dmr_chan * const c = arg;
   c->symbol_index = index;
@@ -204,6 +207,8 @@ static void on_symbol(void *arg,uint64_t index){
   if(c->data != NULL && dmr_data_packet_open(c->data) && c->anchored
      && time_of_symbol(c,index) - c->data_last_us > DATA_IDLE_FLUSH_US)
     dmr_data_flush(c->data);
+  if(c->auto_stations && c->anchored)
+    family_idle(c,time_of_symbol(c,index));
   if(c->ticks % DRIFT_CHECK_TICKS == 0)
     check_clock(c,index);
 }
@@ -260,7 +265,7 @@ static bool foreign_color_code(struct dmr_chan const *c,struct dmr_burst const *
   return b->kind == DMR_KIND_DATA && b->slot_type_valid && required >= 0 && (b->color_code & 0xf) != required;
 }
 
-static void note_family(struct dmr_chan *c,enum dmr_sync sync);
+static void note_family(struct dmr_chan *c,enum dmr_sync sync,uint64_t when_us);
 
 static void on_burst(void *arg,struct dmr_burst const *from_sink){
   struct dmr_chan * const c = arg;
@@ -271,8 +276,8 @@ static void on_burst(void *arg,struct dmr_burst const *from_sink){
   c->stats.bursts++;
   if(burst.sync != DMR_SYNC_NONE){
     c->stats.syncs++;
-    if(c->auto_stations && c->family == DMR_STATION_UNKNOWN)
-      note_family(c,burst.sync);
+    if(c->auto_stations)
+      note_family(c,burst.sync,burst.timestamp_us);
   }
   if(dmr_is_voice(burst.kind))
     c->stats.voice_bursts++;
@@ -405,12 +410,28 @@ static void on_call_end(void *arg,struct dmr_call_meta const *meta,struct dmr_ca
   event(c,meta,info,false);
 }
 
-// Automatic station family: one more synced burst of a family; lock to it once it leads both others by
-// more than 10
+// Automatic station family (sdrtrunk's automatic mode, DMRSyncModeMonitor.java, GPL-3, Dennis Sheirer,
+// with its fix for issue #2623, commit 77e9e97d). A synced burst counts for its family only when it
+// follows another synced burst within Family_sync_gap_us (400 ms: a superframe, the longest a
+// transmission goes between syncs, and a little), so the isolated false syncs noise gives over a long
+// idle do not add up; the channel locks to a family once its count leads both others by more than 10.
+// After Family_idle_us (5 s) without a synced burst the counts are cleared and, if a family was locked,
+// every family enabled is looked for again: a channel that carried one kind of traffic (direct mode,
+// say) is not deaf to another kind (its repeater) for the rest of its life
+static uint64_t const Family_sync_gap_us = 400000;
+static uint64_t const Family_idle_us = 5000000;
 static char const *family_name(enum dmr_station m){
   return m == DMR_STATION_BS ? "base station" : m == DMR_STATION_MS ? "mobile station" : m == DMR_STATION_DIRECT ? "direct mode" : "unknown";
 }
-static void note_family(struct dmr_chan *c,enum dmr_sync sync){
+static void family_notice(struct dmr_chan *c,uint64_t when_us,char const *text){
+  if(c->h.notice != NULL)
+    c->h.notice(c->h.arg,c->anchored ? (int64_t)when_us * 1000 : 0,text);
+}
+static void note_family(struct dmr_chan *c,enum dmr_sync sync,uint64_t when_us){
+  bool const consecutive = c->last_sync_us != 0 && when_us >= c->last_sync_us && when_us - c->last_sync_us <= Family_sync_gap_us;
+  c->last_sync_us = when_us;
+  if(c->family != DMR_STATION_UNKNOWN || !consecutive)
+    return;
   enum dmr_station const mode = dmr_mode_of(sync);
   int const i = mode == DMR_STATION_BS ? 0 : mode == DMR_STATION_MS ? 1 : mode == DMR_STATION_DIRECT ? 2 : -1;
   if(i < 0)
@@ -421,16 +442,29 @@ static void note_family(struct dmr_chan *c,enum dmr_sync sync){
     if(a > b + 10 && a > d + 10){
       c->family = f == 0 ? DMR_STATION_BS : f == 1 ? DMR_STATION_MS : DMR_STATION_DIRECT;
       dmr_rx_restrict_family(c->rx,c->family);
-      if(c->h.notice != NULL){
-        char text[160];
-        snprintf(text,sizeof text,"stations auto: %s (synced bursts bs %llu ms %llu direct %llu); the other families are no longer looked for",
-                 family_name(c->family),(unsigned long long)c->family_syncs[0],(unsigned long long)c->family_syncs[1],
-                 (unsigned long long)c->family_syncs[2]);
-        c->h.notice(c->h.arg,c->anchored ? (int64_t)time_of_symbol(c,c->symbol_index) * 1000 : 0,text);
-      }
+      char text[200];
+      snprintf(text,sizeof text,"stations auto: %s (synced bursts bs %llu ms %llu direct %llu); the other families are not looked for until %.0f s without a sync",
+               family_name(c->family),(unsigned long long)c->family_syncs[0],(unsigned long long)c->family_syncs[1],
+               (unsigned long long)c->family_syncs[2],Family_idle_us * 1e-6);
+      family_notice(c,when_us,text);
       return;
     }
   }
+}
+// No synced burst for Family_idle_us: start counting again, every family enabled
+static void family_idle(struct dmr_chan *c,uint64_t now_us){
+  if(c->last_sync_us == 0 || now_us < c->last_sync_us || now_us - c->last_sync_us < Family_idle_us)
+    return;
+  c->last_sync_us = 0;
+  memset(c->family_syncs,0,sizeof c->family_syncs);
+  if(c->family == DMR_STATION_UNKNOWN)
+    return;
+  char text[160];
+  snprintf(text,sizeof text,"stations auto: no sync for %.0f s, %s unlocked; every family looked for again",Family_idle_us * 1e-6,
+           family_name(c->family));
+  c->family = DMR_STATION_UNKNOWN;
+  dmr_rx_restrict_family(c->rx,DMR_STATION_UNKNOWN);
+  family_notice(c,now_us,text);
 }
 
 // A CRC residual accepted for the first time (learn_crc_masks): worth a line whatever the verbosity
