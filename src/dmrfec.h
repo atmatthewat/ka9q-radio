@@ -80,7 +80,8 @@ void dmr_slot_type_from_burst(uint8_t const burst[264],float const confidence264
 struct dmr_soft dmr_golay20_decode(uint8_t const bits[20],float const confidence[20],float max_weighted_errors);
 
 // EMB of voice bursts B-F: data = (colour code << 3) | (PI << 2) | LCSS, in QR(16,7,6)
-// (PI is ETSI's pre-emption and power control indicator, not a privacy flag);
+// (PI is ETSI's pre-emption and power control indicator, not a privacy flag: PI = 1, the embedded field
+// carries reverse channel information for the other logical channel);
 // sent at burst bits 108-115 and 148-155
 uint32_t dmr_qr16_encode(uint32_t data7);
 void dmr_qr16_encode_bits(uint32_t data7,uint8_t bits[16]);

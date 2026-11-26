@@ -106,7 +106,7 @@ struct dmr_control_line {
   char const *channel_id;       // "site" for a line about the site
   uint8_t slot;                 // 1, 2; 0 = the carrier / the site
   uint8_t color_code;           // DMR_NO_COLOR_CODE = not known
-  char const *kind;             // "SLC", "LC", "PI", "ENC", "CSBK", "MBC", "GRANT", "ALIAS", "SITE", "REST", "MAP", "WARN"
+  char const *kind;             // "SLC", "LC", "PI", "ENC", "EMB", "CSBK", "MBC", "GRANT", "ALIAS", "SITE", "REST", "MAP", "WARN"
   char const *text;
   uint32_t repeats;             // a count line: the repeats it stands for
   char const *formatted;        // the whole line

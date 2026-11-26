@@ -1021,6 +1021,12 @@ void dmr_elc_on_voice_burst(struct dmr_elc_assembler *a,struct dmr_elc_result *r
     return;
   }
 
+  // PI = 1: the field carries reverse channel information for the other logical channel (TS 102 361-1
+  // 9.3.2), not a fragment of this channel's LC; the LC being assembled cannot be completed
+  if(b->emb_pi){
+    elc_abandon(a);
+    return;
+  }
   switch(b->emb_lcss){
   case DMR_LCSS_FIRST:
     elc_abandon(a);

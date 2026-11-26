@@ -120,7 +120,8 @@
 //        once per transmission (from the first voice LC header, PI header or voice burst on the timeslot
 //          to the first other burst there, or slot_gap_dibits, 4,800 = 1 s, of silence): voice LC header,
 //          PI header, terminator, each different embedded LC, burst F encryption parameters, and
-//          "EMB PI=1" (an unconfirmed indicator: PI is ETSI's pre-emption and power control bit);
+//          "EMB PI=1" (ETSI's pre-emption and power control indicator: the embedded field carries
+//          reverse channel information for the other logical channel; not an encryption indicator);
 //        every time: a completed talker alias with the talker of its transmission (one that completes
 //          before the talker is known waits for it, radio unknown if the transmission ends first), and
 //          "CSBK CRC FAIL ..." the 3rd time a (CSBKO, FID, observed mask) comes and every 1,000th after;
@@ -2312,7 +2313,7 @@ static void control_plane(struct dmr_cplane *c,struct dmr_burst const *b,struct 
     if(b->kind != DMR_KIND_VOICE_A && b->emb_valid && b->emb_pi){
       c->counters.emb_pi_set++;
       if(first_in_transmission(slot,"EMBPI"))
-        line(c,slot_number,cc,"ENC","EMB PI=1 (the EMB's pre-emption and power control indicator; set by some systems on encrypted calls and by others on clear ones; unconfirmed)");
+        line(c,slot_number,cc,"EMB","EMB PI=1: the embedded field carries reverse channel information for the other logical channel (TS 102 361-1 9.3.2)");
     }
     if(m->has_embedded_lc){
       struct dmr_lc const *lc = &m->embedded_lc.lc;

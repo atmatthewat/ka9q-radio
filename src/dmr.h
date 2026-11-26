@@ -143,7 +143,8 @@ struct dmr_burst {
   uint8_t slot_type_errors; // bits corrected
 
   // Voice bursts B-F: the EMB (QR(16,7,6)). emb_pi is ETSI's pre-emption and power control indicator,
-  // NOT a privacy flag
+  // NOT a privacy flag: set, the embedded field carries reverse channel information for the other
+  // logical channel (TS 102 361-1 9.3.2), not a fragment of this one's embedded LC
   bool emb_valid;
   bool emb_pi;
   enum dmr_lcss emb_lcss;

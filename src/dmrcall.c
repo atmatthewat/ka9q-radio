@@ -53,9 +53,10 @@
 //     encryption parameters, says encrypted; burst F decoded as another message (null, TXI, reverse
 //     channel) says clear. On systems whose LCs do not carry the privacy bit, burst F says encrypted
 //     in every superframe, and the LCs saying clear between do not undo it.
-// Nothing else counts. The EMB's PI bit is ETSI's pre-emption and power control indicator, not a
-// privacy flag: some systems set it on clear calls, and under this rule that would mute them, so it
-// is only counted (emb_pi[][]). An LC valid only through a learned CRC residual (dmrmsg.h) gives
+// Nothing else counts. The EMB's PI bit is ETSI's pre-emption and power control indicator: PI = 1 says
+// the embedded field carries reverse channel information for the other logical channel (TS 102 361-1
+// 9.3.2, table 9.19). It says nothing of encryption ("privacy indicator" is the PI header's), so it is
+// only counted, against what the transmission's LCs said (emb_pi[][]). An LC valid only through a learned CRC residual (dmrmsg.h) gives
 // identity and may say encrypted, never clear. An embedded LC counts as saying clear only when its
 // four bursts B-E all belong to this transmission since its last gap (more than voice_gap_us without
 // a confirmed burst), so that one assembled across an unseen boundary cannot.
