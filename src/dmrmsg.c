@@ -45,9 +45,10 @@
 //                                 BPTC only: the 96 bits are handed on, DMR_DATA_UNCHECKED, for the
 //                                 code that parses them and owns their CRC.
 //   rate 3/4, rate 1, reserved    Not BPTC coded: the 196 bits go on as sent, DMR_DATA_NOT_BPTC.
-// From sdrtrunk these are not taken: its inverted LC validity (LCMessageFactory.java:134), its mask
-// learning (DMRCrcMaskManager, which marks failing LCs valid after two sightings), and its one-bit
-// "correction" by CRC.
+// From sdrtrunk these are not taken: its inverted LC validity (LCMessageFactory.java:134) and its
+// one-bit "correction" by CRC. Its mask learning (DMRCrcMaskManager, which marks failing LCs valid
+// after two sightings) is done here only when asked for (learn_crc_masks; dmr_crc_learner below), and
+// a learned LC never says clear (dmrcall.c).
 //
 // The link control (TS 102 361-2 7.1.1): PF (1), reserved (1), FLCO (6), FID (8), then 56 bits that
 // depend on the (FID, FLCO) pair. Field positions are sdrtrunk's (lc/full/*.java, LCOpcode.java,
@@ -290,7 +291,7 @@ static void lc_gps(struct dmr_lc *lc,uint8_t const *lc9){
   lc->body = DMR_LCB_GPS_INFO;
 }
 // Hytera XPT channel grant (FID 0x68 FLCO 0x09): DSD-FME's layout (ISC, src/dmr_flco.c:330-345; dsd-neo,
-// GPL-3, src/protocol/dmr/dmr_flco.c:591-605, the same, with the reserved bit as group): the call's
+// ISC, src/protocol/dmr/dmr_flco.c:591-605, the same, with the reserved bit as group): the call's
 // LCN 16-19, free repeater 24-27, handshake 28-31, a 16-bit target 32-47 and a 16-bit source 56-71, as
 // XPT addresses are 8-bit groups and 16-bit units. sdrtrunk's 24-bit target at 24-47 and source at 48-71
 // (HyteraXptChannelGrant.java) read its own capture, 49 68 50 10 00 34 00 2A F9 (a terminator LC that
@@ -1681,6 +1682,7 @@ void dmr_msg_options_init(struct dmr_msg_options *o){
   o->hidden_iv_max_golay_errors = 3;
   o->single_burst_max_corrected = DMR_SINGLE_BURST_MAX_CORRECTED;
   o->slot_gap_dibits = 4800;
+  o->learn_crc_masks = false;
 }
 
 static void slot_reset(struct dmr_msg_slot *s){

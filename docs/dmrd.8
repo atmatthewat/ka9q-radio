@@ -45,8 +45,8 @@ Name the voice output is advertised under. Default: not advertised.
 .B "\-D group, \-\-data\-out group"
 Send every packet data packet, with the octets it carried, and every unified
 single block to this multicast group: one RTP datagram each, payload type 98,
-a 48-octet header and the data (layout in dmrd.md). Without it packet data is
-only logged.
+a 48-octet header, the packet's data header(s) as received, and the data
+(layout in dmrd.md). Without it packet data is only logged.
 .TP
 .B "\-T ttl, \-\-ttl ttl"
 Multicast TTL of the voice and packet output. Default 0: this host only.
@@ -211,8 +211,9 @@ nothing is held back. A transmission starts clear. A checked link control word
 with the privacy bit set, a PI header or burst F's encryption parameters make
 it encrypted; only a word of the same kind saying otherwise (a link control
 word with the bit clear; burst F carrying a null or TXI message) undoes it. A damaged
-word mislabels the voice until the next word of its kind, at most a superframe
-(360 ms).
+word mislabels the voice until the next word of its kind decodes: one comes
+every superframe (360 ms), but on a fading signal they are lost too, and an
+encrypted call can then come out clear (as noise) for seconds.
 .SH SIGNALS
 SIGUSR1 increases verbosity; SIGUSR2 decreases it. SIGINT, SIGTERM and SIGQUIT
 stop dmrd; transmissions in progress are ended and the repeaters it asked for
@@ -243,7 +244,9 @@ Norbury and others, GPL-3) were used as references for DMR implementation
 details, along with ETSI TS 102 361. Taken from them, with a credit beside each
 in the source: the sync words, the code tables and layouts, the CRC masks, the
 link control, talker alias, CSBK and packet data layouts, and the rules for
-learning CRC masks and choosing the station family automatically. Speech
+learning CRC masks and choosing the station family automatically. The Hytera
+XPT channel grant layout and the Motorola MNIS packet data CRC span follow
+DSD-FME (lwvmobile) and dsd-neo (arancormonk), both ISC. Speech
 decoding uses mbelib (https://github.com/szechyjs/mbelib) when it is installed.
 .PP
 Much of what is here was first worked out, prototyped and run in production by

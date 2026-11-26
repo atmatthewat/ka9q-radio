@@ -63,11 +63,13 @@
 // a confirmed burst), so that one assembled across an unseen boundary cannot.
 //
 // What that costs, accepted so that no clear voice is lost. A damaged word that passes its checks with
-// wrong contents mislabels the voice until the next word of its kind: an embedded LC or a burst F comes
-// once a superframe (360 ms). One saying encrypted in a clear transmission mutes that much speech; one
-// saying clear in an encrypted transmission lets that much through, decoded to noise. An encrypted
-// transmission entered late (its header missed) is decoded until its first embedded LC or burst F
-// says encrypted, up to a superframe. A rule that held voice until a word confirmed it clear, and asked
+// wrong contents mislabels the voice until the next word of its kind decodes. An embedded LC or a
+// burst F comes once a superframe (360 ms), but on a fading signal they are lost too, so it can be
+// seconds: in a simulation with about 15% of bursts damaged and sync lost every 200 bursts, runs of up
+// to 2.3 s of an encrypted call were let through. One saying encrypted in a clear transmission mutes
+// that much speech; one saying clear in an encrypted transmission lets that much through, decoded to
+// noise. An encrypted transmission entered late (its header missed) is decoded until its first
+// embedded LC or burst F that says encrypted decodes. A rule that held voice until a word confirmed it clear, and asked
 // two words to agree before muting, lost clear voice at a weak signal, where the confirming word often
 // failed.
 //

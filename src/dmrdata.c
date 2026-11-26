@@ -813,7 +813,7 @@ static void end_packet(struct dmr_data_assembler *a,struct slot_state *s,enum dm
       dmr_data_crc32_observed(&p->crc32_observed,p->payload,(int)total);
       // Motorola MNIS (a vendor format; TS 102 361-1 B.3.9 has the CRC over the blocks' data alone):
       // the CRC covers the MNIS header's octets 3-9 and the data octets but the one just before the
-      // CRC. dsd-neo's rule (GPL-3, src/protocol/dmr/dmr_block.c dmr_block_type1_update_crc(), after
+      // CRC. dsd-neo's rule (ISC, src/protocol/dmr/dmr_block.c dmr_block_type1_update_crc(), after
       // node-dmr-lib DataBlock.getBuffer()), and the only span that passes on the LRRP packet of
       // lwvmobile/dsd-fme#283; with the standard span no MNIS packet ever completed. Either passes
       if(p->crc_stored != p->crc_computed && s->has_second && s->second.kind == DMR_DH_MOTOROLA_MNIS
@@ -924,8 +924,24 @@ static void handle_header(struct dmr_data_assembler *a,struct slot_state *s,stru
     }
     end_packet(a,s,DMR_PACKET_NEW_HEADER);
   }
-  if(h.blocks_to_follow == 0)
-    return;  // a header with nothing after it: status, an ACK
+  if(h.blocks_to_follow == 0){
+    // A header with nothing after it (status / precoded short data, a response): a packet of its own,
+    // all of it in the header
+    s->header = h;
+    s->has_second = false;
+    memset(&s->second,0,sizeof s->second);
+    s->confirmed = false;
+    s->block_count = 0;
+    s->cursor = 0;
+    s->any_block = false;
+    s->duplicates = 0;
+    s->first_timestamp_us = b->timestamp_us;
+    s->last_timestamp_us = b->timestamp_us;
+    s->color_code = b->color_code;
+    s->slot = b->slot;
+    end_packet(a,s,DMR_PACKET_ALL_BLOCKS);
+    return;
+  }
 
   s->open = true;
   s->header = h;

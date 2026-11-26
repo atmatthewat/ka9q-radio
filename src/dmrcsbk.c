@@ -22,10 +22,11 @@
 // payload bits (16-79), and a CRC-CCITT of bits 0-79, inverted and XORed with 0xA5A5 (0xAAAA for a
 // multi-block header). The CRC rule: a block that fails is never parsed and never acted on. Some
 // systems use another mask (Motorola's "RAS" among them); sdrtrunk learns such a mask after two
-// sightings and from then on accepts it unasked (DMRCrcMaskManager.java). That is not done here. The
+// sightings and from then on accepts it unasked (DMRCrcMaskManager.java). This layer does not learn: the
 // mask that would have made the block pass is computed for every block (observed_mask), a counter keeps
 // how often each (CSBKO, FID, mask) has come, and accepting anything but 0xA5A5 is the caller's
-// explicit choice, by passing that mask. A bit error also produces an "observed mask", a different one
+// explicit choice, by passing that mask. The message layer's learner (dmr_crc_learner, dmrmsg.c) makes
+// that choice when asked to (dmrd -L). A bit error also produces an "observed mask", a different one
 // each time, which is why a count and a deliberate decision come before anything is believed. The
 // counter holds 256 entries; when it is full the entries seen once (bit errors, mostly) are dropped,
 // and if it is still full the new one is not recorded.

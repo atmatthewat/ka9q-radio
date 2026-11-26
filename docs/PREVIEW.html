@@ -2178,8 +2178,9 @@ freq = &quot;857m98125&quot;</pre>
     group</b></a></dt>
   <dd>Send every packet data packet, with the octets it carried, and every
       unified single block to this multicast group: one RTP datagram each,
-      payload type 98, a 48-octet header and the data (layout in dmrd.md).
-      Without it packet data is only logged.</dd>
+      payload type 98, a 48-octet header, the packet's data header(s) as
+      received, and the data (layout in dmrd.md). Without it packet data is only
+      logged.</dd>
   <dt id="T"><a class="permalink" href="#T"><b>-T ttl, --ttl ttl</b></a></dt>
   <dd>Multicast TTL of the voice and packet output. Default 0: this host
     only.</dd>
@@ -2341,7 +2342,9 @@ lcn = &quot;1 2&quot;</pre>
     parameters make it encrypted; only a word of the same kind saying otherwise
     (a link control word with the bit clear; burst F carrying a null or TXI
     message) undoes it. A damaged word mislabels the voice until the next word
-    of its kind, at most a superframe (360 ms).</p>
+    of its kind decodes: one comes every superframe (360 ms), but on a fading
+    signal they are lost too, and an encrypted call can then come out clear (as
+    noise) for seconds.</p>
 </section>
 <section class="Sh">
 <h1 class="Sh" id="SIGNALS"><a class="permalink" href="#SIGNALS">SIGNALS</a></h1>
@@ -2381,7 +2384,9 @@ lcn = &quot;1 2&quot;</pre>
     credit beside each in the source: the sync words, the code tables and
     layouts, the CRC masks, the link control, talker alias, CSBK and packet data
     layouts, and the rules for learning CRC masks and choosing the station
-    family automatically. Speech decoding uses mbelib
+    family automatically. The Hytera XPT channel grant layout and the Motorola
+    MNIS packet data CRC span follow DSD-FME (lwvmobile) and dsd-neo
+    (arancormonk), both ISC. Speech decoding uses mbelib
     (https://github.com/szechyjs/mbelib) when it is installed.</p>
 <p class="Pp">Much of what is here was first worked out, prototyped and run in
     production by the author in the receivers&#x00A0;behind&#x00A0;scanrad.io.

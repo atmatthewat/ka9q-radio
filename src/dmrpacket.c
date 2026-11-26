@@ -7,7 +7,8 @@
 //   2      record: 1 packet, 2 unified single block
 //   3      flags (DMR_PACKET_*)
 //   4      slot (1, 2; 0 not known)
-//   5      reserved, 0
+//   5      octets of data headers after the fixed header: 12 (the data header), 24 (and the vendor's
+//          second header that followed it), 0 for a single block
 //   6-7    network code: the DMR colour code
 //   8      format: a packet's data header kind (dmrdata.h enum dmr_data_header_kind); a single block's
 //          service type
@@ -22,11 +23,14 @@
 //   35     algorithm
 //   36-37  key ID
 //   38-46  message indicator, 72 bits: DMR's 32-bit IV in octets 43-46, the rest 0
-//   47     reserved, 0
-//   48-    the octets: trimmed (flag), the user data; otherwise every block's data octets in place,
-//          pad and CRC included, missing blocks zero-filled. Their bit length is the datagram's octets
-//          less 48, times 8, except in trimmed short data and UDT, whose last octet may be partly pad:
-//          the bit length then is in the format's own fields (and in dmrd's log line)
+//   47     trimmed: pad bits at the end of the last data octet (short data and UDT pad in bits or
+//          nibbles), 0-7; else 0
+//   48-    the data headers, 12 octets each as decoded (CRC included): every field the fixed header
+//          does not carry (a short data or UDT format and its pad, a response's class and status, a
+//          status, the MNIS prefix of a Motorola second header) is there
+//   then   the data: trimmed (flag), the user data; otherwise every block's data octets in place, pad
+//          and CRC included, missing blocks zero-filled. None for a header with no blocks (status /
+//          precoded short data, a response). Its bit length: 8 times its octets, less octet 47
 #include <string.h>
 
 #include "dmrdataapp.h"
@@ -57,7 +61,8 @@ static void header(uint8_t *b,int record,uint8_t flags,uint8_t slot,uint8_t colo
 
 size_t dmr_packet_encode(uint8_t *buf,size_t size,struct dmr_data_packet const *p,uint32_t frequency_hz){
   size_t const n = p->payload_length <= sizeof p->payload ? p->payload_length : sizeof p->payload;
-  if(size < DMR_PACKET_HEADER + n)
+  size_t const headers = (p->has_second_header ? 2 : 1) * DMR_PACKET_DATA_HEADER;
+  if(size < DMR_PACKET_HEADER + headers + n)
     return 0;
   uint8_t flags = 0;
   if(p->complete) flags |= DMR_PACKET_COMPLETE;
@@ -79,8 +84,18 @@ size_t dmr_packet_encode(uint8_t *buf,size_t size,struct dmr_data_packet const *
     put16(buf + 36,p->key_id);
     put32(buf + 43,p->iv);
   }
-  memcpy(buf + DMR_PACKET_HEADER,p->payload,n);
-  return DMR_PACKET_HEADER + n;
+  buf[5] = (uint8_t)headers;
+  if(p->payload_trimmed && 8 * n > p->payload_bits)
+    buf[47] = (uint8_t)(8 * n - p->payload_bits);
+  uint8_t *cp = buf + DMR_PACKET_HEADER;
+  memcpy(cp,p->header.octets,DMR_PACKET_DATA_HEADER);
+  cp += DMR_PACKET_DATA_HEADER;
+  if(p->has_second_header){
+    memcpy(cp,p->second_header.octets,DMR_PACKET_DATA_HEADER);
+    cp += DMR_PACKET_DATA_HEADER;
+  }
+  memcpy(cp,p->payload,n);
+  return DMR_PACKET_HEADER + headers + n;
 }
 
 size_t dmr_packet_encode_single_block(uint8_t *buf,size_t size,struct dmr_usbd const *u,uint32_t frequency_hz){

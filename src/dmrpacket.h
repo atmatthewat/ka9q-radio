@@ -27,8 +27,9 @@ enum {
   DMR_PACKET_CRC_CHECKED = 0x20,      // the packet CRC could be checked (every block arrived) ...
   DMR_PACKET_CRC_OK = 0x40,           // ... and passed
   DMR_PACKET_RETRANSMISSION = 0x80,   // repeats the previous complete confirmed packet
-  DMR_PACKET_HEADER = 48,             // octets before the data
-  DMR_PACKET_MAX = DMR_PACKET_HEADER + DMR_DATA_MAX_OCTETS,
+  DMR_PACKET_HEADER = 48,             // the fixed header; the data headers follow it, then the data
+  DMR_PACKET_DATA_HEADER = 12,        // one data header as decoded, CRC included
+  DMR_PACKET_MAX = DMR_PACKET_HEADER + 2 * DMR_PACKET_DATA_HEADER + DMR_DATA_MAX_OCTETS,
 };
 
 // The datagram for a packet that ended (its octets as dmrdata.h delivers them), heard on a carrier

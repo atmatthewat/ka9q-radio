@@ -68,10 +68,14 @@
 // reach such a number only above 1,342,177 (a DMR talkgroup has 24 bits; on a system using larger
 // ones two streams could meet: a later change maps them explicitly).
 //
-// Site-level state is deliberately not here: one radiod and a fixed list of repeater channels for
-// now. Which radiod and SSRC serves a frequency, the channel map and grant following belong in a
-// site layer kept apart from these per-channel decoders, for trunked systems spanning more than one
-// radiod.
+// Sites and following. What a site's channels share (its identity, channel map, rest channel, the
+// control log) is the site layer's (dmrsite.c), kept apart from the per-channel decoders: a site's
+// channels may come from more than one radiod and run on different threads. Each channel of a site
+// (from the sites file, -f, or one site per carrier without it) is attached to it, and the site hands
+// back the channels its messages announce. Which to ask for is decided here (follow(): -g, -x, -m),
+// and which radiod serves a frequency by asking each in turn until one covers it; a channel dmrd asked
+// for is kept while it carries a wanted call (keep_followed()). A dark site's other repeaters are
+// probed one at a time to find its control or rest channel (hunt()).
 
 #define MAX_MCAST 20   // Maximum number of input groups
 #define RESEQ 32       // Resequencing queue, packets. radiod sends one to three packets per 20 ms block
@@ -214,7 +218,7 @@ static int Nsites;
 
 // Call following: the radiods channels may be asked of, each by its command group as its channels'
 // status names it, with a channel's format to ask in. Which radiod serves a frequency is decided by
-// asking each in turn until one covers it (locate_radio()), so a site may span receivers
+// asking each in turn until one covers it (follow()), so a site may span receivers
 #define MAX_RADIOS 8
 struct radio {
   struct sockaddr_storage control;
@@ -229,14 +233,28 @@ static bool Follow = true;            // -n: don't
 static double Hold = 5.0;             // -H: a followed channel is kept this long after the last sign of a call
 static int const Ctl_ttl = 1;         // commands to radiod, as tune and control send them
 #define MAX_ASKED 256
+// What a channel dmrd asked for is wanted for now: what the latest announcement of it said (follow()),
+// or the hunt. Only a wanted call is counted by -m; a call's voice keeps the channel only while the call
+// is wanted
+enum asked_for {
+  ASKED_CALL,                         // a call to follow
+  ASKED_UNWANTED,                     // a call refused (-g, -x, -m): left to run out
+  ASKED_REST,                         // a site's rest channel
+  ASKED_PROBE,                        // hunting a dark site's control channel
+};
 static struct {
-  uint32_t ssrc;                      // SSRCs dmrd has asked for (under Ctl_mutex): a decoder on one is
-  int radio;                          // a followed channel, even once radiod has let it go
+  uint32_t ssrc;                      // SSRCs dmrd created in radiod (chanctl_ours(); under Ctl_mutex): a
+  int radio;                          // decoder on one is a followed channel, even once radiod has let it go
   int64_t logged;
-  bool rest;                          // asked for as a site's rest channel, not for a call (not counted by -m)
-  bool probe;                         // asked for while hunting a dark site's control channel (ditto)
+  enum asked_for purpose;
 } Asked[MAX_ASKED];
 static int Nasked;
+// SSRCs a decoder runs on (under Ctl_mutex; a session per sender, so an SSRC may be here twice): a
+// channel radiod carries before its status has been seen or the site knows the decoder is on it, which
+// follow() must not ask for (a command to a channel radiod made would give it a lifetime)
+#define MAX_LIVE 1024
+static uint32_t Live[MAX_LIVE];
+static int Nlive;
 struct tg_range { uint32_t lo,hi; };
 #define MAX_TG_RANGES 64
 static struct tg_range Allow[MAX_TG_RANGES],Deny[MAX_TG_RANGES]; // -g, -x
@@ -905,6 +923,10 @@ static int start_decoder(struct session *sp){
     return -1;
   }
   sp->running = true;
+  pthread_mutex_lock(&Ctl_mutex);
+  if(Nlive < MAX_LIVE)
+    Live[Nlive++] = sp->ssrc;
+  pthread_mutex_unlock(&Ctl_mutex);
   return 0;
 }
 
@@ -919,6 +941,14 @@ static void close_session(struct session *sp,char const *reason){
     pthread_mutex_unlock(&sp->qmutex);
     pthread_join(sp->thread,NULL);
     sp->running = false;
+    pthread_mutex_lock(&Ctl_mutex);
+    for(int i=0; i < Nlive; i++){
+      if(Live[i] == sp->ssrc){
+        Live[i] = Live[--Nlive];
+        break;
+      }
+    }
+    pthread_mutex_unlock(&Ctl_mutex);
   }
   if(Verbose)
     session_event(sp,0,"closed (%s): packets %'llu drops %'llu dupes %'llu filled %'llu resyncs %'llu overruns %'llu unusable %'llu",
@@ -1102,8 +1132,10 @@ static void *decode_task(void *arg){
       dmr_chan_samples(dec.chan,bp->samples,bp->count,bp->time); // voice_frame(), voice_event() run in here
     if(Follow && dec.chan != NULL)
       keep_followed(&dec,bp->time);
+    // Frames now due on the streams this channel is a source of are played. Before its status gives
+    // the block a time, the channel has none to give (0, ignored): never dmrd's own clock
     int64_t const end = bp->time != 0 ? bp->time + llrint(1e9 * bp->count / dec.samprate) : 0;
-    dmr_voter_poll(Voter,end); // frames now due are played
+    dmr_voter_poll(Voter,sp->receiver,end);
     dec.samples += bp->count;
     FREE(bp);
     if(Verbose && Update > 0 && dec.samples >= dec.next_report){
@@ -1183,10 +1215,6 @@ static void voice_event(void *arg,struct dmr_chan_event const *e){
   }
 }
 
-// A voted stream ended: how many frames each repeater supplied
-// A line of the carrier's control log (CSBKs, link control, the site's identity, rest channel, grants
-// and warnings), on the channel's thread. Repeats are collapsed into counts by the log. Its own
-// timestamp is local time; ours is the signal's, as for every other line
 // A control log line as dmrd writes it after its own time and channel: slot, colour code, kind, text,
 // and a count line's "(xN since ..., last ...)". False for a line not written at this verbosity: link
 // control (LC, SLC) says again what the transmission lines say, so it is written only at -v
@@ -1213,6 +1241,9 @@ static bool control_text(char *buf,size_t size,struct dmr_control_line const *li
   return true;
 }
 
+// A line of the carrier's control log (CSBKs, link control, the site's identity, rest channel, grants
+// and warnings), on the channel's thread. Repeats are collapsed into counts by the log. Its own
+// timestamp is local time; ours is the signal's, as for every other line
 static void control_line(void *arg,struct dmr_control_line const *line){
   struct decoder const * const dp = arg;
   char text[DMR_SITE_LINE_MAX + 64];
@@ -1475,8 +1506,6 @@ static void observe_radio(struct session *sp){
   pthread_mutex_unlock(&Ctl_mutex);
 }
 
-// Ask for the repeater an announcement names, unless a decoder is already on it that dmrd did not ask
-// for. 'who' and 'when' are for the line written when a channel is first asked for
 // Talkgroup ranges (-g, -x): DMR talkgroups are 24 bits, so ranges rather than lists
 static bool in_ranges(struct tg_range const *r,int n,struct dmr_follow const *f){
   for(int i=0; i < n; i++){
@@ -1503,11 +1532,24 @@ static bool talkgroup_wanted(struct dmr_follow const *f){
     return false;
   return Nallow == 0 || in_ranges(Allow,Nallow,f);
 }
-// Calls followed now (under Ctl_mutex): channels dmrd asked for for a call, still asked for or up
-static int calls_followed(void){
+static bool live_ssrc(uint32_t ssrc){ // under Ctl_mutex
+  for(int i=0; i < Nlive; i++)
+    if(Live[i] == ssrc)
+      return true;
+  return false;
+}
+static int find_asked(uint32_t ssrc){ // under Ctl_mutex; -1: not asked for
+  for(int j=0; j < Nasked; j++)
+    if(Asked[j].ssrc == ssrc)
+      return j;
+  return -1;
+}
+// Calls followed now (under Ctl_mutex): channels dmrd asked for for a wanted call, still asked for or
+// up, but Asked[except]
+static int calls_followed(int except){
   int n = 0;
   for(int j=0; j < Nasked; j++){
-    if(Asked[j].rest || Asked[j].probe)
+    if(j == except || Asked[j].purpose != ASKED_CALL)
       continue;
     enum chanctl_state const st = chanctl_state(Radios[Asked[j].radio].ctl,Asked[j].ssrc,NULL,NULL);
     n += st == CHANCTL_PENDING || st == CHANCTL_UP;
@@ -1535,8 +1577,10 @@ static bool refusal_due(uint64_t hz,uint32_t talkgroup){
 }
 
 // Ask for the repeater an announcement names, unless a decoder is already on it that dmrd did not ask
-// for, or the call is one not to follow (-g, -x, -m; never the rest channel). 'who' and 'when' are for
-// the lines written
+// for, or the call is one not to follow (-g, -x, -m; never the rest channel). Every announcement of a
+// channel dmrd asked for says what it is wanted for now: a call on the rest channel dmrd follows (as a
+// Capacity Plus call takes the rest channel) is checked and counted like any other, and a refused one is
+// no longer kept by its voice. 'who' and 'when' are for the lines written
 static void follow(char const *who,int64_t when,struct dmr_follow const *f){
   if(f->frequency_hz == 0)
     return; // nowhere to tune: the site has logged it
@@ -1558,24 +1602,21 @@ static void follow(char const *who,int64_t when,struct dmr_follow const *f){
       continue;
     tried = true;
     uint32_t const ssrc = chanctl_ssrc(r->ctl,(double)f->frequency_hz,&r->format);
-    int asked = -1;
-    for(int j=0; j < Nasked && asked < 0; j++)
-      if(Asked[j].ssrc == ssrc)
-        asked = j;
-    if(f->attached && asked < 0){
+    int asked = find_asked(ssrc);
+    if(asked < 0 && (f->attached || (live_ssrc(ssrc) && chanctl_state(r->ctl,ssrc,NULL,NULL) == CHANCTL_NONE))){
       covered = true;
-      break; // a channel radiod carries anyway: nothing to do
+      break; // a channel radiod carries anyway (the site may not know the decoder yet): nothing to do
     }
-    enum chanctl_state const st = chanctl_state(r->ctl,ssrc,NULL,NULL);
-    bool const following = asked >= 0 && (st == CHANCTL_PENDING || st == CHANCTL_UP);
-    if(!f->rest && !following){
-      // A new call: is it one to follow?
+    if(!f->rest){
+      // A call: is it one to follow? (A call dmrd follows already counts itself once)
       char why[96] = "";
       if(!talkgroup_wanted(f))
         snprintf(why,sizeof why,"talkgroup %u%s not wanted (-g, -x)",f->talkgroup,f->talkgroup_bits < 24 ? " (low 8 bits)" : "");
-      else if(Max_calls > 0 && calls_followed() >= Max_calls)
+      else if(Max_calls > 0 && calls_followed(asked) >= Max_calls)
         snprintf(why,sizeof why,"already following %d calls (-m)",Max_calls);
       if(why[0] != '\0'){
+        if(asked >= 0)
+          Asked[asked].purpose = ASKED_UNWANTED; // not refreshed: it goes when its time runs out
         if(refusal_due(f->frequency_hz,f->talkgroup))
           snprintf(text,sizeof text,"not followed %s: %s; %s",where,why,f->what);
         covered = true;
@@ -1592,17 +1633,16 @@ static void follow(char const *who,int64_t when,struct dmr_follow const *f){
         snprintf(text,sizeof text,"can't follow %s: %s",where,strerror(errno));
       break;
     }
-    if(asked < 0 && Nasked < MAX_ASKED){
+    // Recorded only if dmrd made it: a channel radiod already had (seen in its status) is not ours to
+    // count or keep
+    if(asked < 0 && Nasked < MAX_ASKED && chanctl_ours(r->ctl,ssrc)){
       asked = Nasked++;
       Asked[asked].ssrc = ssrc;
       Asked[asked].radio = i;
       Asked[asked].logged = 0;
-      Asked[asked].rest = f->rest;
-      Asked[asked].probe = false;
-    } else if(asked >= 0 && !following){
-      Asked[asked].rest = f->rest; // asked for again: for what, now
-      Asked[asked].probe = false;
     }
+    if(asked >= 0)
+      Asked[asked].purpose = f->rest ? ASKED_REST : ASKED_CALL;
     // A line when the channel is asked for while no decoder is on it (at most every 2 s: the
     // announcements repeat until its I/Q arrives)
     int64_t const now_ns = gps_time_ns();
@@ -1686,8 +1726,8 @@ static bool was_asked(uint32_t ssrc){
   return asked;
 }
 
-// A followed channel is kept while it carries voice, checked twice a second. Not any burst: a repeater
-// that is also a rest channel sends its beacons between calls
+// A followed channel is kept while it carries voice, checked twice a second, unless its call was refused
+// (-g, -x, -m). Not any burst: a repeater that is also a rest channel sends its beacons between calls
 // A probe (hunting) is kept while it carries any bursts: a control channel's beacons are what was sought.
 // Each channel of a configured site also says when the site was last heard, for hunting
 static void keep_followed(struct decoder *dp,int64_t now){
@@ -1705,11 +1745,10 @@ static void keep_followed(struct decoder *dp,int64_t now){
   if(!bursts)
     return;
   pthread_mutex_lock(&Ctl_mutex);
-  bool probe = false;
-  for(int j=0; j < Nasked; j++)
-    if(Asked[j].ssrc == dp->sp->ssrc)
-      probe = Asked[j].probe;
-  if(voice || probe){
+  int const asked = find_asked(dp->sp->ssrc);
+  bool const probe = asked >= 0 && Asked[asked].purpose == ASKED_PROBE;
+  bool const refused = asked >= 0 && Asked[asked].purpose == ASKED_UNWANTED;
+  if((voice && !refused) || probe){
     for(int i=0; i < Nradios; i++){
       if(chanctl_ours(Radios[i].ctl,dp->sp->ssrc)){
         chanctl_refresh(Radios[i].ctl,dp->sp->ssrc);
@@ -1769,19 +1808,15 @@ static void hunt(int64_t now){
             continue; // the next radiod
           break;
         }
-        int asked = -1;
-        for(int j=0; j < Nasked && asked < 0; j++)
-          if(Asked[j].ssrc == ssrc)
-            asked = j;
-        if(asked < 0 && Nasked < MAX_ASKED){
+        int asked = find_asked(ssrc);
+        if(asked < 0 && Nasked < MAX_ASKED && chanctl_ours(rd->ctl,ssrc)){
           asked = Nasked++;
           Asked[asked].ssrc = ssrc;
           Asked[asked].radio = r;
           Asked[asked].logged = 0;
-          Asked[asked].rest = false;
         }
         if(asked >= 0)
-          Asked[asked].probe = true;
+          Asked[asked].purpose = ASKED_PROBE;
         cs->probe_until = now + (int64_t)(Probe_time * BILLION);
         if(Verbose){
           char ts[100];
@@ -1799,6 +1834,7 @@ static void hunt(int64_t now){
   }
 }
 
+// A voted stream ended: how many frames each repeater supplied
 static void vote_end(void *arg,struct dmr_vote_result const *r){
   (void)arg;
   char text[512];

@@ -302,14 +302,16 @@ struct p25_audio_group {
   uint8_t pt;                           // RTP payload type
   atomic_flag send_error_logged;
   // RTP sequence numbers by SSRC. A trunked talkgroup's stream moves between channels (each its
-  // own struct p25_audio), so its numbering is kept here to stay continuous for the listener
+  // own struct p25_audio), so its numbering is kept here to stay continuous for the listener. When
+  // the table is full the stream that sent longest ago makes room
   pthread_mutex_t lock;
   struct {
     uint32_t ssrc;
     uint16_t seq;
     bool used;
-  } seqs[64];
-  int next_seq;                         // slot reused next when the table is full
+    uint64_t sent;                      // the group's count of sends when it last sent
+  } seqs[256];
+  uint64_t sends;
 };
 
 static socklen_t socklen(struct sockaddr_storage const *s){
@@ -435,22 +437,24 @@ static uint16_t get_seq(struct p25_audio_group *g,uint32_t ssrc){
 static void put_seq(struct p25_audio_group *g,uint32_t ssrc,uint16_t seq){
   int const n = (int)(sizeof g->seqs / sizeof g->seqs[0]);
   pthread_mutex_lock(&g->lock);
-  int slot = -1;
+  int slot = -1,free_slot = -1,stalest = 0;
   for(int i=0; i < n; i++){
     if(g->seqs[i].used && g->seqs[i].ssrc == ssrc){
       slot = i;
       break;
     }
-    if(slot < 0 && !g->seqs[i].used)
-      slot = i;
+    if(!g->seqs[i].used){
+      if(free_slot < 0)
+        free_slot = i;
+    } else if(g->seqs[i].sent < g->seqs[stalest].sent)
+      stalest = i;
   }
-  if(slot < 0){
-    slot = g->next_seq;
-    g->next_seq = (g->next_seq + 1) % n;
-  }
+  if(slot < 0)
+    slot = free_slot >= 0 ? free_slot : stalest;
   g->seqs[slot].ssrc = ssrc;
   g->seqs[slot].seq = seq;
   g->seqs[slot].used = true;
+  g->seqs[slot].sent = ++g->sends;
   pthread_mutex_unlock(&g->lock);
 }
 

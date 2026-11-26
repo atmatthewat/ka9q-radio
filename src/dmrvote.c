@@ -52,9 +52,20 @@
 // Only clear frames come in (dmrd passes nothing else), so voting never lets a frame through that its
 // own repeater's tracker had not labelled clear.
 //
+// Whose clock. Each channel's times are its own radiod's (the RTP timestamps its status ties to that
+// radiod's clock), and channels decode in their own threads, so at any moment their times differ: by
+// the blocks they work in, by tens of milliseconds between radiods, by more when a clock is wrong or a
+// thread falls behind. A stream is therefore played by its own sources' times only, each taken onto the
+// stream's frame numbers by that source's alignment (a source aligned to frame k0 by its frame at
+// first_when is ahead of the stream by first_when - (base + 20 k0 ms)): the newest of those is the
+// stream's time. A channel that carries none of the stream's sources never moves it, so one radiod's
+// clock running ahead, or a channel that is idle, takes no frame from a stream it has no part in. When
+// no source has reported a time, the newest frame offered stands in for it.
+//
 // End. A stream ends when every source has ended and every frame due has been played, or when no
-// frame has come for Idle; its result (frames played, lost, and per source the frames offered,
-// chosen, and the corrections in them) goes to the end handler.
+// frame has come for Idle by its time, or (its channels gone, so nothing moves its time) for Gone by
+// the local clock, after what it holds is played; its result (frames played, lost, and per source the
+// frames offered, chosen, and the corrections in them) goes to the end handler.
 
 enum {
   MAX_STREAMS = 32,
@@ -69,6 +80,7 @@ enum {
 static int64_t const Frame_ns = 20000000;
 static int64_t const Idle_ns = 1000000000;
 static int64_t const Takeover_ns = 300000000;
+static int64_t const Gone_ns = 5000000000;
 
 struct candidate {
   bool have;
@@ -108,6 +120,7 @@ struct source {
   int chosen;
   int fec;
   int64_t last_when;
+  int64_t offset;        // aligned: how far its times are ahead of the stream's (first_when - base - 20 k0 ms)
 };
 
 struct stream {
@@ -120,6 +133,8 @@ struct stream {
   int64_t last_frame;    // time of the last frame offered (any source)
   int64_t last_aligned;  // ... by an aligned source
   int64_t max_k;         // highest frame number offered
+  int64_t latest;        // newest time of an aligned source's frame, in the stream's time; 0 none
+  int64_t last_local;    // local clock when a frame was last offered (for Gone)
   int last_source;
   struct candidate ring[RING];
   struct source src[MAX_SOURCES];
@@ -127,10 +142,11 @@ struct stream {
   int lost;
 };
 
-struct signal {
+struct signal {           // a receiver: its signal measurements, and the newest time it has reported
   uint32_t channel;      // the receiver
   double frequency;
   float bb_power,n0,low,high;
+  int64_t now;           // its newest time (dmr_voter_poll()); 0 not yet
   uint64_t updated;      // the voter's count of updates when it was last set: the stalest goes when full
 };
 
@@ -138,7 +154,7 @@ struct dmr_voter {
   pthread_mutex_t lock;
   struct p25_audio_group *group;
   int64_t delay;
-  int64_t now;           // latest time any channel has reported
+  int64_t now;           // the newest time given for every stream (receiver 0); 0 none
   uint64_t signal_updates;
   dmr_vote_end_fn end_fn;
   void *end_arg;
@@ -177,26 +193,37 @@ void dmr_voter_set_end_handler(struct dmr_voter *v,dmr_vote_end_fn fn,void *arg)
   v->end_arg = arg;
 }
 
-void dmr_voter_set_signal(struct dmr_voter *v,uint32_t channel,double frequency,float bb_power,float n0,float low,float high){
-  if(v == NULL)
-    return;
-  pthread_mutex_lock(&v->lock);
-  // Receivers come and go (a followed channel is a new one each time): when the table is full the
-  // entry set longest ago, a receiver that is gone, makes room
-  struct signal *entry = NULL,*stalest = NULL;
+// A receiver's entry, made if need be (under the lock). Receivers come and go (a followed channel is a
+// new one each time): when the table is full the entry set longest ago, a receiver that is gone, makes
+// room
+static struct signal *receiver_entry(struct dmr_voter *v,uint32_t channel){
+  struct signal *stalest = NULL;
   for(int i=0; i < MAX_CHANNELS; i++){
     struct signal * const g = &v->signals[i];
     if(g->channel == channel){
-      entry = g;
-      break;
+      g->updated = ++v->signal_updates;
+      return g;
     }
     // An empty entry if there is one, else the one set longest ago
     if(stalest == NULL || (stalest->channel != 0 && (g->channel == 0 || g->updated < stalest->updated)))
       stalest = g;
   }
-  if(entry == NULL)
-    entry = stalest;
-  *entry = (struct signal){channel,frequency,bb_power,n0,low,high,++v->signal_updates};
+  memset(stalest,0,sizeof *stalest);
+  stalest->channel = channel;
+  stalest->updated = ++v->signal_updates;
+  return stalest;
+}
+
+void dmr_voter_set_signal(struct dmr_voter *v,uint32_t channel,double frequency,float bb_power,float n0,float low,float high){
+  if(v == NULL)
+    return;
+  pthread_mutex_lock(&v->lock);
+  struct signal * const g = receiver_entry(v,channel);
+  g->frequency = frequency;
+  g->bb_power = bb_power;
+  g->n0 = n0;
+  g->low = low;
+  g->high = high;
   pthread_mutex_unlock(&v->lock);
 }
 
@@ -277,6 +304,9 @@ static void offer(struct stream *s,int si,int64_t k,int fec,uint32_t u01,bool cl
   struct source * const src = &s->src[si];
   src->offered++;
   src->fec += fec;
+  if(s->base + k * Frame_ns > s->latest)
+    s->latest = s->base + k * Frame_ns;
+  s->last_local = gps_time_ns();
   if(k < s->next_k)
     return; // its frame has been played already
   if(k >= s->next_k + RING)
@@ -336,6 +366,7 @@ static void try_align(struct stream *s,int si){
   src->aligned = true;
   src->k0 = found;
   src->first_when = run[0].when;
+  src->offset = src->first_when - (s->base + found * Frame_ns);
   // Its pending frames are offered now
   for(int i=0; i < n; i++){
     struct pending const * const p = &src->pend[i];
@@ -454,6 +485,7 @@ static void frame(struct dmr_voter *v,uint32_t ssrc,uint32_t own_ssrc,char const
     src->aligned = true;
     src->k0 = 0;
     src->first_when = when;
+    src->offset = 0;
   }
   if(!src->aligned && s->last_aligned != 0 && when - s->last_aligned > Takeover_ns){
     // Nothing aligned is coming: this source carries on, placed by its time
@@ -462,6 +494,7 @@ static void frame(struct dmr_voter *v,uint32_t ssrc,uint32_t own_ssrc,char const
     src->npending = 0;
     src->k0 = round_frames(when - s->base);
     src->first_when = when;
+    src->offset = src->first_when - (s->base + src->k0 * Frame_ns);
   }
   if(src->aligned){
     offer(s,si,src->k0 + round_frames(when - src->first_when),fec,u01,clean,bits);
@@ -533,26 +566,55 @@ void dmr_voter_source_end(struct dmr_voter *v,uint32_t ssrc,uint32_t channel,int
   pthread_mutex_unlock(&v->lock);
 }
 
-void dmr_voter_poll(struct dmr_voter *v,int64_t now){
-  if(v == NULL)
-    return;
-  if(now == 0)
-    now = gps_time_ns();
+// A stream's time (under the lock): the newest its aligned sources' receivers have reported, each taken
+// onto the stream's frame numbers, else the newest frame offered; the time given for every stream, if
+// newer. 0: none yet
+static int64_t stream_time(struct dmr_voter const *v,struct stream const *s){
+  int64_t t = s->latest;
+  for(int j=0; j < MAX_SOURCES; j++){
+    struct source const * const src = &s->src[j];
+    if(!src->used || !src->aligned)
+      continue;
+    struct signal const * const g = find_signal(v,src->channel);
+    if(g != NULL && g->now != 0 && g->now - src->offset > t)
+      t = g->now - src->offset;
+  }
+  if(v->now > t)
+    t = v->now;
+  return t;
+}
+
+void dmr_voter_poll(struct dmr_voter *v,uint32_t receiver,int64_t now){
+  if(v == NULL || now == 0)
+    return; // a receiver that knows no time yet (no status) says nothing
   pthread_mutex_lock(&v->lock);
-  if(now > v->now)
-    v->now = now;
-  now = v->now; // channels report a little apart: the stream plays by the latest
+  if(receiver == 0){
+    if(now > v->now)
+      v->now = now;
+  } else {
+    struct signal * const g = receiver_entry(v,receiver);
+    if(now > g->now)
+      g->now = now;
+  }
+  int64_t const local = gps_time_ns();
   for(int i=0; i < MAX_STREAMS; i++){
     struct stream * const s = &v->streams[i];
     if(!s->used)
       continue;
-    play(v,s,now);
+    int64_t const t = stream_time(v,s);
+    if(t != 0)
+      play(v,s,t);
     bool all_ended = true;
     for(int j=0; j < MAX_SOURCES; j++)
       if(s->src[j].used && !s->src[j].ended)
         all_ended = false;
-    if((all_ended && s->next_k > s->max_k) || now - s->last_frame > Idle_ns + v->delay)
+    if((all_ended && s->next_k > s->max_k) || (t != 0 && s->latest != 0 && t - s->latest > Idle_ns + v->delay))
       end_stream(v,s);
+    else if(s->last_local != 0 && local - s->last_local > Gone_ns){
+      // Nothing moves its time any more: what it holds is played, then it ends
+      play(v,s,s->base + (s->max_k + 1) * Frame_ns + v->delay);
+      end_stream(v,s);
+    }
   }
   pthread_mutex_unlock(&v->lock);
 }

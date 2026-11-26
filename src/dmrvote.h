@@ -47,8 +47,11 @@ void dmr_voter_frame(struct dmr_voter *v,uint32_t ssrc,uint32_t own_ssrc,char co
                      uint8_t const bits[DMR_VOICE_FRAME_BITS],int64_t when);
 // That repeater slot's transmission ended (it offers no more frames to the stream)
 void dmr_voter_source_end(struct dmr_voter *v,uint32_t ssrc,uint32_t receiver,int slot);
-// The time now on some channel: frames now due are played, streams with nothing left end
-void dmr_voter_poll(struct dmr_voter *v,int64_t now);
+// The time now on a receiver (its signal time; 0: not known, ignored): frames now due on the streams it
+// is a source of are played, and streams with nothing left end. Each stream plays by its own sources'
+// receivers' times only, so a receiver whose clock is ahead takes nothing from another's stream.
+// Receiver 0: a time for every stream (one clock for all: tests, replays)
+void dmr_voter_poll(struct dmr_voter *v,uint32_t receiver,int64_t now);
 // The signal measurements for a channel's status (see p25_audio_set_signal()): used for the stream a
 // channel last contributed to
 void dmr_voter_set_signal(struct dmr_voter *v,uint32_t receiver,double frequency,float bb_power,float n0,float low,float high);

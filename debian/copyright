@@ -24,8 +24,12 @@ Files:
  src/dsync.c
  src/rs63.*
  docs/p25d.*
+ docs/dmrd.*
  config/examples/fragments/p25.conf
+ config/examples/fragments/dmr.conf
+ config/examples/dmrd-sites.conf
  service/p25d@.service.in
+ service/dmrd@.service.in
 Copyright:
  2026 Matthew Kaufman, KA6SQG
 License: GPL-3.0+
@@ -34,9 +38,17 @@ Comment:
  the multi-fragment messages) and src/p25alias.c (Motorola talker alias
  table) hold tables after sdrtrunk, Copyright Dennis
  Sheirer, and OP25, Copyright Max H. Parke KA1RBI, Graham J. Norbury and
- others, both GPL-3.0+; each is credited beside the table. src/dmrfec.c
- likewise holds the DMR Hamming generator matrices, CACH bit positions,
- block product code layouts and CRC masks as sdrtrunk and OP25 have them.
+ others, both GPL-3.0+; each is credited beside the table. The DMR sources
+ likewise hold tables and layouts as sdrtrunk and OP25 have them, each
+ credited beside it: src/dmrfec.c (Hamming generator matrices, CACH bit
+ positions, block product code layouts, RS(12,9), CRC masks), src/dmrtypes.c
+ (sync words), src/dmrmsg.c (link control, talker alias and burst
+ layouts), src/dmrcsbk.c (the CSBK opcode table and message layouts),
+ src/dmrdata.c and src/dmrdataapp.c (packet data header, block and
+ application layouts) and src/dmrchan.c (the rule for choosing the station
+ family automatically). src/dmrmsg.c (the Hytera XPT channel grant layout)
+ and src/dmrdata.c (the Motorola MNIS CRC span) follow DSD-FME and dsd-neo,
+ ISC, Copyright lwvmobile and arancormonk.
 
 License: GPL-3.0+
  This package is free software: you can redistribute it and/or modify

@@ -167,16 +167,16 @@ uint8_t dmr_elc_checksum(uint8_t const lc[72]);
 void dmr_elc_checksum_append(uint8_t info[77]);
 bool dmr_elc_checksum_check(uint8_t const info[77]);
 // CRC-9 of a confirmed data block (x^9 + x^6 + x^4 + x^3 + 1, inverted, masked): its ndata data bits
-// and 7-bit serial number, data first unless serial_first. UNCONFIRMED (see dmrfec.c)
+// and 7-bit serial number, data first unless serial_first. Settled against on-air vectors (dmrfec.c)
 #define DMR_CRC9_MASK_RATE12 0x0F0
 #define DMR_CRC9_MASK_RATE34 0x1FF
 #define DMR_CRC9_MASK_RATE1 0x10F
 uint16_t dmr_crc9(uint8_t const *data,int ndata,uint8_t serial,uint16_t mask,bool serial_first);
-// CRC-32 of packet data. UNCONFIRMED (see dmrfec.c)
+// CRC-32 of packet data. Its octet order settled against on-air vectors (dmrfec.c)
 uint32_t dmr_crc32_bits(uint8_t const *bits,int n);                       // plain division
 uint32_t dmr_packet_crc32(uint8_t const *octets,int noctets);             // noctets even
 bool dmr_packet_crc32_check(uint8_t const *octets,int noctets);           // last 4 octets, lsb first
-// CRC-7 of reverse channel signalling (x^7 + x^5 + x^2 + x + 1). The mask is UNCONFIRMED
+// CRC-7 of reverse channel signalling (x^7 + x^5 + x^2 + x + 1), masked as table B.21 gives it
 #define DMR_CRC7_MASK_REVERSE_CHANNEL 0x7A
 uint8_t dmr_crc7(uint8_t const *bits,int n,uint8_t mask);
 

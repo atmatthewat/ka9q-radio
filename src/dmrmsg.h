@@ -593,7 +593,7 @@ struct dmr_msg_options {
   uint64_t slot_gap_dibits; // a slot's assembly state is dropped after this long silent
   bool learn_crc_masks;     // accept LCs with a learned CRC residual (dmr_crc_learner; default off)
 };
-void dmr_msg_options_init(struct dmr_msg_options *o); // data defaults, 3, 2, 4800
+void dmr_msg_options_init(struct dmr_msg_options *o); // data defaults, 3, 2, 4800, masks not learned
 
 // What one burst produced
 struct dmr_burst_messages {

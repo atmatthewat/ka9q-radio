@@ -35,12 +35,15 @@
 // per-channel decoders for the same reason: the channels of one site may be on different receivers
 // and threads, and the site is what joins them.
 //
-// Grant following is not built here. Every grant goes to the handlers' grant function with the
-// frequency it resolves to (the hook); a follower decides from it (talkgroup lists, data or voice,
-// encryption, how many at once, hang time), asks dmr_site_locate() which radiod and SSRC carry the
-// frequency, asks that radiod for the channel, and attaches a new channel's decoder to the site
-// (dmr_site_attach(); dmr_site_detach() when it lets the channel go). The site's P_CLEAR hook names the
-// channel and slot whose call has ended, for that channel's call tracker.
+// Following is decided by the owner, not here. Every grant goes to the handlers' grant function with
+// the frequency it resolves to, and every channel a message announces (a grant, a Capacity Plus rest
+// channel or busy LSN, a channel naming its own call) to the follow function, with what the site knows
+// of it: LCN, frequency, slot, whether a decoder is attached, and the call's talkgroup when the message
+// gives it. The owner decides (talkgroup lists, how many at once), finds the radiod that covers the
+// frequency, asks it for the channel, and attaches the new channel's decoder to the site
+// (dmr_site_attach(); dmr_site_detach() when it lets the channel go). Every announcement of one message
+// is handed on: a Site Status names the rest channel and up to 24 busy LSNs. The site's P_CLEAR hook
+// names the channel and slot whose call has ended, for that channel's call tracker.
 //
 // Threads. The site is shared: one mutex, held for a few table updates. What an entry point decides to
 // write or call (log lines, the grant and clear hooks) is collected under the lock and done after it is
@@ -848,7 +851,9 @@ struct actions {
   uint64_t grant_hz[DMR_MAX_GRANTS];
   bool have_clear;
   int nfollows;
-  struct dmr_follow follows[8];
+  // One message's: a Capacity Plus Site Status names the rest channel and up to
+  // DMR_CAP_PLUS_ACTIVITY_MAX busy ones, a CSBK up to DMR_MAX_GRANTS grants
+  struct dmr_follow follows[1 + DMR_CAP_PLUS_ACTIVITY_MAX + DMR_MAX_GRANTS];
   struct dmr_site_context clear_channel;
   uint8_t clear_slot;
   struct dmr_site_handlers h;   // the hooks as they were under the lock
@@ -934,18 +939,33 @@ static bool same_frequency(struct dmr_site const *s,uint64_t a,uint64_t b){
   return (a > b ? a - b : b - a) <= s->o.frequency_tolerance_hz;
 }
 // The channel of an LCN (lcn != 0), else of a frequency (hz != 0), configured or attached
+// The repeater with this LCN, else this frequency. Two entries can name one repeater (two radiods, or a
+// decoder the hunt started beside a configured one): the one a decoder is attached to, else the first
 static struct site_channel *find_channel(struct dmr_site *s,uint16_t lcn,uint64_t hz){
   if(lcn != 0){
+    struct site_channel *found = NULL;
     for(int i=0; i < s->nchannels; i++){
-      if(s->channels[i].lcn == lcn)
-        return &s->channels[i];
+      if(s->channels[i].lcn == lcn){
+        if(s->channels[i].attached)
+          return &s->channels[i];
+        if(found == NULL)
+          found = &s->channels[i];
+      }
     }
+    if(found != NULL)
+      return found;
   }
   if(hz != 0){
+    struct site_channel *found = NULL;
     for(int i=0; i < s->nchannels; i++){
-      if(s->channels[i].frequency_hz != 0 && same_frequency(s,s->channels[i].frequency_hz,hz))
-        return &s->channels[i];
+      if(s->channels[i].frequency_hz != 0 && same_frequency(s,s->channels[i].frequency_hz,hz)){
+        if(s->channels[i].attached)
+          return &s->channels[i];
+        if(found == NULL)
+          found = &s->channels[i];
+      }
     }
+    return found;
   }
   return NULL;
 }

@@ -191,9 +191,9 @@ struct dmr_follow {
 };
 struct dmr_site_handlers {
   // GRANT FOLLOWING HOOK. Every grant the site hears (voice and data, repeats included), with the
-  // frequency its CG_AP block or the channel map gives it (0: not known). Following is not done here:
-  // a follower decides from the grant and asks dmr_site_locate() which radiod and SSRC serve the
-  // frequency. Called on the thread of the channel the grant was heard on, no lock held
+  // frequency its CG_AP block or the channel map gives it (0: not known). The site does not follow it:
+  // the follow hook below names the channel to a follower, which decides. Called on the thread of the
+  // channel the grant was heard on, no lock held
   void (*grant)(void *arg,struct dmr_site *site,struct dmr_grant const *g,uint64_t frequency_hz);
   // A P_CLEAR heard on a channel's timeslot (reason "P_CLEAR"): end the call there
   // (dmr_call_end_call()). On that channel's thread, no lock held
