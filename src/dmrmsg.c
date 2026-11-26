@@ -81,8 +81,9 @@
 //
 // Burst F. With EMB LCSS "single fragment" the 32 bits are one self-contained (32,11) codeword. ETSI
 // has two forms: the second row repeats the first (the null message, 11 zero bits) or is its
-// complement (reverse channel: 4 RC bits and a CRC-7, sent with EMB PI = 1). The forms are 16 bits
-// apart, so both are tried and at most one decodes. The reverse channel's CRC-7 mask is not confirmed
+// complement (reverse channel: 4 RC bits and a CRC-7). The EMB's PI says which (TS 102 361-1 9.3.2,
+// 6.4.2: an RC burst has LCSS single and PI = 1), and only that form is decoded; the other is tried
+// too, but only to count (single_burst_form_mismatch) the bursts in which it alone would decode. The reverse channel's CRC-7 mask is not confirmed
 // (OP25 expects residue 0 with its check compiled out), so the residue is reported, not used. The
 // vendor "short burst" layout (sdrtrunk, voice/embedded/*.java and VoiceSuperFrameProcessor.java,
 // after patents EP2347540B1 and US8271009B2; one source) has the opcode in bits 8-10 of the 11:
@@ -1110,20 +1111,19 @@ void dmr_single_burst_parse(struct dmr_single_burst *s,uint32_t info11,bool reve
   }
 }
 
-bool dmr_single_burst_decode_burst(struct dmr_single_burst *s,struct dmr_burst const *b,float max_corrected){
+bool dmr_single_burst_decode_burst(struct dmr_single_burst *s,struct dmr_burst const *b,float max_corrected,
+                                   bool reverse_channel,bool *other_form){
   uint8_t bits[32];
   float confidence[32];
   dmr_embedded_from_burst(b->bits,b->confidence,bits,confidence);
-  for(int form=0; form < 2; form++){
-    bool const reverse = form == 1;
-    struct dmr_soft const d = dmr_single_burst_decode(bits,confidence,reverse,max_corrected);
-    if(!d.valid)
-      continue;
-    dmr_single_burst_parse(s,d.data,reverse);
-    s->corrected = d.errors;
-    return true;
-  }
-  return false;
+  if(other_form != NULL)
+    *other_form = dmr_single_burst_decode(bits,confidence,!reverse_channel,max_corrected).valid;
+  struct dmr_soft const d = dmr_single_burst_decode(bits,confidence,reverse_channel,max_corrected);
+  if(!d.valid)
+    return false;
+  dmr_single_burst_parse(s,d.data,reverse_channel);
+  s->corrected = d.errors;
+  return true;
 }
 
 int dmr_single_burst_describe(char *buf,size_t size,struct dmr_single_burst const *s){
@@ -1768,11 +1768,14 @@ static void on_voice(struct dmr_msg_decoder *dec,struct dmr_burst const *b,struc
   if(b->kind != DMR_KIND_VOICE_A && b->emb_valid && b->emb_lcss == DMR_LCSS_SINGLE){
     if(position < 0)
       position = 5;
-    m->has_single_burst = dmr_single_burst_decode_burst(&m->single_burst,b,dec->options.single_burst_max_corrected);
+    m->has_single_burst = dmr_single_burst_decode_burst(&m->single_burst,b,dec->options.single_burst_max_corrected,
+                                                        b->emb_pi,&m->single_burst_form_mismatch);
     if(m->has_single_burst)
       dec->counters.single_bursts++;
     else
       dec->counters.single_bursts_undecoded++;
+    if(m->single_burst_form_mismatch)
+      dec->counters.single_burst_form_mismatch++;
   }
   m->superframe_position = position;
   struct dmr_hidden_iv iv;

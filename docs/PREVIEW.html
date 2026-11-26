@@ -2339,9 +2339,9 @@ lcn = &quot;1 2&quot;</pre>
     wins, and nothing is held back. A transmission starts clear. A checked link
     control word with the privacy bit set, a PI header or burst F's encryption
     parameters make it encrypted; only a word of the same kind saying otherwise
-    (a link control word with the bit clear; burst F carrying something else)
-    undoes it. A damaged word mislabels the voice until the next word of its
-    kind, at most a superframe (360 ms).</p>
+    (a link control word with the bit clear; burst F carrying a null or TXI
+    message) undoes it. A damaged word mislabels the voice until the next word
+    of its kind, at most a superframe (360 ms).</p>
 </section>
 <section class="Sh">
 <h1 class="Sh" id="SIGNALS"><a class="permalink" href="#SIGNALS">SIGNALS</a></h1>

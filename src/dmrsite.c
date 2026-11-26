@@ -2331,6 +2331,12 @@ static void control_plane(struct dmr_cplane *c,struct dmr_burst const *b,struct 
     }
     if(b->kind != DMR_KIND_VOICE_A && b->emb_valid && b->emb_lcss == DMR_LCSS_SINGLE && !m->has_single_burst)
       c->counters.single_bursts_undecoded++;
+    if(m->single_burst_form_mismatch){
+      c->counters.single_burst_form_mismatch++;
+      if(first_in_transmission(slot,"FFORM"))
+        line(c,slot_number,cc,"EMB",b->emb_pi ? "BURST F: EMB PI=1 but only the single burst form decodes (not used)"
+                                                : "BURST F: EMB PI=0 but only the reverse channel form decodes (not used)");
+    }
     if(m->has_single_burst && m->single_burst.kind == DMR_SB_ENCRYPTION_PARAMETERS){
       c->counters.burst_f_encryption++;
       char desc[DMR_DESCRIBE_MAX];

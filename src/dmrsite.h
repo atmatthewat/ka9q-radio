@@ -361,6 +361,7 @@ struct dmr_cplane_counters {
   uint64_t refused_by_data_type[16];      // the slot type decoded, BPTC found no codeword
   uint64_t embedded_lc_failed;
   uint64_t single_bursts_undecoded;
+  uint64_t single_burst_form_mismatch; // only the form PI did not select decodes
   uint64_t csbk_crc_failed;
   uint64_t mbc_header_crc_failed;
   uint64_t mbc_crc_failed;

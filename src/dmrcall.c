@@ -50,8 +50,9 @@
 //     header or embedded LC with the privacy bit clear says clear. (A terminator ends the transmission
 //     anyway: its "clear" would change nothing.)
 //   The encryption parameters. A PI header (CRC-CCITT), with the algorithm, key and MI, or burst F's
-//     encryption parameters, says encrypted; burst F decoded as another message (null, TXI, reverse
-//     channel) says clear. On systems whose LCs do not carry the privacy bit, burst F says encrypted
+//     encryption parameters, says encrypted; burst F decoded as another message of this channel (null,
+//     TXI) says clear. A reverse channel burst (EMB PI = 1) is the other logical channel's and says
+//     nothing. On systems whose LCs do not carry the privacy bit, burst F says encrypted
 //     in every superframe, and the LCs saying clear between do not undo it.
 // Nothing else counts. The EMB's PI bit is ETSI's pre-emption and power control indicator: PI = 1 says
 // the embedded field carries reverse channel information for the other logical channel (TS 102 361-1
@@ -886,9 +887,10 @@ static void on_voice(struct dmr_call_tracker *t,uint8_t slot,struct dmr_burst co
       tx->key_id = f->key_id;
     }
     parameters_say(t,tx,true,BY_BURST_F);
-  } else if(m->has_single_burst && m->single_burst.kind != DMR_SB_UNKNOWN){
-    parameters_say(t,tx,false,BY_BURST_F); // burst F decoded as another message: no parameters
+  } else if(m->has_single_burst && (m->single_burst.kind == DMR_SB_NULL || m->single_burst.kind == DMR_SB_TXI_DELAY)){
+    parameters_say(t,tx,false,BY_BURST_F); // this channel's burst F, another message: no parameters
   }
+  // A reverse channel burst (EMB PI = 1) is the other logical channel's: it says nothing of this one
   if(m->has_embedded_lc){
     // The LC's four fragments came in the slot's last four voice bursts: all this transmission's,
     // and after its last gap, when it has had four since

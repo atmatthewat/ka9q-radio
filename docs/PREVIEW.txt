@@ -2129,8 +2129,8 @@ INPUT AND OUTPUT
        control word with the privacy bit set, a PI header or burst F's
        encryption parameters make it encrypted; only a word of the same kind
        saying otherwise (a link control word with the bit clear; burst F
-       carrying something else) undoes it. A damaged word mislabels the voice
-       until the next word of its kind, at most a superframe (360 ms).
+       carrying a null or TXI message) undoes it. A damaged word mislabels the
+       voice until the next word of its kind, at most a superframe (360 ms).
 
 SIGNALS
        SIGUSR1 increases verbosity; SIGUSR2 decreases it. SIGINT, SIGTERM and

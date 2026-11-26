@@ -427,9 +427,13 @@ struct dmr_single_burst {
 #define DMR_SINGLE_BURST_MAX_CORRECTED 2.0f
 bool dmr_short_burst_crc3_ok(uint32_t info11);
 void dmr_single_burst_parse(struct dmr_single_burst *s,uint32_t info11,bool reverse_channel_form);
-// Decode the 32 embedded bits of a voice burst (EMB LCSS single fragment). False if neither form of
-// the code decodes within max_corrected (confidence-weighted) corrections
-bool dmr_single_burst_decode_burst(struct dmr_single_burst *s,struct dmr_burst const *b,float max_corrected);
+// Decode the 32 embedded bits of a voice burst (EMB LCSS single fragment) in the form the EMB's PI
+// selects (TS 102 361-1 9.3.2, 6.4.2): reverse_channel (PI = 1) the reverse channel form, else the
+// single burst (or null) form. False if it does not decode within max_corrected (confidence-weighted)
+// corrections. *other_form (may be NULL): the other form would have decoded (not used: evidence of a
+// damaged or nonstandard EMB)
+bool dmr_single_burst_decode_burst(struct dmr_single_burst *s,struct dmr_burst const *b,float max_corrected,
+                                   bool reverse_channel,bool *other_form);
 int dmr_single_burst_describe(char *buf,size_t size,struct dmr_single_burst const *s);
 
 // ---------------- IV hidden in the voice frames of a superframe ----------------
@@ -601,6 +605,7 @@ struct dmr_burst_messages {
   bool embedded_lc_failed; // four fragments were collected and failed BPTC or the checksum
   bool has_single_burst;   // burst F
   struct dmr_single_burst single_burst;
+  bool single_burst_form_mismatch; // the form the EMB's PI did not select would have decoded (not used)
   bool has_hidden_iv;
   struct dmr_hidden_iv hidden_iv;
   bool has_talker_alias;
@@ -619,6 +624,7 @@ struct dmr_msg_counters {
   uint64_t embedded_lc_failed;
   uint64_t single_bursts;
   uint64_t single_bursts_undecoded;
+  uint64_t single_burst_form_mismatch; // the form PI did not select would have decoded
   uint64_t short_lc_decoded;
   uint64_t talker_aliases;
 };
