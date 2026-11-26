@@ -1613,10 +1613,12 @@ void dmr_site_link_control(struct dmr_site *s,int handle,uint8_t slot,uint8_t co
     if(lc->body == DMR_LCB_HYTERA_VOICE)
       xpt_free_repeater(s,lc->u.hytera_voice.free_repeater,&a);
     else if(lc->body == DMR_LCB_HYTERA_XPT_GRANT){
-      if(lc->u.xpt_grant.channel != 0){
+      struct dmr_lc_hytera_xpt_grant const *g = &lc->u.xpt_grant;
+      xpt_free_repeater(s,g->free_repeater,&a);
+      if(g->channel != 0){
         char what[64];
-        format(what,sizeof what,"XPT channel grant tg=%u",lc->u.xpt_grant.target);
-        struct follow_who const who = {lc->u.xpt_grant.target, 24, true};
+        format(what,sizeof what,"XPT channel grant %s=%u",g->group ? "tg" : "unit",(unsigned)g->target);
+        struct follow_who const who = {g->target, 16, g->group};
         announce_on(s,NULL,lc->u.xpt_grant.channel,0,0,false,what,who,ch,now,&a);
       }
     }

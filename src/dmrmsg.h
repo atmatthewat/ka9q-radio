@@ -102,11 +102,16 @@ struct dmr_lc_hytera_voice {
   uint8_t priority_hash;     // bits 48-55
   uint16_t source;           // bits 56-71
 };
+// Hytera XPT channel grant ("call alert" in a terminator LC; dmrmsg.c says whose layout)
 struct dmr_lc_hytera_xpt_grant {
-  uint8_t channel;         // bits 16-19
-  uint8_t unknown;         // bits 20-23
-  uint32_t target;         // bits 24-47 (a talkgroup)
-  uint32_t source;         // bits 48-71
+  uint8_t channel;         // bits 16-19: the call's repeater (an LCN)
+  uint8_t state;           // bits 20-23: not known (7 seen while a call is set up, 0 once connected)
+  uint8_t free_repeater;   // bits 24-27
+  uint8_t handshake;       // bits 28-31: 0 ordinary, 1-2 interrupts
+  bool group;              // the LC's reserved bit (bit 1): a group call, else a private one
+  uint16_t target;         // bits 32-47: the talkgroup (XPT's are 8 bits) or called unit
+  uint8_t unknown;         // bits 48-55
+  uint16_t source;         // bits 56-71
 };
 // Terminator data LC (ends a data transmission)
 struct dmr_lc_terminator_data {

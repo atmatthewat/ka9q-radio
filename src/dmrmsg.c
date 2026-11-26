@@ -289,12 +289,24 @@ static void lc_gps(struct dmr_lc *lc,uint8_t const *lc9){
   lc->kind = DMR_LC_GPS_INFO;
   lc->body = DMR_LCB_GPS_INFO;
 }
+// Hytera XPT channel grant (FID 0x68 FLCO 0x09): DSD-FME's layout (ISC, src/dmr_flco.c:330-345; dsd-neo,
+// GPL-3, src/protocol/dmr/dmr_flco.c:591-605, the same, with the reserved bit as group): the call's
+// LCN 16-19, free repeater 24-27, handshake 28-31, a 16-bit target 32-47 and a 16-bit source 56-71, as
+// XPT addresses are 8-bit groups and 16-bit units. sdrtrunk's 24-bit target at 24-47 and source at 48-71
+// (HyteraXptChannelGrant.java) read its own capture, 49 68 50 10 00 34 00 2A F9 (a terminator LC that
+// passes RS(12,9) with mask 0x99), as talkgroup 1048628; this layout gives LCN 5, free repeater 1,
+// talkgroup 52, source 11001. sdrtrunk's own HyteraFullLC.java puts the free repeater at 24-27 and a
+// 16-bit target at 32-47 too
 static void lc_xpt_grant(struct dmr_lc *lc,uint8_t const *lc9){
   struct dmr_lc_hytera_xpt_grant *g = &lc->u.xpt_grant;
   g->channel = (uint8_t)octet_field(lc9,16,4);
-  g->unknown = (uint8_t)octet_field(lc9,20,4);
-  g->target = octet_field(lc9,24,24);
-  g->source = octet_field(lc9,48,24);
+  g->state = (uint8_t)octet_field(lc9,20,4);
+  g->free_repeater = (uint8_t)octet_field(lc9,24,4);
+  g->handshake = (uint8_t)octet_field(lc9,28,4);
+  g->group = lc->reserved_bit;
+  g->target = (uint16_t)octet_field(lc9,32,16);
+  g->unknown = lc9[6];
+  g->source = (uint16_t)octet_field(lc9,56,16);
   lc->kind = DMR_LC_HYTERA_XPT_CHANNEL_GRANT;
   lc->body = DMR_LCB_HYTERA_XPT_GRANT;
 }
@@ -516,7 +528,8 @@ int dmr_lc_describe(char *buf,size_t size,struct dmr_lc const *lc){
   }
   case DMR_LCB_HYTERA_XPT_GRANT: {
     struct dmr_lc_hytera_xpt_grant const *g = &lc->u.xpt_grant;
-    append(buf,size,&len," src=%u tg=%u channel=%u",(unsigned)g->source,(unsigned)g->target,(unsigned)g->channel);
+    append(buf,size,&len," src=%u %s=%u lcn=%u free=%u handshake=%u",(unsigned)g->source,g->group ? "tg" : "unit",
+           (unsigned)g->target,(unsigned)g->channel,(unsigned)g->free_repeater,(unsigned)g->handshake);
     break;
   }
   case DMR_LCB_TERMINATOR_DATA: {
