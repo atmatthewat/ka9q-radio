@@ -293,6 +293,7 @@ struct dmr_data_packet {
   bool crc_ok;
   uint32_t crc_stored;
   uint32_t crc_computed;
+  bool crc_mnis_span;          // it passed over Motorola MNIS's span, not the standard's (dmrdata.c)
   struct dmr_crc32_observed crc32_observed; // not for a UDT
   uint16_t udt_crc_observed_mask;           // UDT: the CRC-CCITT mask that would make it pass
 

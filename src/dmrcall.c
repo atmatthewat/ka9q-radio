@@ -45,8 +45,8 @@
 //
 // Two kinds of word say encrypted, and each is undone only by a word of its own kind. The transmission
 // is Encrypted while either says so:
-//   The LC. A checked voice LC header, embedded LC or terminator LC with the privacy bit set, a
-//     Capacity Plus encrypted voice LC, or a vendor encryption parameters LC, says encrypted; a checked
+//   The LC. A checked voice LC header, embedded LC or terminator LC with the privacy bit set (a
+//     Capacity Plus 0x20 LC included), or a vendor encryption parameters LC, says encrypted; a checked
 //     header or embedded LC with the privacy bit clear says clear. (A terminator ends the transmission
 //     anyway: its "clear" would change nothing.)
 //   The encryption parameters. A PI header (CRC-CCITT), with the algorithm, key and MI, or burst F's
@@ -848,8 +848,12 @@ static void on_voice(struct dmr_call_tracker *t,uint8_t slot,struct dmr_burst co
     bool const lc_encrypted = tx->lc_encrypted,parameters_encrypted = tx->parameters_encrypted;
     uint8_t const algorithm = tx->algorithm,key_id = tx->key_id;
     uint32_t const mi = tx->mi;
+    // The LC's four bursts are one superframe's (TS 102 361-1 7.1.3.0), so the LC that names the new
+    // talker is its own word: the bursts since the gap carry over, and it may say clear below
+    uint32_t const since_gap = tx->bursts_since_gap;
     end(t,slot,DMR_END_NEW_TALKER,now,END_BOUNDARY);
     tx = start(t,slot,DMR_START_NEW_TALKER,now);
+    tx->bursts_since_gap = since_gap;
     tx->lc_encrypted = lc_encrypted;
     tx->parameters_encrypted = parameters_encrypted;
     tx->algorithm = algorithm;

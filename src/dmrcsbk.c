@@ -1987,6 +1987,20 @@ void dmr_mbc_on_continuation(struct dmr_mbc_assembler *a,struct dmr_mbc_event *e
     p->active = false;
     return;
   }
+  // A continuation carrying absolute parameters (CG_AP, MV_AP, BC_AP, VN_AP) has its header's CSBKO
+  // in bits 2-7 (TS 102 361-4 tables 7.16, 7.18, 7.21, 7.72; dsd-neo dmr_abs_params.c checks it too):
+  // one that does not is another message's block, and the pair is not a message
+  if(p->header.fid == DMR_FID_STANDARD && dmr_mbc_carries_absolute(&p->header,p->mobile_sourced)){
+    uint8_t opcode = 0;
+    for(int i=2; i < 8; i++)
+      opcode = (uint8_t)((opcode << 1) | p->bits[i]);
+    if(opcode != p->header.opcode){
+      a->stats.opcode_mismatches++;
+      e->status = DMR_MBC_OPCODE_MISMATCH;
+      p->active = false;
+      return;
+    }
+  }
   struct dmr_csbk_message *m = &e->message;
   memset(m,0,sizeof *m);
   m->block = p->header;

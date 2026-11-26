@@ -395,8 +395,6 @@ static void event(struct dmr_chan *c,struct dmr_call_meta const *meta,struct dmr
 
 static void on_call_start(void *arg,struct dmr_call_meta const *meta,struct dmr_call_info const *info){
   struct dmr_chan * const c = arg;
-  if(info->slot <= 2)
-    c->alias[info->slot][0] = '\0'; // a new transmission's alias comes with it
   event(c,meta,info,true);
 }
 
@@ -408,6 +406,11 @@ static void on_call_end(void *arg,struct dmr_call_meta const *meta,struct dmr_ca
       dmr_cplane_reset_slot(c->cplane,info->slot);
   }
   event(c,meta,info,false);
+  // The next transmission's alias comes with it. Cleared at the end, not at the next start: a late
+  // entry's start is announced only once its talker is known, and an alias completed before then
+  // (the message layer reports it once) would be lost
+  if(info->slot <= 2)
+    c->alias[info->slot][0] = '\0';
 }
 
 // Automatic station family (sdrtrunk's automatic mode, DMRSyncModeMonitor.java, GPL-3, Dennis Sheirer,

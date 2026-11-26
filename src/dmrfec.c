@@ -56,8 +56,8 @@
 //     without the parity bit.
 //   QR(16,7,6): the (17,9) quadratic residue code (generator x^8 + x^5 + x^4 + x^3 + 1, a factor
 //     of x^17 + 1) shortened by two data bits, plus overall parity. Do not use the 128 words of
-//     sdrtrunk's EMB.java: for colour codes 8-15 they differ from this code by 0x0060 and, as a
-//     set, have minimum distance 4.
+//     sdrtrunk's EMB.java as it was at a0533156: for colour codes 8-15 they differ from this code by
+//     0x0060 and, as a set, have minimum distance 4 (fixed upstream by 26a24fc6, #2645).
 //   (32,11): one Hamming(16,11,4) row sent twice (its complement the second time for reverse
 //     channel signalling), distance 8.
 // How often a random word passes, by the limit. Hard decisions, counted (the codewords times the
@@ -104,8 +104,8 @@
 // The limits are tight for the Short LC and embedded LC because the checks that follow are weak
 // (1 wrong message in 256 and in 31 passes).
 // The check after the code (CRC, RS(12,9), CRC-8, checksum) is still needed: ok alone does not
-// make a message valid. sdrtrunk's single-burst decoder corrects only its first row; this one
-// decodes the whole 32 bits.
+// make a message valid. This single-burst decoder decodes the whole 32 bits (sdrtrunk's at a0533156
+// corrected only its first row; it now decodes both).
 //
 // RS(12,9). The 96 bits of a voice LC header or terminator are 12 octets: 9 of LC and 3 of parity.
 // GF(256) is the polynomials over GF(2) modulo x^8 + x^4 + x^3 + x^2 + 1 (0x11D); the generator is
@@ -126,10 +126,11 @@
 // it has 0x9696 for the PI header, which with the complement applied would fail every one). The
 // Short LC's CRC-8 (x^8 + x^2 + x + 1) is neither inverted nor masked; the embedded LC's 5-bit
 // checksum is the sum of its nine octets modulo 31. Nothing here corrects bits with a CRC.
-// Not confirmed against sdrtrunk, OP25 (neither checks them) or a capture, and to be settled
-// against captures before anything relies on them: the CRC-9 masks and bit order (data then serial
-// number, or the reverse; both are offered), the CRC-32 octet order (pairs swapped, no preset, not
-// inverted, stored least significant octet first) and the CRC-7 mask.
+// Settled against captures (ok-dmrlib's on-air vectors) and the standard: CRC-9 over the data then
+// the serial number, the serial number "the last seven bits" (TS 102 361-1 B.3.10), masked per data
+// type (table B.21); CRC-32 with pairs of octets swapped, no preset, not inverted, stored least
+// significant octet first (B.3.9 is ambiguous; figure B.8C and the captures decide it; DSD-FME
+// agrees); CRC-7 masked with 0x7A (table B.21).
 //
 // Rate 3/4 trellis. 144 bits are 48 tribits and a flushing zero tribit; each, with the previous
 // one as the state (starting at 0), selects a constellation point, two 4-level symbols (dibits),
@@ -1268,9 +1269,9 @@ bool dmr_elc_checksum_check(uint8_t const info[77]){
   return dmr_elc_checksum(info) == get_field(info + 72,5);
 }
 
-// CRC-9: the polynomial matches sdrtrunk's CRC9_CHECKSUMS table (CRCDMR.java), which sdrtrunk never
-// uses; OP25 has none. The masks are as recalled from the ETSI mask table, the order of the bits
-// as recalled from dmrshark; both to be settled against captures
+// CRC-9 (TS 102 361-1 B.3.10): data then the serial number, inverted, masked per data type (table
+// B.21); DSD-FME (dmr_dburst.c, ComputeCrc9Bit) agrees and ok-dmrlib's on-air vectors pass (the
+// serial number first fails them). The serial-first order stays offered for tests
 uint16_t dmr_crc9(uint8_t const *data,int ndata,uint8_t serial,uint16_t mask,bool serial_first){
   uint8_t serial_bits[7];
   put_field(serial,7,serial_bits);
@@ -1284,8 +1285,8 @@ uint16_t dmr_crc9(uint8_t const *data,int ndata,uint8_t serial,uint16_t mask,boo
   }
   return (reg ^ 0x1ff ^ mask) & 0x1ff;
 }
-// CRC-32: neither sdrtrunk nor OP25 checks one for DMR; the octet order is as dmrshark and DSD-FME
-// are recalled to do it, not checked against them or the ETSI text
+// CRC-32 (TS 102 361-1 B.3.9): the octet order, which B.3.9 leaves ambiguous, as figure B.8C shows
+// it, DSD-FME (ComputeCrc32Bit) does it and ok-dmrlib's on-air vectors confirm
 uint32_t dmr_crc32_bits(uint8_t const *bits,int n){
   return crc_remainder(bits,n,0x04C11DB7,32,0);
 }
@@ -1307,8 +1308,8 @@ bool dmr_packet_crc32_check(uint8_t const *octets,int noctets){
   uint32_t const stored = (uint32_t)c[0] | ((uint32_t)c[1] << 8) | ((uint32_t)c[2] << 16) | ((uint32_t)c[3] << 24);
   return dmr_packet_crc32(octets,noctets - 4) == stored;
 }
-// CRC-7: as OP25 (crc16.h crc7, compiled out there); the 0x7A reverse channel mask is as recalled
-// from the ETSI mask table
+// CRC-7 (TS 102 361-1 B.3.13): polynomial and zero preset as OP25 (crc16.h crc7) and ok-dmrlib; the
+// reverse channel mask 0x7A is table B.21's
 uint8_t dmr_crc7(uint8_t const *bits,int n,uint8_t mask){
   return (crc_remainder(bits,n,0x27,7,0) ^ mask) & 0x7f;
 }

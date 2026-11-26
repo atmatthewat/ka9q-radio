@@ -178,7 +178,7 @@ bool dmr_lc_voice_identity(struct dmr_lc const *lc,struct dmr_voice_identity *id
 enum dmr_lc_privacy {
   DMR_LC_NO_STATEMENT = 0, // not a voice LC
   DMR_LC_CLEAR,            // a voice channel user LC with the privacy bit clear
-  DMR_LC_ENCRYPTED,        // privacy bit set, a Cap+ encrypted voice LC, or encryption parameters
+  DMR_LC_ENCRYPTED,        // privacy bit set, or encryption parameters
 };
 enum dmr_lc_privacy dmr_lc_privacy(struct dmr_lc const *lc);
 
@@ -421,7 +421,7 @@ struct dmr_single_burst {
   uint8_t algorithm_id;    // ... as a PI header names it: DMR_ALG_DMRA_*
   uint8_t txi_delay;       // TXI: 0 any time, 2 frame E, 4 frame D, 6 frame C, 8 frame B
   uint8_t reverse_channel; // reverse channel: the 4 RC bits
-  uint8_t rc_crc_residue;  // ... CRC-7 of them XOR the 7 sent (the mask is not confirmed; not used)
+  uint8_t rc_crc_residue;  // ... CRC-7 of them, masked 0x7A, XOR the 7 sent: 0 passes (not used)
 };
 // Corrections a single-burst decode is accepted with by default: one fewer than the code's radius
 #define DMR_SINGLE_BURST_MAX_CORRECTED 2.0f

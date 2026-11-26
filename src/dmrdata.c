@@ -70,7 +70,8 @@
 //           Least significant first is the default, as dmrshark has it and as DSD-FME (lwvmobile/dsd-fme,
 //           dmr_block.c, ComputeCrc32Bit in dmr_utils.c) checks it on real packets: the remainder over
 //           pair-swapped octets, byte-reversed, against the four octets read most significant first.
-//           sdrtrunk and OP25 never check it. crc32_observed keeps the evidence until a capture settles it.
+//           sdrtrunk and OP25 never check it. ok-dmrlib's on-air vectors (rate 1/2, IPv4/UDP, defined short
+//           data) all pass with it, which settles it; crc32_observed still keeps the evidence.
 //   UDT     CRC-CCITT over the appended blocks before their last 16 bits, complemented, no mask
 //           (table 9.17E, B.3.8).
 // How a capture settles them: dmr_data_crc9_observed() and dmr_data_crc32_observed() give "stored XOR
@@ -602,7 +603,7 @@ int dmr_data_packet_describe(char *buf,size_t size,struct dmr_data_packet const 
          p->blocks_received,p->blocks_expected,p->blocks_good,p->duplicate_blocks,dmr_packet_end_name(p->end),
          p->complete ? "COMPLETE" : "INCOMPLETE",p->payload_length);
   if(p->crc_checked && p->crc_ok){
-    append(buf,size,&len," crc=ok");
+    append(buf,size,&len,p->crc_mnis_span ? " crc=ok(mnis span)" : " crc=ok");
   } else if(p->crc_checked && p->header.kind == DMR_DH_UDT){
     append(buf,size,&len," crc=FAIL(udt mask %04X)",(unsigned)p->udt_crc_observed_mask);
   } else if(p->crc_checked){
@@ -810,6 +811,22 @@ static void end_packet(struct dmr_data_assembler *a,struct slot_state *s,enum dm
       p->crc_stored = dmr_data_crc32_stored(p->payload + total - 4,&a->config.crc);
       p->crc_computed = dmr_data_crc32(p->payload,(int)total - 4,&a->config.crc);
       dmr_data_crc32_observed(&p->crc32_observed,p->payload,(int)total);
+      // Motorola MNIS (a vendor format; TS 102 361-1 B.3.9 has the CRC over the blocks' data alone):
+      // the CRC covers the MNIS header's octets 3-9 and the data octets but the one just before the
+      // CRC. dsd-neo's rule (GPL-3, src/protocol/dmr/dmr_block.c dmr_block_type1_update_crc(), after
+      // node-dmr-lib DataBlock.getBuffer()), and the only span that passes on the LRRP packet of
+      // lwvmobile/dsd-fme#283; with the standard span no MNIS packet ever completed. Either passes
+      if(p->crc_stored != p->crc_computed && s->has_second && s->second.kind == DMR_DH_MOTOROLA_MNIS
+         && s->second.octets[2] == 0x02 && total >= 5){
+        static _Thread_local uint8_t span[7 + DMR_DATA_MAX_OCTETS];
+        memcpy(span,s->second.octets + 3,7);
+        memcpy(span + 7,p->payload,total - 5);
+        uint32_t const mnis = dmr_data_crc32(span,(int)total + 2,&a->config.crc);
+        if(mnis == p->crc_stored){
+          p->crc_computed = mnis;
+          p->crc_mnis_span = true;
+        }
+      }
     }
     p->crc_ok = p->crc_stored == p->crc_computed;
   }

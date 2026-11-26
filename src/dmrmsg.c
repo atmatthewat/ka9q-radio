@@ -26,8 +26,8 @@
 //                                 parity with no mask: an LC that fails with its mask is accepted with
 //                                 none, but only if RS then has nothing to correct (a random word passes
 //                                 that one time in 16.7 million). rs_corrected and lc_uncorrected say
-//                                 whether RS had to repair an octet; the call tracker wants an
-//                                 uncorrected LC before it believes "clear".
+//                                 whether RS had to repair an octet (evidence only: the call tracker
+//                                 takes any checked LC, dmrcall.c).
 //   PI header                     BPTC, CRC-CCITT with mask 0x6969. The 80 bits are the algorithm
 //                                 octet, FID, key ID, a 32-bit MI and a 24-bit destination, as OP25
 //                                 (GPL-3, op25_repeater/lib/dmr_slot.h, get_pi_*) and sdrtrunk (GPL-3,
@@ -56,7 +56,7 @@
 //              GPS 0x08, terminator data 0x30
 //   FID 0x10   group voice 0x00, Capacity Plus wide-area voice with the rest LSN 0x04, Capacity Max
 //              group voice 0x10 and talker alias header and blocks 0x14-0x17 (the standard's layout:
-//              sdrtrunk 9359f523, GPL-3, Dennis Sheirer, issue #2421), Capacity Plus encrypted voice 0x20,
+//              sdrtrunk 9359f523, GPL-3, Dennis Sheirer, issue #2421), Capacity Plus voice 0x20 (privacy from its options),
 //              encryption parameters 0x21
 //   FID 0x68   group voice 0x00, unit-to-unit 0x03, talker alias 0x04-0x07, GPS 0x08, XPT channel
 //              grant 0x09, terminator 0x30
@@ -83,14 +83,16 @@
 // has two forms: the second row repeats the first (the null message, 11 zero bits) or is its
 // complement (reverse channel: 4 RC bits and a CRC-7). The EMB's PI says which (TS 102 361-1 9.3.2,
 // 6.4.2: an RC burst has LCSS single and PI = 1), and only that form is decoded; the other is tried
-// too, but only to count (single_burst_form_mismatch) the bursts in which it alone would decode. The reverse channel's CRC-7 mask is not confirmed
-// (OP25 expects residue 0 with its check compiled out), so the residue is reported, not used. The
+// too, but only to count (single_burst_form_mismatch) the bursts in which it alone would decode. The
+// reverse channel's CRC-7 is masked with 0x7A (TS 102 361-1 table B.21, clause 6.4.2; ok-dmrlib and
+// DSD-FME agree; OP25's check, compiled out, omits the mask), so residue 0 is a pass; it is reported,
+// not used, since nothing acts on the RC bits. The
 // vendor "short burst" layout (sdrtrunk, voice/embedded/*.java and VoiceSuperFrameProcessor.java,
 // after patents EP2347540B1 and US8271009B2; one source) has the opcode in bits 8-10 of the 11:
 // 0 null, valid when the 11 bits divide by x^3 + x + 1; 1, 4, 5 encryption parameters, bits 0-7 the
 // key and the opcode the algorithm (ARC4, AES-128, AES-256), with no check beyond the code; 3 TXI
 // delay, bits 3-7, with bits 0-2 a CRC-3 by the same division. The decoder is maximum likelihood over
-// both rows, where sdrtrunk corrects only the first row. The code has distance 8 and nothing checks
+// both rows (as sdrtrunk's BPTC_16_2.java now is; at a0533156 it corrected only the first row). The code has distance 8 and nothing checks
 // what it delivers, so a burst with five or more errors can decode to a wrong message within three
 // corrections. So a decode is accepted with at most DMR_SINGLE_BURST_MAX_CORRECTED (2) corrections,
 // where the code could correct 3: a wrong message then needs six errors in the 32.
@@ -98,7 +100,8 @@
 // The hidden IV (sdrtrunk's VoiceSuperFrameProcessor, the same patents). Each AMBE frame gives up its
 // last four c3 bits (frame bits 71, 67, 63, 59, in that order); the 18 frames of a superframe carry
 // 72 bits, three Golay(24,12) words, word w made of frame w of bursts A to F in turn. The 36 data bits
-// are a 32-bit IV and a CRC-4 (x^4 + x + 1, register preset to 0xF). Checked against sdrtrunk's code
+// are a 32-bit IV and a CRC-4 (x^4 + x + 1, the remainder XORed with 0xF at the end, as sdrtrunk and
+// DSD-FME do). Checked against sdrtrunk's code
 // only (VoiceMessage.java:37-42, 103-110; VoiceSuperFrameProcessor.java:46-48, 199-273), with no
 // vector from a real system; sdrtrunk counts the parity over all 72 bits instead of the word's 24,
 // which is not copied. On a clear call the same bits are speech, and three random words pass Golay and
@@ -112,8 +115,8 @@
 // assembler takes the bursts of both slots. A CACH whose TACT did not decode is taken as the next
 // fragment of a message already begun (BPTC and the CRC then decide); anything else out of turn, a
 // step in the clock other than 144 +- 24 dibits, or a burst with no CACH drops the message, and the
-// next "first" starts again. sdrtrunk computes the CRC-8 and then overwrites the result with the BPTC
-// status (SLCAssembler.java:145-149); OP25 (dmr_cai.cc) checks it, as here. Opcodes as sdrtrunk parses
+// next "first" starts again. sdrtrunk at a0533156 computed the CRC-8 and then overwrote the result with
+// the BPTC status (SLCAssembler.java:145-149; it now ANDs the two); OP25 (dmr_cai.cc) checks it, as here. Opcodes as sdrtrunk parses
 // them (lc/shorty/*.java), compared with OP25 (dmr_cai.cc decode_shortLC): for the huge network model
 // of Sys_Parms sdrtrunk has network 2 bits and site 10 (as TS 102 361-4), OP25's shifts read other
 // bits; for the Capacity Plus rest channel (SLCO 15) sdrtrunk reads a 5-bit rest LSN at bits 15-19
@@ -141,7 +144,8 @@
 // Voice frames (TS 102 361-1 6.1): frame 1 is burst bits 0-71, frame 2 72-107 and 156-191, frame 3
 // 192-263 (sdrtrunk's 288-bit indexes less 24, VoiceMessage.java:61-92; OP25 agrees). They are kept as
 // sent, msb first in 9 octets, the form a vocoder's frame decoder takes; each bit is copied singly,
-// so sdrtrunk's frame-2 octet 4 fault (a sign-extending shift, VoiceMessage.java:77) cannot happen.
+// so the frame-2 octet 4 fault sdrtrunk had at a0533156 (a sign-extending shift, VoiceMessage.java:77;
+// masked since) cannot happen.
 // The FEC is the half-rate vocoder's, which DMR shares with P25 Phase 2: p25p2_ambe_decode() gives the
 // c0 and c1 Golay corrections (fec_errors, 0 for an undamaged frame, up to 4 + 3) and the 49 bits.
 //
@@ -226,7 +230,7 @@ char const *dmr_lc_kind_name(enum dmr_lc_kind k){
   case DMR_LC_MOTOROLA_GROUP_VOICE: return "MOTOROLA GROUP VOICE";
   case DMR_LC_CAP_PLUS_WIDE_AREA_VOICE: return "CAP+ WIDE-AREA VOICE";
   case DMR_LC_CAP_MAX_GROUP_VOICE: return "CAPMAX GROUP VOICE";
-  case DMR_LC_CAP_PLUS_ENCRYPTED_VOICE: return "CAP+ ENCRYPTED VOICE";
+  case DMR_LC_CAP_PLUS_ENCRYPTED_VOICE: return "CAP+ VOICE 0x20";
   case DMR_LC_MOTOROLA_ENCRYPTION_PARAMETERS: return "MOTOROLA ENCRYPTION PARAMETERS";
   case DMR_LC_HYTERA_GROUP_VOICE: return "HYTERA GROUP VOICE";
   case DMR_LC_HYTERA_UNIT_TO_UNIT_VOICE: return "HYTERA UNIT-TO-UNIT VOICE";
@@ -437,8 +441,12 @@ bool dmr_lc_voice_identity(struct dmr_lc const *lc,struct dmr_voice_identity *id
   return true;
 }
 
+// FID 0x10 FLCO 0x20 says what its service options say, like every voice LC: the name "encrypted
+// voice" is sdrtrunk's from one observation (LCOpcode.java), and sdrtrunk itself takes the call's
+// encryption from the options bit (DMRDecoderState.java); DSD-FME and dsd-neo read it as a RAS group
+// call, privacy from bit 0x40 (dmr_flco.c). Read from the opcode, a clear call was taken as encrypted
 enum dmr_lc_privacy dmr_lc_privacy(struct dmr_lc const *lc){
-  if(lc->kind == DMR_LC_MOTOROLA_ENCRYPTION_PARAMETERS || lc->kind == DMR_LC_CAP_PLUS_ENCRYPTED_VOICE)
+  if(lc->kind == DMR_LC_MOTOROLA_ENCRYPTION_PARAMETERS)
     return DMR_LC_ENCRYPTED;
   struct dmr_voice_identity id;
   if(!dmr_lc_voice_identity(lc,&id))
@@ -1084,7 +1092,7 @@ void dmr_single_burst_parse(struct dmr_single_burst *s,uint32_t info11,bool reve
     uint_to_bits(s->info,11,bits);
     s->kind = DMR_SB_REVERSE_CHANNEL;
     s->reverse_channel = (uint8_t)(s->info >> 7);
-    s->rc_crc_residue = (uint8_t)(dmr_crc7(bits,4,0) ^ (s->info & 0x7f));
+    s->rc_crc_residue = (uint8_t)(dmr_crc7(bits,4,DMR_CRC7_MASK_REVERSE_CHANNEL) ^ (s->info & 0x7f));
     return;
   }
   uint32_t const opcode = s->info & 7u;

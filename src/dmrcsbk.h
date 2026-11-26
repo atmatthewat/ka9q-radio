@@ -659,6 +659,7 @@ enum dmr_mbc_status {
   DMR_MBC_STALE,                // too long after the previous block; abandoned
   DMR_MBC_TOO_MANY_BLOCKS,      // more than DMR_MBC_MAX_CONTINUATION_BLOCKS; abandoned
   DMR_MBC_CRC_FAILED,           // the continuation blocks failed their CRC; abandoned
+  DMR_MBC_OPCODE_MISMATCH,      // a CG_AP continuation whose CSBKO is not its header's; abandoned
 };
 struct dmr_mbc_event {
   enum dmr_mbc_status status;
@@ -673,6 +674,7 @@ struct dmr_mbc_stats {
   uint64_t crc_failures;
   uint64_t orphan_blocks;       // NO_HEADER
   uint64_t abandoned;           // stale, too many blocks, or cut short by another burst
+  uint64_t opcode_mismatches;   // OPCODE_MISMATCH
 };
 struct dmr_mbc_pending {
   bool active;
